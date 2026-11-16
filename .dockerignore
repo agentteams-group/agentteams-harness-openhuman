@@ -1,0 +1,9 @@
+.git
+.github
+.deps
+agentteams
+native
+tests
+**/__pycache__
+**/target
+.pytest_cache

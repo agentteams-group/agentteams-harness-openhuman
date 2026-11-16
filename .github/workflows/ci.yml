@@ -1,0 +1,72 @@
+name: OpenHuman Harness
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-controls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GGML_NATIVE: 'OFF'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: agentscope-ai/AgentTeams
+          ref: efa101387fdb1d7b7e3cd9199e6b1de4c2df517c
+          path: agentteams
+      - uses: actions/checkout@v4
+        with:
+          repository: tinyhumansai/openhuman
+          ref: v0.54.0
+          path: native
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.93.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - name: Install native runtime build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev libssl-dev libxdo-dev libxtst-dev libx11-dev libevdev-dev cmake clang pkg-config
+      - name: Verify Task tool configuration and receipt guards
+        run: |
+          python3 -m pip install 'pytest>=8,<9' 'PyYAML>=6,<7'
+          AT_SOURCE="$GITHUB_WORKSPACE/agentteams" python3 -m pytest -q tests
+          cargo test --locked --manifest-path tests/session-receipts/Cargo.toml
+          bash -n scripts/openhuman-worker-entrypoint.sh scripts/agt
+      - name: Apply the packaged patches
+        run: |
+          git -C native apply "$GITHUB_WORKSPACE/patches/manager-matrix.patch"
+          git -C native apply "$GITHUB_WORKSPACE/patches/dashboard-approvals.patch"
+          git -C native apply "$GITHUB_WORKSPACE/patches/direct-control.patch"
+          cp patches/session_receipts.rs native/src/openhuman/channels/session_receipts.rs
+          git -C native apply "$GITHUB_WORKSPACE/patches/session-receipts.patch"
+          cp patches/task_coordination.rs native/src/openhuman/channels/task_coordination.rs
+          git -C native apply "$GITHUB_WORKSPACE/patches/task-coordination.patch"
+      - name: Verify native Matrix controls and tool cleanup
+        working-directory: native
+        run: cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control
+
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: agentscope-ai/AgentTeams
+          ref: efa101387fdb1d7b7e3cd9199e6b1de4c2df517c
+          path: agentteams
+      - uses: docker/setup-buildx-action@v3
+      - run: make build VERSION=ci AT_CONTEXT=./agentteams
+      - run: make smoke VERSION=ci
