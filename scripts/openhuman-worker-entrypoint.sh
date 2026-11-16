@@ -107,6 +107,9 @@ if [ -d "${WORKSPACE}/agent-config/skills" ]; then
     find "${WORKSPACE}/skills" -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
 fi
 
+python3 /opt/agentteams/scripts/lib/agentteams_skill_warnings.py "${WORKSPACE}/skills" \
+    || log "WARNING: skill validation unavailable; continuing startup"
+
 # Copy memory files
 if [ -d "${WORKSPACE}/agent-config/memory" ]; then
     cp -rf "${WORKSPACE}/agent-config/memory/"* "${WORKSPACE}/memory/" 2>/dev/null || true
@@ -374,8 +377,13 @@ log "Local->Remote sync started (PID: ${SYNC_LOCAL_PID})"
             sleep 300
         fi
         ensure_mc_credentials 2>/dev/null || true
-        mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/skills/" \
-            "${WORKSPACE}/skills/" --overwrite 2>/dev/null || true
+        if mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/skills/" \
+            "${WORKSPACE}/skills/" --overwrite 2>/dev/null; then
+            python3 /opt/agentteams/scripts/lib/agentteams_skill_warnings.py "${WORKSPACE}/skills" || true
+            cp -a "${WORKSPACE}/skills/." "${NATIVE_WORKSPACE}/skills/" 2>/dev/null || log "WARNING: native skill copy failed"
+        else
+            log "WARNING: skill sync failed; retaining existing skills"
+        fi
         find "${WORKSPACE}/skills" -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
         mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/shared/" "${WORKSPACE}/shared/" \
             --overwrite --newer-than "5m" "${TASK_SYNC_EXCLUDES[@]}" 2>/dev/null || true
