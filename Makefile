@@ -19,3 +19,4 @@ test:
 smoke:
 	docker run --rm --entrypoint openhuman-core $(IMAGE):$(VERSION) --help
 	docker run --rm --entrypoint sh $(IMAGE):$(VERSION) -ec 'command -v agt; test -r /opt/agentteams/scripts/lib/task_coordination.py; test -r /opt/agentteams/plugins/teamharness/mcp/server.py; python3 -c "import yaml"; test -s /usr/share/licenses/openhuman/LICENSE'
+	docker run --rm --network none --entrypoint python3 -v "$(CURDIR)/tests/native_startup_config_smoke.py:/tmp/native_startup_config_smoke.py:ro" $(IMAGE):$(VERSION) /tmp/native_startup_config_smoke.py

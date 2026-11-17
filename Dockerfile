@@ -195,7 +195,6 @@ COPY --from=builder /build/openhuman-src/LICENSE /usr/share/licenses/openhuman/L
 USER root
 
 # Default environment
-ENV OPENHUMAN_WORKSPACE=/home/openhuman/.openhuman
 ENV OPENHUMAN_CORE_HOST=0.0.0.0
 ENV OPENHUMAN_CORE_PORT=7788
 ENV RUST_LOG=info
