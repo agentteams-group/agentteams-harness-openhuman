@@ -101,6 +101,9 @@ RUN git -C /build/openhuman-src apply /tmp/session-receipts.patch
 COPY patches/task-coordination.patch /tmp/task-coordination.patch
 COPY patches/task_coordination.rs /build/openhuman-src/src/openhuman/channels/task_coordination.rs
 RUN git -C /build/openhuman-src apply /tmp/task-coordination.patch
+COPY patches/task-recovery.patch /tmp/task-recovery.patch
+COPY patches/task_recovery.rs /build/openhuman-src/src/openhuman/channels/task_recovery.rs
+RUN git -C /build/openhuman-src apply /tmp/task-recovery.patch
 
 WORKDIR /build/openhuman-src
 

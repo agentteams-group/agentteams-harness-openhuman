@@ -56,9 +56,11 @@ jobs:
           git -C native apply "$GITHUB_WORKSPACE/patches/session-receipts.patch"
           cp patches/task_coordination.rs native/src/openhuman/channels/task_coordination.rs
           git -C native apply "$GITHUB_WORKSPACE/patches/task-coordination.patch"
+          cp patches/task_recovery.rs native/src/openhuman/channels/task_recovery.rs
+          git -C native apply "$GITHUB_WORKSPACE/patches/task-recovery.patch"
       - name: Verify native Matrix controls and tool cleanup
         working-directory: native
-        run: cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control
+        run: cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery
 
   image:
     runs-on: ubuntu-24.04
