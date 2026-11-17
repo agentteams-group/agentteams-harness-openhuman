@@ -1,0 +1,50 @@
+{
+  "kind": "native_sdk_fixture_tests",
+  "real_task_e2e": false,
+  "harness_sha": "b70b490f422b5a7058a4b33d1ac660656758c23a",
+  "core_sha": "cc9f63503817d87bf7731c973db85f7db6fc89a3",
+  "upstream_ref": "v0.54.0",
+  "upstream_sha": "c25fc8e5fd3e7716f416571cd53b34247c94ddbe",
+  "platform": "GitHub ubuntu-24.04",
+  "rust": "1.93.0",
+  "run_url": "https://github.com/agentteams-group/agentteams-harness-openhuman/actions/runs/44083059656",
+  "job_url": "https://github.com/agentteams-group/agentteams-harness-openhuman/actions/runs/44083059656/job/134038303010",
+  "completed_at": "2026-11-17T12:28:44Z",
+  "command": "cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery",
+  "result": "passed",
+  "native_tests": [
+    "test task_recovery::tests::only_current_scoped_unexpired_native_history_is_reused ... ok",
+    "test cancelled_native_mcp_call_stops_server_and_child_and_can_reinitialize ... ok",
+    "test shell_cancellation_stops_shell_and_children ... ok",
+    "test matrix_run_acknowledges_only_after_cleanup_and_retains_supplements ... ok"
+  ],
+  "receipt_module_tests": 1,
+  "host_tests": 12,
+  "completed_job_log_sha256": "7a07690dc2a8636d2bae80632fb76e8507abe30fd28a3e61191d45d63b76ec9a",
+  "limits": [
+    "Native fixture/API/process tests, not real Controller/Matrix/model Task execution.",
+    "Native Matrix SDK uses mock homeserver responses in the direct-control fixture.",
+    "MCP cleanup test starts actual Python and sleep child processes.",
+    "Image build and current-head d6a4fd3 verification were still pending when this proof was collected.",
+    "Six-Harness and 30-direction Task/fault matrix remains incomplete."
+  ],
+  "follow_up_native_controls": {
+    "harness_sha": "d6a4fd3fc35c7ac7818957785b349e4509e95d48",
+    "core_sha": "cc9f63503817d87bf7731c973db85f7db6fc89a3",
+    "job_url": "https://github.com/agentteams-group/agentteams-harness-openhuman/actions/runs/44083952082/job/134041362203",
+    "completed_at": "2026-11-17T12:34:56Z",
+    "result": "passed",
+    "completed_job_log_sha256": "431d520e60919c8454c91b26a5d89327c3a0859cce2ab51a34bd382f2d8509a7",
+    "new_native_tests": 2,
+    "existing_direct_control_tests": 2,
+    "receipt_module_tests": 1,
+    "real_task_e2e": false
+  },
+  "prior_head_image_ci": {
+    "harness_sha": "b70b490f422b5a7058a4b33d1ac660656758c23a",
+    "job_url": "https://github.com/agentteams-group/agentteams-harness-openhuman/actions/runs/44083059656/job/134038303463",
+    "completed_at": "2026-11-17T12:37:19Z",
+    "result": "passed",
+    "publication": false
+  }
+}

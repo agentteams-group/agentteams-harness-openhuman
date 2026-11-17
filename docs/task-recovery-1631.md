@@ -31,7 +31,7 @@ before another effect; cancellation cannot prove an external service rolled back
 
 ## Validation boundary
 
-- Shared Core dependency: `cc9f63503817d87bf7731c973db85f7db6fc89a3`.
+- Shared Core dependency: `e0bc358b97ad8957320965c89875b6e636e9b307`, including durable-submission interruption recovery. Earlier test proofs below retain their actual older Core SHA.
 - Upstream: `v0.54.0`, `c25fc8e5fd3e7716f416571cd53b34247c94ddbe`.
 - All six packaged patches reapplied to that upstream; integrated files matched
   the edited source checkout.
@@ -40,13 +40,13 @@ before another effect; cancellation cannot prove an external service rolled back
 - New native tests cover scoped/current/unexpired tool-history reuse and stale,
   foreign, corrupted or missing caches, plus cancellation of a real stdio MCP
   server and its child followed by session reinitialization. These tests are
-  packaged in `task-recovery.patch`. At candidate `b70b490`, hosted native-controls
-  passed; its completed-job log is being checked separately from image CI. The
-  additional startup verification fence and released-tool check still need their
-  own current-head native run.
+  packaged in `task-recovery.patch`. Hosted native compilation and all five
+  Rust tests passed at `b70b490` and at `d6a4fd3` (including the startup verification
+  fence and released-tool check). The former's independent image/smoke CI also
+  passed. See `tests/evidence/worker-task-native-controls-1631.json` for exact SHAs,
+  job URLs, log hashes and limits; the latter's image job is still running.
 
-This is still a Draft implementation. Native compilation, real model/Controller/
-Matrix Task continuation, reply-only recovery, authority conflicts, unknown
+This is still a Draft implementation. Real model/Controller/Matrix Task continuation, reply-only recovery, authority conflicts, unknown
 effects, cancellation/reassignment and the full restart/switch matrix remain
 unaccepted. A patch-application check and the existing receipt test do not prove
 Task execution recovery. The common persistent handoff state machine and shared
