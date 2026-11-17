@@ -23,9 +23,12 @@ static WAKE: Notify = Notify::const_new();
 
 tokio::task_local! { pub(crate) static TASK_RUN: Arc<Run>; }
 
-pub(crate) async fn check_authority() -> anyhow::Result<()> {
+pub(crate) async fn check_authority(for_tool: bool) -> anyhow::Result<()> {
     if let Ok(run) = TASK_RUN.try_with(Arc::clone) {
-        run.current().await.map_err(anyhow::Error::msg)?;
+        let current = run.current().await.map_err(anyhow::Error::msg)?;
+        if for_tool && current["task"]["execution"]["state"] == "released" {
+            anyhow::bail!("Task execution was released; only saved-result delivery is permitted");
+        }
     }
     Ok(())
 }
@@ -364,6 +367,13 @@ async fn scan(
                 &execution["checkpoint"],
             )
             .await?;
+            continue;
+        }
+        if execution["state"] == "needs_verification" {
+            // A fresh process cannot establish the outcome of an interrupted
+            // native effect from its old session. Wait for shared verification
+            // evidence instead of asking the model to replay that operation.
+            tracing::warn!("Owned Task is waiting for side-effect verification");
             continue;
         }
         if task["status"] == "submitted" || !ADMITTED.lock().unwrap().insert(admission) {

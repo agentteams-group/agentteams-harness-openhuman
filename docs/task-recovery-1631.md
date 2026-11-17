@@ -24,8 +24,10 @@ the turn runs. Dropping a cancelled native MCP request now drops its owned stdio
 session and kills the server process group. Shell Task tools receive the current
 process identity and credential-file path, without forwarding raw model keys or
 loading an old process identity. Interrupted native effects are fenced through
-the shared unknown-outcome protocol. This requires external verification before
-another effect; cancellation cannot prove an external service rolled back.
+the shared unknown-outcome protocol. Startup recovery parks unresolved effects
+until shared verification evidence is saved; it does not start a replay turn.
+A released execution cannot admit another tool call. This requires verification
+before another effect; cancellation cannot prove an external service rolled back.
 
 ## Validation boundary
 
@@ -38,7 +40,10 @@ another effect; cancellation cannot prove an external service rolled back.
 - New native tests cover scoped/current/unexpired tool-history reuse and stale,
   foreign, corrupted or missing caches, plus cancellation of a real stdio MCP
   server and its child followed by session reinitialization. These tests are
-  packaged in `task-recovery.patch`; their first full native build/run is pending.
+  packaged in `task-recovery.patch`. At candidate `b70b490`, hosted native-controls
+  passed; its completed-job log is being checked separately from image CI. The
+  additional startup verification fence and released-tool check still need their
+  own current-head native run.
 
 This is still a Draft implementation. Native compilation, real model/Controller/
 Matrix Task continuation, reply-only recovery, authority conflicts, unknown

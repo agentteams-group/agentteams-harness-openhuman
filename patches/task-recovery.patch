@@ -5,7 +5,7 @@
      let stop_hooks = current_stop_hooks();
      for iteration in 0..max_iterations {
 +        #[cfg(feature = "channel-matrix")]
-+        crate::openhuman::channels::task_recovery::check_authority().await?;
++        crate::openhuman::channels::task_recovery::check_authority(false).await?;
          if let Some(ref sink) = on_progress {
              if let Err(e) = sink
                  .send(AgentProgress::IterationStarted {
@@ -23,7 +23,7 @@
          let mut individual_results: Vec<String> = Vec::new();
          for (call_idx, call) in tool_calls.iter().enumerate() {
 +            #[cfg(feature = "channel-matrix")]
-+            crate::openhuman::channels::task_recovery::check_authority().await?;
++            crate::openhuman::channels::task_recovery::check_authority(true).await?;
              // Stable id threaded through the start/complete pair (and
              // any preceding args-delta events) so consumers can
              // reconcile tool rows by id. The fallback includes
