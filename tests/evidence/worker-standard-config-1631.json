@@ -1,0 +1,35 @@
+{
+  "passed": true,
+  "scope": "Worker standard record through startup projection/TOML fragments and actual installed native configuration CLI readback",
+  "core_projector_source": "f858bf7b26c9996411b0f4ac9d5d5fd7d3774948",
+  "openhuman_startup_source": "8eea00e1ace4b1527da4a871b25aae4f90a717c7",
+  "image": "recovery-1631/openhuman:local-20261117102805",
+  "image_id": "sha256:a719762dd4ea44dfa7b7b0412086ac5dd9febe5c3f36c07a996e9e94788f7a81",
+  "base_image": "higress-registry.cn-hangzhou.cr.aliyuncs.com/agentteams/agentteams-harness-openhuman:v1.2.7",
+  "base_digest": "sha256:e02273a9025e7464c20bfb5ea3820a8a76c47ef8f595c6e372277566bc8d61cd",
+  "native_sdk_git_revision": "Not established from the released base binary; source CI separately builds the pinned v0.54.0 SDK",
+  "file_sha256": {
+    "shared_projector": "df70f630cdba7cbba11e2f9e4847151d8db9ff1923a7e44899c2ae48eb764e9d",
+    "entrypoint": "1478196d74dbe9f0fac71ddd81fa83d8f86fe78b344398e16a530227785e5f34",
+    "driver": "ed1c729cef65f25c2554fc62e291a4dc3712d8e72361a68bf088486634c65e5e"
+  },
+  "log_sha256": "99d52dc5a1467b8e6fab9d0a8ebfc70cc97b4a49efb3e38c9fb690dbe3f7ca56",
+  "network": "none",
+  "assertions": [
+    "no compatibility object or agent-config directory",
+    "standard Worker model and normalized gateway URL visible to native config get",
+    "Worker-bound model key and Matrix token read by native config get",
+    "standard Matrix user, personal room and sender list",
+    "derived cache mode 0600"
+  ],
+  "matrix_connected": false,
+  "model_calls": 0,
+  "task_execution_tested": false,
+  "full_worker_startup_tested": false,
+  "limits": [
+    "record is a local fixture; no running Controller or object storage",
+    "actual startup configuration fragments run, not the full daemon entrypoint",
+    "local overlay adds Python/YAML already required by the current source Dockerfile to the older released base",
+    "no native Task/session recovery patches or real Matrix policy behavior proven by this configuration-only overlay"
+  ]
+}
