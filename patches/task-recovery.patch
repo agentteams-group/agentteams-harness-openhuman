@@ -1,14 +1,30 @@
 --- a/src/openhuman/agent/harness/tool_loop.rs
 +++ b/src/openhuman/agent/harness/tool_loop.rs
-@@ -170,6 +170,8 @@
+@@ -170,6 +170,9 @@
  
      let stop_hooks = current_stop_hooks();
      for iteration in 0..max_iterations {
 +        #[cfg(feature = "channel-matrix")]
-+        crate::openhuman::channels::task_recovery::check_authority(false).await?;
++        { crate::openhuman::channels::task_recovery::check_authority(false).await?;
++          crate::openhuman::channels::task_recovery::attach_pending(history).await?; }
          if let Some(ref sink) = on_progress {
              if let Err(e) = sink
                  .send(AgentProgress::IterationStarted {
+@@ -461,4 +464,14 @@
+         if tool_calls.is_empty() {
++            #[cfg(feature = "channel-matrix")]
++            if crate::openhuman::channels::task_recovery::unexecuted_tool_frame(&response_text) {
++                // Parsing did not dispatch anything. Ask for a real function call
++                // within the existing bounded turn, without replaying any tool.
++                history.push(ChatMessage::assistant(response_text));
++                history.push(ChatMessage::user(
++                    "That tool request was malformed and did not run. Use a registered function to continue.",
++                ));
++                continue;
++            }
+             tracing::debug!(
+                 iteration,
+                 "[agent_loop] no tool calls — returning final response"
 @@ -482,6 +484,8 @@
                  }
              }
@@ -270,10 +286,12 @@
  
 --- /dev/null
 +++ b/tests/agentteams_task_recovery.rs
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,92 @@
 +//! Native API/adapter tests; these do not replace real Controller/Matrix/model E2E.
 +use openhuman_core::openhuman;
 +use openhuman_core::openhuman::channels::traits;
++#[path = "../src/openhuman/channels/session_receipts.rs"]
++mod session_receipts;
 +#[path = "../src/openhuman/channels/task_recovery.rs"]
 +mod task_recovery;
 +

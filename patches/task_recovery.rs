@@ -17,7 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 static RUNS: Lazy<Mutex<HashMap<String, Arc<Run>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static ADMITTED: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
-static SOURCES: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static SOURCES: Lazy<Mutex<HashMap<String, Vec<String>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static READY: AtomicBool = AtomicBool::new(false);
 static MATRIX_INBOX_READY: Notify = Notify::const_new();
 static WAKE: Notify = Notify::const_new();
@@ -34,10 +35,31 @@ pub(crate) async fn check_authority(for_tool: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn unexecuted_tool_frame(text: &str) -> bool {
+    TASK_RUN.try_with(|_| ()).is_ok() && text.trim_start().starts_with("<tool_call>")
+}
+
+pub(crate) async fn attach_pending(history: &mut Vec<ChatMessage>) -> anyhow::Result<()> {
+    if let Ok(run) = TASK_RUN.try_with(Arc::clone) {
+        run.attach_pending(history)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
 /// Called only after the native tool loop has appended its actual tool results.
 pub(crate) async fn checkpoint(history: &[ChatMessage]) -> anyhow::Result<()> {
     if let Ok(run) = TASK_RUN.try_with(Arc::clone) {
-        run.remember(history).await.map_err(anyhow::Error::msg)?;
+        if let Err(error) = run.remember(history).await {
+            // Submitted Tasks close session publication before the final-text callback.
+            if run.message()
+                || error != "conflict"
+                || run.current().await.map_err(anyhow::Error::msg)?["task"]["status"] != "submitted"
+            {
+                return Err(anyhow::anyhow!(error));
+            }
+        }
     }
     Ok(())
 }
@@ -129,10 +151,11 @@ pub(crate) async fn rpc(mut request: Value) -> Result<Value, &'static str> {
 }
 
 pub(crate) fn source(room: &str, task: &str, event: &str) {
-    SOURCES
-        .lock()
-        .unwrap()
-        .insert(digest(&json!([room, task])), event.to_owned());
+    let mut pending = SOURCES.lock().unwrap();
+    let events = pending.entry(digest(&json!([room, task]))).or_default();
+    if !events.iter().any(|id| id == event) {
+        events.push(event.to_owned());
+    }
     WAKE.notify_one();
 }
 
@@ -239,6 +262,33 @@ fn delivered_event(
     None
 }
 
+fn append_assignment(
+    history: &mut Vec<ChatMessage>,
+    input: &Value,
+    work: &Value,
+    room: &str,
+    id: &str,
+) -> Result<Option<ChatMessage>, &'static str> {
+    if input["work"] != *work
+        || input["room_id"] != room
+        || input["event_id"] != id
+        || input["intent"] != "task_notification"
+    {
+        return Err("assignment scope changed");
+    }
+    if !input["native_commit"].is_null() {
+        return Ok(None);
+    }
+    let msg = ChatMessage::user(json!({"room_id":room,"event_id":id,"sender":input["input"]["sender"],"content":input["input"]["content"]}).to_string());
+    if !history
+        .iter()
+        .any(|row| row.role == msg.role && row.content == msg.content)
+    {
+        history.push(msg.clone());
+    }
+    Ok(Some(msg))
+}
+
 impl Run {
     async fn new(
         client: &Client,
@@ -288,6 +338,44 @@ impl Run {
             finished: AtomicBool::new(false),
             succeeded: AtomicBool::new(false),
         }))
+    }
+
+    async fn attach_pending(&self, history: &mut Vec<ChatMessage>) -> Result<(), &'static str> {
+        if self.message() {
+            return Ok(());
+        }
+        let scope = digest(&json!([self.room, self.work["task_id"]]));
+        let events = SOURCES
+            .lock()
+            .unwrap()
+            .get(&scope)
+            .cloned()
+            .unwrap_or_default();
+        for id in events {
+            let key = digest(&json!([self.room, id]));
+            let view = rpc(json!({"action":"matrix.native.get","event_key":key})).await?;
+            if let Some(msg) =
+                append_assignment(history, &view["input"], &self.work, &self.room, &id)?
+            {
+                // Publish the actual native transcript before making the Matrix
+                // source eligible for a read receipt. Repeated sync is idempotent.
+                self.remember(history).await?;
+                super::session_receipts::checkpoint(
+                    &home(),
+                    &self.room,
+                    &id,
+                    &self.session,
+                    &msg,
+                    std::slice::from_ref(&id),
+                )
+                .map_err(|_| "native assignment persistence failed")?;
+                commit_input(&home(), &self.room, &id, &self.session).await?;
+            }
+            if let Some(events) = SOURCES.lock().unwrap().get_mut(&scope) {
+                events.retain(|old| old != &id);
+            }
+        }
+        Ok(())
     }
 
     fn message(&self) -> bool {
@@ -722,9 +810,14 @@ async fn scan(
         let identity = json!({"task_id":task["task_id"], "team_id":entry["team_id"], "generation":execution["generation"], "instance_id":execution["instance_id"],"process_id":execution["process_id"]});
         let admission = identity.to_string();
         let delivery_only = execution["checkpoint"]["delivery"] == "pending";
-        if !delivery_only
-            && (task["status"] == "submitted" || ADMITTED.lock().unwrap().contains(&admission))
-        {
+        let admitted = ADMITTED.lock().unwrap().contains(&admission);
+        let source_key = digest(&json!([task["room_id"], task["task_id"]]));
+        let waiting_source = SOURCES
+            .lock()
+            .unwrap()
+            .get(&source_key)
+            .is_some_and(|ids| !ids.is_empty());
+        if !delivery_only && (task["status"] == "submitted" || (admitted && !waiting_source)) {
             continue;
         }
         if execution["state"] == "needs_verification" {
@@ -770,11 +863,18 @@ async fn scan(
             .await?;
             continue;
         }
+        if admitted {
+            if !run.restored.is_empty() {
+                run.attach_pending(&mut run.restore()).await?;
+            }
+            continue;
+        }
         ADMITTED.lock().unwrap().insert(admission);
         let id = SOURCES
             .lock()
             .unwrap()
-            .get(&digest(&json!([room, task["task_id"]])))
+            .get(&source_key)
+            .and_then(|ids| ids.first())
             .cloned()
             .unwrap_or_else(|| format!("recovery:{}", uuid::Uuid::new_v4()));
         RUNS.lock().unwrap().insert(id.clone(), run.clone());
@@ -840,6 +940,34 @@ pub(crate) fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_assignment_enters_the_original_history_once() {
+        let work = json!({"kind":"task","team_id":"team","task_id":"task"});
+        let mut input = json!({"work":work,"room_id":"!room:d","event_id":"$one","intent":"task_notification","input":{"sender":"@leader:d","content":{"body":"assigned"}}});
+        let mut history = vec![ChatMessage::assistant("existing turn")];
+        for _ in 0..2 {
+            let msg = append_assignment(&mut history, &input, &work, "!room:d", "$one")
+                .unwrap()
+                .unwrap();
+            let body: Value = serde_json::from_str(&msg.content).unwrap();
+            assert_eq!(body["event_id"], "$one");
+            assert_eq!(body["content"], input["input"]["content"]);
+        }
+        assert_eq!(history.len(), 2);
+        assert!(append_assignment(&mut history, &input, &work, "!other:d", "$one").is_err());
+        assert!(append_assignment(&mut history, &input, &work, "!room:d", "$other").is_err());
+        input["work"]["team_id"] = json!("another");
+        assert!(append_assignment(&mut history, &input, &work, "!room:d", "$one").is_err());
+        input["work"] = work.clone();
+        input["native_commit"] = json!({"native_ref":"existing"});
+        assert!(
+            append_assignment(&mut history, &input, &work, "!room:d", "$one")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(history.len(), 2);
+    }
 
     #[test]
     fn history_requires_the_same_accepted_event_and_room() {
