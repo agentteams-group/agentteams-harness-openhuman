@@ -138,6 +138,7 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
     ca-certificates \
     python3 \
     python3-yaml \
+    python3-venv \
     libssl3 \
     libasound2 \
     libxdo3 \
@@ -172,6 +173,9 @@ RUN mkdir -p /home/openhuman/.openhuman/skills \
 
 # Copy AgentTeams shared scripts
 COPY --from=agentteams shared/lib/ /opt/agentteams/scripts/lib/
+RUN python3 -m venv /opt/venv/agentteams \
+    && /opt/venv/agentteams/bin/pip install --no-cache-dir -r /opt/agentteams/scripts/lib/telemetry/requirements.txt
+ENV PATH="/opt/venv/agentteams/bin:${PATH}"
 RUN chmod +x /opt/agentteams/scripts/lib/*.sh 2>/dev/null || true
 
 # Install mc-wrapper as /usr/local/bin/mc (STS credential refresh proxy)
