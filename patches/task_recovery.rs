@@ -176,7 +176,14 @@ pub(crate) async fn wait_ready() {
     }
 }
 
-fn select_session(path: &PathBuf, checkpoint: &str, scope: &Value) -> (String, Vec<ChatMessage>) {
+fn select_session(
+    path: &PathBuf,
+    checkpoint: Option<&str>,
+    scope: &Value,
+) -> (String, Vec<ChatMessage>) {
+    let Some(checkpoint) = checkpoint else {
+        return (String::new(), Vec::new());
+    };
     let saved: Option<Value> = std::fs::read(path)
         .ok()
         .and_then(|data| serde_json::from_slice(&data).ok());
@@ -240,6 +247,7 @@ impl Run {
         work: Value,
         scope: Value,
         checkpoint_digest: &str,
+        delivery_only: bool,
     ) -> Result<Arc<Self>, &'static str> {
         let key = digest(&scope);
         let cache_path = home()
@@ -249,7 +257,13 @@ impl Run {
                 "runtime/openhuman-message-sessions"
             })
             .join(format!("{key}.json"));
-        let (mut session, mut restored) = select_session(&cache_path, checkpoint_digest, &scope);
+        // Delivery uses only the verified saved bytes, SDK device and durable
+        // transaction. A submitted Task no longer admits session-cache reads.
+        let (mut session, mut restored) = select_session(
+            &cache_path,
+            (!delivery_only).then_some(checkpoint_digest),
+            &scope,
+        );
         if !restored.is_empty() {
             let view = rpc(json!({"action":"session.load","work":work})).await?;
             let native = serde_json::to_value(&restored).map_err(|_| "invalid native history")?;
@@ -599,6 +613,7 @@ pub(crate) async fn admit_message(
         claim["checkpoint_digest"]
             .as_str()
             .ok_or("missing checkpoint digest")?,
+        claim["recovery"] == "deliver",
     )
     .await?;
     if claim["recovery"] == "deliver" {
@@ -706,6 +721,16 @@ async fn scan(
         let execution = &task["execution"];
         let identity = json!({"task_id":task["task_id"], "team_id":entry["team_id"], "generation":execution["generation"], "instance_id":execution["instance_id"],"process_id":execution["process_id"]});
         let admission = identity.to_string();
+        let delivery_only = execution["checkpoint"]["delivery"] == "pending";
+        if !delivery_only
+            && (task["status"] == "submitted" || ADMITTED.lock().unwrap().contains(&admission))
+        {
+            continue;
+        }
+        if execution["state"] == "needs_verification" {
+            tracing::warn!("Owned Task is waiting for side-effect verification");
+            continue;
+        }
         let room = task["room_id"]
             .as_str()
             .ok_or("missing Task room")?
@@ -732,9 +757,10 @@ async fn scan(
             claimed["checkpoint_digest"]
                 .as_str()
                 .ok_or("missing checkpoint digest")?,
+            delivery_only,
         )
         .await?;
-        if execution["checkpoint"]["delivery"] == "pending" {
+        if delivery_only {
             run.deliver(
                 claimed["saved_result"]
                     .as_str()
@@ -744,16 +770,7 @@ async fn scan(
             .await?;
             continue;
         }
-        if execution["state"] == "needs_verification" {
-            // A fresh process cannot establish the outcome of an interrupted
-            // native effect from its old session. Wait for shared verification
-            // evidence instead of asking the model to replay that operation.
-            tracing::warn!("Owned Task is waiting for side-effect verification");
-            continue;
-        }
-        if task["status"] == "submitted" || !ADMITTED.lock().unwrap().insert(admission) {
-            continue;
-        }
+        ADMITTED.lock().unwrap().insert(admission);
         let id = SOURCES
             .lock()
             .unwrap()
@@ -884,7 +901,9 @@ mod tests {
             "authority":authority(),"checkpoint_digest":"checkpoint-4","session_id":"native-thread-a",
             "expires_at":now()+3600,"history":history,"native_digest":digest(&history)});
         std::fs::write(&path, saved.to_string()).unwrap();
-        let (id, restored) = select_session(&path, "checkpoint-4", &scope);
+        let (delivery_session, delivery_history) = select_session(&path, None, &scope);
+        assert!(delivery_session.is_empty() && delivery_history.is_empty());
+        let (id, restored) = select_session(&path, Some("checkpoint-4"), &scope);
         assert_eq!(id, "native-thread-a");
         assert_eq!(restored.len(), 3);
         assert_eq!(restored[2].role, "tool");
@@ -903,13 +922,17 @@ mod tests {
             let mut invalid = saved.clone();
             invalid[field] = replacement;
             std::fs::write(&path, invalid.to_string()).unwrap();
-            let (new_id, restored) = select_session(&path, "checkpoint-4", &scope);
+            let (new_id, restored) = select_session(&path, Some("checkpoint-4"), &scope);
             assert_ne!(new_id, "native-thread-a", "{field}");
             assert!(restored.is_empty(), "{field}");
         }
         std::fs::remove_file(&path).unwrap();
-        assert!(select_session(&path, "checkpoint-4", &scope).1.is_empty());
+        assert!(select_session(&path, Some("checkpoint-4"), &scope)
+            .1
+            .is_empty());
         std::fs::write(&path, "{broken").unwrap();
-        assert!(select_session(&path, "checkpoint-4", &scope).1.is_empty());
+        assert!(select_session(&path, Some("checkpoint-4"), &scope)
+            .1
+            .is_empty());
     }
 }
