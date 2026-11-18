@@ -501,6 +501,78 @@ impl Run {
     }
 }
 
+fn same_input(event: &Value, record: &Value) -> bool {
+    event["event_id"] == record["event_id"]
+        && event["sender"] == record["input"]["sender"]
+        && event["type"] == record["input"]["type"]
+        && event["content"] == record["input"]["content"]
+        && event
+            .get("room_id")
+            .is_none_or(|id| id == &record["room_id"])
+}
+
+async fn room_context(client: &Client, record: &Value) -> Result<Vec<Value>, &'static str> {
+    let room_id = record["room_id"]
+        .as_str()
+        .ok_or("missing source room")?
+        .parse::<matrix_sdk::ruma::OwnedRoomId>()
+        .map_err(|_| "invalid source room")?;
+    let id = record["event_id"]
+        .as_str()
+        .ok_or("missing source event")?
+        .parse::<matrix_sdk::ruma::OwnedEventId>()
+        .map_err(|_| "invalid source event")?;
+    let room = client.get_room(&room_id).ok_or("missing SDK room")?;
+    let page = room
+        .event_with_context(&id, false, 24u32.into(), None)
+        .await
+        .map_err(|_| "Matrix source context unavailable")?;
+    let original: Value = serde_json::from_str(
+        page.event
+            .as_ref()
+            .ok_or("source event unavailable")?
+            .raw()
+            .json()
+            .get(),
+    )
+    .map_err(|_| "invalid source event")?;
+    if !same_input(&original, record) {
+        return Err("Matrix source differs from the shared input");
+    }
+    let mut history = Vec::new();
+    for item in page.events_before.iter().rev() {
+        let raw: Value =
+            serde_json::from_str(item.raw().json().get()).map_err(|_| "invalid history")?;
+        if raw["type"] != "m.room.message" {
+            continue;
+        }
+        let Some(prior) = raw["event_id"].as_str() else {
+            continue;
+        };
+        let key = digest(&json!([room_id.as_str(), prior]));
+        let accepted = rpc(json!({"action":"matrix.input","event_key":key})).await?;
+        if matches!(accepted["intent"].as_str(), Some("context" | "message")) {
+            if !same_input(&raw, &accepted) {
+                return Err("Matrix history differs from the shared input");
+            }
+            history.push(
+                json!({"event_id":prior,"sender":raw["sender"],"body":raw["content"]["body"]}),
+            );
+        }
+    }
+    let reply_to = original
+        .pointer("/content/m.relates_to/m.in_reply_to/event_id")
+        .and_then(Value::as_str);
+    if let Some(parent) = reply_to.filter(|p| !history.iter().any(|e| e["event_id"] == *p)) {
+        let key = digest(&json!([room_id.as_str(), parent]));
+        let accepted = rpc(json!({"action":"matrix.input","event_key":key})).await?;
+        if matches!(accepted["intent"].as_str(), Some("context" | "message")) {
+            history.insert(0,json!({"event_id":parent,"sender":accepted["input"]["sender"],"body":accepted["input"]["content"]["body"]}));
+        }
+    }
+    Ok(history)
+}
+
 pub(crate) async fn admit_message(
     client: &Client,
     record: &Value,
@@ -543,6 +615,13 @@ pub(crate) async fn admit_message(
         .as_str()
         .ok_or("missing recovery context")?
         .to_owned();
+    if run.restored.is_empty() {
+        let previous = room_context(client, record).await?;
+        if !previous.is_empty() {
+            prompt.push_str("\nEarlier accepted room messages for context:\n");
+            prompt.push_str(&json!(previous).to_string());
+        }
+    }
     prompt.push_str("\nNative Matrix input:\n");
     prompt.push_str(body);
     let input = ChannelMessage {
@@ -744,6 +823,25 @@ pub(crate) fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_requires_the_same_accepted_event_and_room() {
+        let source = json!({"type":"m.room.message","content":{"body":"one"},"sender":"@alice:d"});
+        let record = json!({"input":source,"event_id":"$one","room_id":"!a:d"});
+        let mut event = source;
+        event["event_id"] = json!("$one");
+        assert!(same_input(&event, &record));
+        for (key, changed) in [
+            ("room_id", json!("!b:d")),
+            ("event_id", json!("$other")),
+            ("sender", json!("@mallory:d")),
+            ("content", json!({"body":"changed"})),
+        ] {
+            let mut altered = event.clone();
+            altered[key] = changed;
+            assert!(!same_input(&altered, &record));
+        }
+    }
 
     #[test]
     fn saved_reply_proof_is_bound_to_room_sender_bytes_and_transaction() {

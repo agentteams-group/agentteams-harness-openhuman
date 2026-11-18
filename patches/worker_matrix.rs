@@ -182,14 +182,17 @@ where
         }
     }
     let snapshot = rpc(json!({"action":"matrix.load"})).await?;
-    let records = rpc(json!({"action":"matrix.pending","snapshot":snapshot})).await?;
+    // Each accepted input has its own storage key. Keep RPC response sizes
+    // bounded when a Worker has accumulated many events while stopped.
+    let mut records = Vec::new();
+    for key in snapshot["state"]["pending"]
+        .as_array()
+        .ok_or("missing pending inputs")?
+    {
+        records.push(rpc(json!({"action":"matrix.input","event_key":key})).await?);
+    }
     for intent in ["task_notification", "message"] {
-        for record in records
-            .as_array()
-            .ok_or("invalid Matrix pending records")?
-            .iter()
-            .filter(|r| r["intent"] == intent)
-        {
+        for record in records.iter().filter(|r| r["intent"] == intent) {
             let room = record["room_id"].as_str().ok_or("missing room ID")?;
             if snapshot["state"]["rooms"][room]["gaps"]
                 .as_array()
