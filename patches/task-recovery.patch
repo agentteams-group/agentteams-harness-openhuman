@@ -284,9 +284,26 @@
              }
          }
  
+--- a/src/openhuman/routing/provider.rs
++++ b/src/openhuman/routing/provider.rs
+@@ -370,7 +370,13 @@
+ #[async_trait]
+ impl Provider for IntelligentRoutingProvider {
+     fn capabilities(&self) -> ProviderCapabilities {
+-        self.remote.capabilities()
++        let mut capabilities = self.remote.capabilities();
++        // The reliable and model routers may expose tool support through the
++        // dedicated method. Preserve local routing policy when it is enabled.
++        if !self.local_enabled {
++            capabilities.native_tool_calling = self.remote.supports_native_tools();
++        }
++        capabilities
+     }
+
+     fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
 --- /dev/null
 +++ b/tests/agentteams_task_recovery.rs
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,112 @@
 +//! Native API/adapter tests; these do not replace real Controller/Matrix/model E2E.
 +use openhuman_core::openhuman;
 +use openhuman_core::openhuman::channels::traits;
@@ -378,6 +395,26 @@
 +        "cancelled stdio session must be rebuilt"
 +    );
 +    client.close_session().await.unwrap();
++}
++
++#[test]
++fn gateway_routing_preserves_structured_tool_capability() {
++    use openhuman_core::openhuman::config::Config;
++    use openhuman_core::openhuman::inference::provider::{
++        create_intelligent_routing_provider, ProviderRuntimeOptions,
++    };
++
++    let mut config = Config::default();
++    config.local_ai.runtime_enabled = false;
++    let provider = create_intelligent_routing_provider(
++        Some("http://127.0.0.1:8080/v1"),
++        None,
++        Some("fixture-worker-key"),
++        &config,
++        &ProviderRuntimeOptions::default(),
++    )
++    .unwrap();
++    assert!(provider.supports_native_tools());
 +}
 diff --git a/src/openhuman/memory/conversations/store.rs b/src/openhuman/memory/conversations/store.rs
 index 577eeae..794fd24 100644
