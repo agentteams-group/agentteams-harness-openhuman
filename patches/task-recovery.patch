@@ -379,3 +379,104 @@
 +    );
 +    client.close_session().await.unwrap();
 +}
+diff --git a/src/openhuman/memory/conversations/store.rs b/src/openhuman/memory/conversations/store.rs
+index 577eeae..794fd24 100644
+--- a/src/openhuman/memory/conversations/store.rs
++++ b/src/openhuman/memory/conversations/store.rs
+@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
+ use log::{debug, warn};
+ use once_cell::sync::Lazy;
+ use parking_lot::Mutex;
++use sha2::{Digest, Sha256};
+ use tempfile::NamedTempFile;
+
+ use super::types::{
+@@ -24,6 +25,7 @@ use super::types::{
+ const LOG_PREFIX: &str = "[memory:conversations]";
+ const THREADS_FILENAME: &str = "threads.jsonl";
+ const THREAD_MESSAGES_DIR: &str = "threads";
++const MAX_HEX_THREAD_ID_BYTES: usize = (255 - ".jsonl".len()) / 2;
+ static CONVERSATION_STORE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+ fn redact_title_for_log(title: &str) -> String {
+@@ -411,9 +413,18 @@ impl ConversationStore {
+     }
+
+     fn thread_messages_path(&self, thread_id: &str) -> PathBuf {
++        // Long Matrix Task thread IDs cannot fit as hex in a 255-byte filename.
++        let name = if thread_id.len() <= MAX_HEX_THREAD_ID_BYTES {
++            hex::encode(thread_id.as_bytes())
++        } else {
++            format!(
++                "sha256-{}",
++                hex::encode(Sha256::digest(thread_id.as_bytes()))
++            )
++        };
+         self.root_dir()
+             .join(THREAD_MESSAGES_DIR)
+-            .join(format!("{}.jsonl", hex::encode(thread_id.as_bytes())))
++            .join(format!("{name}.jsonl"))
+     }
+
+     fn list_threads_unlocked(&self) -> Result<Vec<ConversationThread>, String> {
+diff --git a/src/openhuman/memory/conversations/store_tests.rs b/src/openhuman/memory/conversations/store_tests.rs
+index a95a350..8f2a111 100644
+--- a/src/openhuman/memory/conversations/store_tests.rs
++++ b/src/openhuman/memory/conversations/store_tests.rs
+@@ -40,6 +40,11 @@ fn store_roundtrips_threads_and_messages() {
+             },
+         )
+         .expect("append message");
++    let legacy_path = store
++        .root_dir()
++        .join("threads")
++        .join(format!("{}.jsonl", hex::encode("default-thread")));
++    assert!(legacy_path.is_file());
+
+     let threads = store.list_threads().expect("list threads");
+     assert_eq!(threads.len(), 1);
+@@ -736,3 +741,44 @@ fn read_jsonl_skips_invalid_lines_but_keeps_valid_ones() {
+     assert_eq!(messages[0].id, "m1");
+     assert_eq!(messages[1].id, "m2");
+ }
++
++#[test]
++fn store_roundtrips_long_matrix_task_thread() {
++    let (temp, store) = make_store();
++    let thread_id = format!(
++        "channel:matrix_@worker:example.org_!room:example.org_task:{}",
++        "任务".repeat(35)
++    );
++    let created_at = "2026-04-10T12:00:00Z";
++    store
++        .ensure_thread(CreateConversationThread {
++            parent_thread_id: None,
++            id: thread_id.clone(),
++            title: "Task continuation".into(),
++            created_at: created_at.into(),
++            labels: None,
++        })
++        .expect("ensure long thread");
++    store
++        .append_message(
++            &thread_id,
++            ConversationMessage {
++                id: "restored-input".into(),
++                content: "Continue the assigned task".into(),
++                message_type: "text".into(),
++                extra_metadata: json!({}),
++                sender: "worker".into(),
++                created_at: created_at.into(),
++            },
++        )
++        .expect("append message for a long Task thread");
++
++    let reopened = ConversationStore::new(temp.path().to_path_buf());
++    assert_eq!(reopened.list_threads().unwrap()[0].id, thread_id);
++    assert_eq!(
++        reopened.get_messages(&thread_id).unwrap()[0].id,
++        "restored-input"
++    );
++    assert!(reopened.delete_thread(&thread_id, created_at).unwrap());
++    assert!(reopened.get_messages(&thread_id).unwrap().is_empty());
++}
