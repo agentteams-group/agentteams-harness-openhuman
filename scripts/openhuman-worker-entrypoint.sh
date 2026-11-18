@@ -87,8 +87,11 @@ mkdir -p "${WORKSPACE}" "${WORKSPACE}/shared" "${WORKSPACE}/memory" \
 
 log "Pulling Worker config from centralized storage..."
 ensure_mc_credentials 2>/dev/null || true
+# The native workspace uses a link to the Worker shared directory.
+# Older Harnesses can leave separate cached Task records under this prefix.
+WORKER_PULL_EXCLUDES=(--exclude "credentials/**" --exclude "workspace/shared/**")
 mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/" "${WORKSPACE}/" \
-    --overwrite --exclude "credentials/**" 2>/dev/null || true
+    --overwrite "${WORKER_PULL_EXCLUDES[@]}" 2>/dev/null || true
 mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/shared/" "${WORKSPACE}/shared/" \
     --overwrite 2>/dev/null || true
 
@@ -112,7 +115,7 @@ while [ ! -f "${WORKSPACE}/SOUL.md" ] || [ ! -f "${WORKSPACE}/AGENTS.md" ]; do
     log "Waiting for config files to appear in MinIO (attempt ${RETRY}/6)..."
     sleep 5
     mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/" "${WORKSPACE}/" \
-        --overwrite --exclude "credentials/**" 2>/dev/null || true
+        --overwrite "${WORKER_PULL_EXCLUDES[@]}" 2>/dev/null || true
     touch "${PULL_MARKER}"
 done
 

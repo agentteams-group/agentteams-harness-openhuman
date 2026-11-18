@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 import yaml
 
 
@@ -22,9 +23,15 @@ def configure(workspace: Path, bundle: Path):
             raise ValueError('Your native shared directory points outside your Worker workspace')
     else:
         if native_shared.exists():
-            if not native_shared.is_dir() or any(native_shared.iterdir()):
-                raise ValueError('Reconcile existing native shared files before using your Worker shared directory')
-            native_shared.rmdir()
+            if not native_shared.is_dir():
+                raise ValueError('Your native shared path must be a directory')
+            if any(native_shared.iterdir()):
+                # Keep old local files for inspection without importing stale Task data.
+                backup = Path(tempfile.mkdtemp(prefix='openhuman-legacy-shared-', dir=runtime.parent))
+                native_shared.rename(backup / 'shared')
+                print(f'Preserved your previous native shared directory at {backup / "shared"}')
+            else:
+                native_shared.rmdir()
         native_shared.symlink_to(shared, target_is_directory=True)
     env = {'TEAMHARNESS_RUNTIME_CONFIG': str(runtime), 'TEAMHARNESS_SHARED_DIR': str(shared)}
     q = json.dumps

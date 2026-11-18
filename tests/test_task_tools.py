@@ -47,15 +47,36 @@ def test_restarting_retains_worker_shared_artifacts_and_standard_role(tmp_path, 
         (tmp_path / 'workspace/shared/artifact.txt').write_text('persisted')
         assert (tmp_path / 'shared/artifact.txt').read_text() == 'persisted'
 
-def test_existing_native_shared_data_requires_reconciliation_without_deletion(tmp_path):
+def test_switch_from_a_harness_with_legacy_shared_data_uses_the_worker_directory(tmp_path):
     (tmp_path / 'runtime').mkdir()
     (tmp_path / 'runtime/runtime.yaml').write_text('member:\n  role: worker\n')
-    shared = tmp_path / 'workspace/shared'
+    legacy = tmp_path / 'workspace/shared/tasks/task'
+    legacy.mkdir(parents=True)
+    (legacy / 'meta.json').write_text('old checkpoint')
+    (legacy / 'unpublished.txt').write_text('old local artifact')
+    shared = tmp_path / 'shared/tasks/task'
     shared.mkdir(parents=True)
-    (shared / 'unverified-artifact.txt').write_text('do not overwrite authoritative artifacts')
-    with pytest.raises(ValueError, match='Reconcile'):
+    (shared / 'meta.json').write_text('current checkpoint')
+
+    for _ in range(2):
+        (tmp_path / 'config.toml').write_text('')
         config.configure(tmp_path, agentteams / 'plugins/teamharness')
-    assert (shared / 'unverified-artifact.txt').is_file()
+        assert legacy.resolve() == shared
+        assert (legacy / 'meta.json').read_text() == 'current checkpoint'
+        assert not (shared / 'unpublished.txt').exists()
+
+    backup, = (tmp_path / 'runtime').glob('openhuman-legacy-shared-*')
+    assert (backup / 'shared/tasks/task/meta.json').read_text() == 'old checkpoint'
+    assert (backup / 'shared/tasks/task/unpublished.txt').read_text() == 'old local artifact'
+
+
+def test_native_shared_link_cannot_point_outside_the_worker_directory(tmp_path):
+    (tmp_path / 'runtime').mkdir()
+    (tmp_path / 'runtime/runtime.yaml').write_text('member:\n  role: worker\n')
+    (tmp_path / 'workspace').mkdir()
+    (tmp_path / 'workspace/shared').symlink_to(tmp_path / 'somewhere-else')
+    with pytest.raises(ValueError, match='points outside'):
+        config.configure(tmp_path, agentteams / 'plugins/teamharness')
 
 def test_old_controller_without_member_contract_does_not_gain_a_broken_server(tmp_path, monkeypatch):
     monkeypatch.delenv('TEAMHARNESS_COORDINATION_URL', raising=False)
