@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      export_native_binary:
+        description: Save the native executable for an isolated runtime-recovery run
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -81,3 +86,26 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - run: make build VERSION=ci AT_CONTEXT=./agentteams
       - run: make smoke VERSION=ci
+
+      - name: Export native executable and build provenance
+        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+        run: |
+          mkdir test-binary
+          image=ghcr.io/agentteams-group/agentteams-harness-openhuman:ci
+          container=$(docker create "$image")
+          trap 'docker rm -f "$container" >/dev/null' EXIT
+          docker cp "$container:/usr/local/bin/openhuman-core" test-binary/openhuman-core
+          docker cp "$container:/usr/share/licenses/openhuman/LICENSE" test-binary/LICENSE
+          git rev-parse HEAD > test-binary/harness.sha
+          git -C agentteams rev-parse HEAD > test-binary/core.sha
+          cp versions.env test-binary/
+          docker inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' "$image" > test-binary/image.txt
+          docker run --rm --entrypoint sh "$image" -c 'dpkg-query -W && ldd /usr/local/bin/openhuman-core' > test-binary/dependencies.txt
+          (cd test-binary && sha256sum openhuman-core > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+        with:
+          name: openhuman-native-test-binary
+          path: test-binary/
+          retention-days: 1
+          if-no-files-found: error
