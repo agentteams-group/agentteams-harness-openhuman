@@ -9,8 +9,11 @@ The native Matrix listener starts recovery before admitting ordinary messages.
 A verified assignment notification wakes discovery instead of starting a second
 ungated turn. Discovery can enqueue an existing Task without a new Matrix event;
 internal recovery inputs are not represented as fabricated Matrix event IDs.
-Saved results go directly to native SDK delivery using the durable transaction
-ID, without entering inference.
+Before discovery, the Matrix listener registers the actual Worker start. A saved
+result uses the current SDK account and device from `whoami`. Core binds the
+first sending device before the SDK sends the encrypted or plaintext event.
+After a device change, the SDK reads room history and verifies the original
+sender, transaction marker and result bytes before acknowledging delivery.
 
 The native dispatcher restores its actual `ChatMessage` history only when its
 Worker authority, team/task scope, runtime, expiry, checkpoint digest and native
@@ -31,7 +34,7 @@ before another effect; cancellation cannot prove an external service rolled back
 
 ## Validation boundary
 
-- Shared Core dependency: `e0bc358b97ad8957320965c89875b6e636e9b307`, including durable-submission interruption recovery. Earlier test proofs below retain their actual older Core SHA.
+- Shared Core dependency: `d49cc3a9af3dcbc38463f34b0e1b881dcfe56f55`. The native Task cache now checks the shared session descriptor and publishes its digest after writing the local native record. Earlier test proofs below retain their actual older Core SHA.
 - Upstream: `v0.54.0`, `c25fc8e5fd3e7716f416571cd53b34247c94ddbe`.
 - All six packaged patches reapplied to that upstream; integrated files matched
   the edited source checkout.

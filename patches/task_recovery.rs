@@ -92,7 +92,9 @@ fn home() -> PathBuf {
         .expect("Worker home is required")
 }
 
-async fn rpc(request: Value) -> Result<Value, &'static str> {
+pub(crate) async fn rpc(mut request: Value) -> Result<Value, &'static str> {
+    request["device_delivery"] = json!(true);
+    request["runtime"] = json!("openhuman");
     let mut child = tokio::process::Command::new("python3")
         .arg("/opt/agentteams/scripts/lib/task_recovery_rpc.py")
         .stdin(Stdio::piped())
@@ -163,6 +165,36 @@ fn select_session(path: &PathBuf, checkpoint: &str, scope: &Value) -> (String, V
     (uuid::Uuid::new_v4().to_string(), Vec::new())
 }
 
+fn delivered_event(
+    event: &Value,
+    room: &str,
+    sender: &str,
+    text: &str,
+    txn: &str,
+    legacy: bool,
+) -> Option<String> {
+    let content = &event["content"];
+    if event["type"] != "m.room.message"
+        || event.get("room_id").is_some_and(|id| id != room)
+        || event["sender"] != sender
+        || content["msgtype"] != "m.text"
+        || content["body"] != text
+    {
+        return None;
+    }
+    if content["org.agentteams.reply_txn"] == txn
+        || (legacy
+            && content.get("org.agentteams.reply_txn").is_none()
+            && event["unsigned"]["transaction_id"] == txn)
+    {
+        return event["event_id"]
+            .as_str()
+            .filter(|id| id.starts_with('$') && id.len() > 1)
+            .map(str::to_owned);
+    }
+    None
+}
+
 impl Run {
     pub(crate) async fn current(&self) -> Result<Value, &'static str> {
         if self.cancel.is_cancelled() {
@@ -195,27 +227,76 @@ impl Run {
             .get_room(&room_id)
             .filter(|room| room.state() == RoomState::Joined)
             .ok_or("room not joined")?;
-        let transaction = checkpoint["reply_txn"]
+        let who = self
+            .client
+            .whoami()
+            .await
+            .map_err(|_| "Matrix whoami unavailable")?;
+        let device = who.device_id.ok_or("Matrix device unavailable")?;
+        if self.client.user_id() != Some(&who.user_id) || self.client.device_id() != Some(&device) {
+            return Err("Matrix identity differs from the restored SDK session");
+        }
+        let plan = rpc(
+            json!({"action":"plan_reply", "identity":self.identity, "text":text,
+            "sender":who.user_id.as_str(), "device":device.as_str()}),
+        )
+        .await?;
+        let transaction = plan["reply_txn"]
             .as_str()
             .ok_or("missing durable transaction")?;
-        rpc(json!({"action":"current", "identity":self.identity})).await?;
-        // One SDK wire attempt. The next discovery rechecks authority and reuses
-        // the durable transaction; SDK encryption/device state remains native.
-        let response = room
-            .send_raw(
-                "m.room.message",
-                json!({"msgtype":"m.text", "body":text,
-            "org.agentteams.progress_only":true, "m.mentions":{"user_ids":[]}}),
-            )
-            .with_transaction_id(transaction.into())
-            .with_request_config(
-                RequestConfig::default()
-                    .disable_retry()
-                    .timeout(Duration::from_secs(20)),
-            )
-            .await
-            .map_err(|_| "Matrix delivery failed")?;
-        rpc(json!({"action":"delivered", "identity":self.identity, "event_id":response.event_id.to_string()})).await?;
+        if checkpoint["reply_txn"] != transaction {
+            return Err("saved reply changed before native delivery");
+        }
+        let event_id = match plan["mode"].as_str() {
+            Some("send") => room
+                .send_raw(
+                    "m.room.message",
+                    json!({"msgtype":"m.text", "body":text,
+                    "org.agentteams.reply_txn":transaction, "org.agentteams.progress_only":true,
+                    "m.mentions":{"user_ids":[]}}),
+                )
+                .with_transaction_id(transaction.into())
+                .with_request_config(
+                    RequestConfig::default()
+                        .disable_retry()
+                        .timeout(Duration::from_secs(15)),
+                )
+                .await
+                .map_err(|_| "Matrix delivery failed")?
+                .event_id
+                .to_string(),
+            Some("find") => {
+                let mut page = matrix_sdk::room::MessagesOptions::backward();
+                let mut seen = HashSet::new();
+                loop {
+                    let entries = room
+                        .messages(page)
+                        .await
+                        .map_err(|_| "Matrix history unavailable")?;
+                    if let Some(id) = entries.chunk.iter().find_map(|entry| {
+                        let event: Value = serde_json::from_str(entry.raw().json().get()).ok()?;
+                        delivered_event(
+                            &event,
+                            &self.room,
+                            who.user_id.as_str(),
+                            text,
+                            transaction,
+                            plan["legacy"] == true,
+                        )
+                    }) {
+                        break id;
+                    }
+                    let from = entries.end.ok_or("prior delivery needs verification")?;
+                    if !seen.insert(from.clone()) {
+                        return Err("Matrix history pagination loop");
+                    }
+                    page = matrix_sdk::room::MessagesOptions::backward();
+                    page.from = Some(from);
+                }
+            }
+            _ => return Err("invalid delivery mode"),
+        };
+        rpc(json!({"action":"delivered", "identity":self.identity, "event_id":event_id})).await?;
         Ok(())
     }
 
@@ -237,7 +318,8 @@ impl Run {
     }
 
     async fn remember(&self, history: &[ChatMessage]) -> Result<(), &'static str> {
-        let current = self.current().await?;
+        let work = json!({"kind":"task","team_id":self.identity["team_id"],"task_id":self.identity["task_id"]});
+        let current = rpc(json!({"action":"session.load","work":work})).await?;
         // Preserve the actual native tool transcript. New startup system policy
         // is projected separately, never restored from an old Harness session.
         let history: Vec<ChatMessage> = history
@@ -271,6 +353,8 @@ impl Run {
             let _ = std::fs::remove_file(&temporary);
             return Err("native cache persistence failed");
         }
+        rpc(json!({"action":"session.remember","work":work,"snapshot":current,"identity":self.identity,
+            "native_ref":self.session,"native_digest":cache["native_digest"],"expires_at":cache["expires_at"]})).await?;
         *self.native_history.lock().unwrap() = history;
         Ok(())
     }
@@ -316,7 +400,7 @@ async fn scan(
         };
         let task = &claimed["task"];
         let execution = &task["execution"];
-        let identity = json!({"task_id":task["task_id"], "team_id":entry["team_id"], "generation":execution["generation"], "instance_id":execution["instance_id"]});
+        let identity = json!({"task_id":task["task_id"], "team_id":entry["team_id"], "generation":execution["generation"], "instance_id":execution["instance_id"],"process_id":execution["process_id"]});
         let admission = identity.to_string();
         let room = task["room_id"]
             .as_str()
@@ -338,13 +422,21 @@ async fn scan(
         let cache_path = home()
             .join("runtime/openhuman-task-sessions")
             .join(format!("{key}.json"));
-        let (session, restored) = select_session(
+        let (mut session, mut restored) = select_session(
             &cache_path,
             claimed["checkpoint_digest"]
                 .as_str()
                 .ok_or("missing checkpoint digest")?,
             &json!([entry["team_id"], task["task_id"]]),
         );
+        if !restored.is_empty() {
+            let view = rpc(json!({"action":"session.load","work":{"kind":"task","task_id":task["task_id"],"team_id":entry["team_id"]}})).await?;
+            let native = serde_json::to_value(&restored).map_err(|_| "invalid native history")?;
+            if rpc(json!({"action":"session.usable","snapshot":view,"native_ref":session,"native_digest":digest(&native)})).await? != true {
+                restored.clear();
+                session = uuid::Uuid::new_v4().to_string();
+            }
+        }
         let run = Arc::new(Run {
             identity,
             admission: admission.clone(),
@@ -428,6 +520,12 @@ pub(crate) fn start(
     READY.store(false, Ordering::Release);
     Some(Monitor(tokio::spawn(async move {
         while !tx.is_closed() {
+            if rpc(json!({"action":"matrix.start"})).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        while !tx.is_closed() {
             if let Err(error) = scan(&client, &own, &tx).await {
                 tracing::warn!("Owned Task recovery deferred: {error}");
             }
@@ -439,6 +537,33 @@ pub(crate) fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_reply_proof_is_bound_to_room_sender_bytes_and_transaction() {
+        let mut event = json!({"type":"m.room.message","room_id":"!room:d","sender":"@me:d","event_id":"$ok",
+            "content":{"msgtype":"m.text","body":"final","org.agentteams.reply_txn":"txn"}});
+        let confirm = |event: &Value, legacy| {
+            delivered_event(event, "!room:d", "@me:d", "final", "txn", legacy)
+        };
+        assert_eq!(confirm(&event, false).as_deref(), Some("$ok"));
+        for (path, changed) in [
+            ("/room_id", "!other:d"),
+            ("/sender", "@else:d"),
+            ("/content/body", "different"),
+            ("/content/org.agentteams.reply_txn", "other"),
+        ] {
+            let mut bad = event.clone();
+            *bad.pointer_mut(path).unwrap() = json!(changed);
+            assert!(confirm(&bad, false).is_none());
+        }
+        event["content"]
+            .as_object_mut()
+            .unwrap()
+            .remove("org.agentteams.reply_txn");
+        event["unsigned"] = json!({"transaction_id":"txn"});
+        assert!(confirm(&event, false).is_none());
+        assert_eq!(confirm(&event, true).as_deref(), Some("$ok"));
+    }
 
     #[test]
     fn only_current_scoped_unexpired_native_history_is_reused() {
