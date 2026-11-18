@@ -55,8 +55,7 @@ receives its readiness signal after both Task discovery and Matrix recovery.
   packaged in `task-recovery.patch`. Hosted native compilation and all five
   Rust tests passed at `b70b490` and at `d6a4fd3` (including the startup verification
   fence and released-tool check). The former's independent image/smoke CI also
-  passed. See `tests/evidence/worker-task-native-controls-1631.json` for exact SHAs,
-  job URLs, log hashes and limits; the latter's image job is still running.
+  passed.
 
 This is still a Draft implementation. Real model/Controller/Matrix Task continuation, reply-only recovery, authority conflicts, unknown
 effects, cancellation/reassignment and the full restart/switch matrix remain
