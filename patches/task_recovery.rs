@@ -19,6 +19,7 @@ static RUNS: Lazy<Mutex<HashMap<String, Arc<Run>>>> = Lazy::new(|| Mutex::new(Ha
 static ADMITTED: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 static SOURCES: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static READY: AtomicBool = AtomicBool::new(false);
+static MATRIX_INBOX_READY: Notify = Notify::const_new();
 static WAKE: Notify = Notify::const_new();
 
 tokio::task_local! { pub(crate) static TASK_RUN: Arc<Run>; }
@@ -43,6 +44,8 @@ pub(crate) async fn checkpoint(history: &[ChatMessage]) -> anyhow::Result<()> {
 
 pub(crate) struct Run {
     identity: Value,
+    work: Value,
+    scope: Value,
     admission: String,
     client: Client,
     room: String,
@@ -133,6 +136,40 @@ pub(crate) fn source(room: &str, task: &str, event: &str) {
     WAKE.notify_one();
 }
 
+pub(crate) async fn commit_input(
+    workspace: &std::path::Path,
+    room: &str,
+    event: &str,
+    session: &str,
+) -> Result<(), &'static str> {
+    if !enabled() || !event.starts_with('$') {
+        return Ok(());
+    }
+    let key = digest(&json!([room, event]));
+    let file = workspace.join(".agentteams/matrix-sessions").join(format!(
+        "{:x}.json",
+        Sha256::digest(format!("{room}\0{event}"))
+    ));
+    let data = std::fs::read(file).map_err(|_| "native input missing")?;
+    let row: Value = serde_json::from_slice(&data).map_err(|_| "invalid native input")?;
+    if row["session"] != session
+        || !row["receipts"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|r| r["room_id"] == room && r["event_id"] == event)
+        })
+    {
+        return Err("native source identity changed");
+    }
+    let view = rpc(json!({"action":"matrix.native.get","event_key":key})).await?;
+    rpc(json!({"action":"matrix.native.commit","event_key":key,"snapshot":view,"native_ref":session,"native_digest":format!("{:x}",Sha256::digest(&data))})).await?;
+    Ok(())
+}
+
+pub(crate) fn matrix_inbox_scanned() {
+    MATRIX_INBOX_READY.notify_one();
+}
+
 pub(crate) async fn wait_ready() {
     while enabled() && !READY.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -196,11 +233,73 @@ fn delivered_event(
 }
 
 impl Run {
+    async fn new(
+        client: &Client,
+        room: &str,
+        identity: Value,
+        work: Value,
+        scope: Value,
+        checkpoint_digest: &str,
+    ) -> Result<Arc<Self>, &'static str> {
+        let key = digest(&scope);
+        let cache_path = home()
+            .join(if work["kind"] == "task" {
+                "runtime/openhuman-task-sessions"
+            } else {
+                "runtime/openhuman-message-sessions"
+            })
+            .join(format!("{key}.json"));
+        let (mut session, mut restored) = select_session(&cache_path, checkpoint_digest, &scope);
+        if !restored.is_empty() {
+            let view = rpc(json!({"action":"session.load","work":work})).await?;
+            let native = serde_json::to_value(&restored).map_err(|_| "invalid native history")?;
+            if rpc(json!({"action":"session.usable","snapshot":view,"native_ref":session,"native_digest":digest(&native)})).await? != true {
+                restored.clear();
+                session = uuid::Uuid::new_v4().to_string();
+            }
+        }
+        Ok(Arc::new(Run {
+            work,
+            scope,
+            admission: identity.to_string(),
+            identity,
+            client: client.clone(),
+            room: room.to_owned(),
+            session: session.clone(),
+            native_history: Mutex::new(restored.clone()),
+            restored,
+            cache_path,
+            cancel: CancellationToken::new(),
+            started: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            succeeded: AtomicBool::new(false),
+        }))
+    }
+
+    fn message(&self) -> bool {
+        self.work["kind"] == "message"
+    }
+
+    async fn call(
+        &self,
+        task_action: &str,
+        message_action: &str,
+        mut fields: Value,
+    ) -> Result<Value, &'static str> {
+        fields["action"] = json!(if self.message() {
+            message_action
+        } else {
+            task_action
+        });
+        fields["identity"] = self.identity.clone();
+        rpc(fields).await
+    }
     pub(crate) async fn current(&self) -> Result<Value, &'static str> {
         if self.cancel.is_cancelled() {
             return Err("conflict");
         }
-        rpc(json!({"action":"current", "identity":self.identity})).await
+        self.call("current", "matrix.message.current", json!({}))
+            .await
     }
 
     pub(crate) fn restore(&self) -> Vec<ChatMessage> {
@@ -209,7 +308,11 @@ impl Run {
 
     pub(crate) async fn guard(self: Arc<Self>) {
         while !self.finished.load(Ordering::Acquire) {
-            if rpc(json!({"action":"current", "identity":self.identity})).await == Err("conflict") {
+            if self
+                .call("current", "matrix.message.owned", json!({}))
+                .await
+                == Err("conflict")
+            {
                 self.cancel.cancel();
                 return;
             }
@@ -236,11 +339,14 @@ impl Run {
         if self.client.user_id() != Some(&who.user_id) || self.client.device_id() != Some(&device) {
             return Err("Matrix identity differs from the restored SDK session");
         }
-        let plan = rpc(
-            json!({"action":"plan_reply", "identity":self.identity, "text":text,
+        let plan = self
+            .call(
+                "plan_reply",
+                "matrix.message.plan_reply",
+                json!({"text":text,
             "sender":who.user_id.as_str(), "device":device.as_str()}),
-        )
-        .await?;
+            )
+            .await?;
         let transaction = plan["reply_txn"]
             .as_str()
             .ok_or("missing durable transaction")?;
@@ -296,17 +402,36 @@ impl Run {
             }
             _ => return Err("invalid delivery mode"),
         };
-        rpc(json!({"action":"delivered", "identity":self.identity, "event_id":event_id})).await?;
+        self.call(
+            "delivered",
+            "matrix.message.delivered",
+            json!({"event_id":event_id}),
+        )
+        .await?;
         Ok(())
     }
 
     pub(crate) async fn complete(&self, text: &str) -> Result<(), &'static str> {
-        let reply =
-            rpc(json!({"action":"prepare_reply", "identity":self.identity, "text":text})).await?;
-        let cp = &reply["saved"]["execution"]["checkpoint"];
+        let reply = self
+            .call(
+                "prepare_reply",
+                "matrix.message.save_reply",
+                json!({"text":text}),
+            )
+            .await?;
+        let (cp, body) = if self.message() {
+            (
+                &reply["execution"]["checkpoint"],
+                reply["saved_result"].as_str().unwrap_or(text),
+            )
+        } else {
+            (
+                &reply["saved"]["execution"]["checkpoint"],
+                reply["text"].as_str().ok_or("missing saved reply")?,
+            )
+        };
         if cp["delivery"] != "delivered" {
-            self.deliver(reply["text"].as_str().ok_or("missing saved reply")?, cp)
-                .await?;
+            self.deliver(body, cp).await?;
         }
         let history = self.native_history.lock().unwrap().clone();
         if let Err(error) = self.remember(&history).await {
@@ -318,7 +443,7 @@ impl Run {
     }
 
     async fn remember(&self, history: &[ChatMessage]) -> Result<(), &'static str> {
-        let work = json!({"kind":"task","team_id":self.identity["team_id"],"task_id":self.identity["task_id"]});
+        let work = &self.work;
         let current = rpc(json!({"action":"session.load","work":work})).await?;
         // Preserve the actual native tool transcript. New startup system policy
         // is projected separately, never restored from an old Harness session.
@@ -329,7 +454,7 @@ impl Run {
             .collect();
         let serialized =
             serde_json::to_value(&history).map_err(|_| "native history serialization failed")?;
-        let cache = json!({"format_version":1, "runtime":"openhuman", "authority":authority(), "scope":json!([self.identity["team_id"], self.identity["task_id"]]),
+        let cache = json!({"format_version":1, "runtime":"openhuman", "authority":authority(), "scope":self.scope,
             "session_id":self.session, "checkpoint_digest":current["checkpoint_digest"],
             "native_digest":digest(&serialized), "history":serialized, "expires_at":now()+86400});
         let directory = self.cache_path.parent().ok_or("missing cache directory")?;
@@ -359,8 +484,14 @@ impl Run {
         Ok(())
     }
 
+    pub(crate) async fn cancel_message(&self) {
+        if self.message() {
+            let _ = rpc(json!({"action":"matrix.message.cancel","identity":self.identity})).await;
+        }
+    }
+
     pub(crate) async fn close(&self, id: &str, success: bool) {
-        if !success && self.started.load(Ordering::Acquire) {
+        if !success && self.started.load(Ordering::Acquire) && !self.message() {
             let _ = rpc(json!({"action":"interrupted", "identity":self.identity})).await;
         } else if !success {
             ADMITTED.lock().unwrap().remove(&self.admission);
@@ -368,6 +499,100 @@ impl Run {
         self.finished.store(true, Ordering::Release);
         RUNS.lock().unwrap().remove(id);
     }
+}
+
+pub(crate) async fn admit_message(
+    client: &Client,
+    record: &Value,
+    key: &str,
+    tx: &mpsc::Sender<ChannelMessage>,
+    body: &str,
+    on_admit: impl FnOnce(),
+) -> Result<(), &'static str> {
+    let id = record["event_id"].as_str().ok_or("missing source event")?;
+    if get(id).is_some() {
+        return Ok(());
+    }
+    let claim = rpc(json!({"action":"matrix.message.claim","event_key":key})).await?;
+    if !matches!(claim["recovery"].as_str(), Some("resume" | "deliver")) {
+        return Ok(());
+    }
+    let room = record["room_id"].as_str().ok_or("missing source room")?;
+    let run = Run::new(
+        client,
+        room,
+        claim["identity"].clone(),
+        json!({"kind":"message","event_key":key}),
+        json!([room, id]),
+        claim["checkpoint_digest"]
+            .as_str()
+            .ok_or("missing checkpoint digest")?,
+    )
+    .await?;
+    if claim["recovery"] == "deliver" {
+        return run
+            .deliver(
+                claim["saved_result"]
+                    .as_str()
+                    .ok_or("missing saved reply")?,
+                &claim["execution"]["checkpoint"],
+            )
+            .await;
+    }
+    let mut prompt = claim["resume_text"]
+        .as_str()
+        .ok_or("missing recovery context")?
+        .to_owned();
+    prompt.push_str("\nNative Matrix input:\n");
+    prompt.push_str(body);
+    let input = ChannelMessage {
+        id: id.to_owned(),
+        sender: record["input"]["sender"]
+            .as_str()
+            .ok_or("missing sender")?
+            .to_owned(),
+        reply_target: room.to_owned(),
+        content: prompt,
+        channel: "matrix".into(),
+        timestamp: now(),
+        thread_ts: Some(run.session.clone()),
+    };
+    if !ADMITTED.lock().unwrap().insert(run.admission.clone()) {
+        return Ok(());
+    }
+    on_admit();
+    RUNS.lock().unwrap().insert(id.to_owned(), run.clone());
+    if tx.send(input).await.is_err() {
+        run.close(id, false).await;
+        return Err("native dispatcher stopped");
+    }
+    Ok(())
+}
+
+pub(crate) async fn begin_message_tools(calls: Value) -> anyhow::Result<Option<String>> {
+    let Ok(run) = TASK_RUN.try_with(Arc::clone) else {
+        return Ok(None);
+    };
+    if !run.message() {
+        return Ok(None);
+    }
+    let op =
+        rpc(json!({"action":"matrix.message.begin_tools","identity":run.identity,"calls":calls}))
+            .await
+            .map_err(anyhow::Error::msg)?;
+    Ok(Some(
+        op.as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing tool operation identity"))?
+            .to_owned(),
+    ))
+}
+
+pub(crate) async fn finish_message_tools(op: Option<String>, results: Value) -> anyhow::Result<()> {
+    if let Some(op) = op {
+        let run = TASK_RUN.try_with(Arc::clone)?;
+        rpc(json!({"action":"matrix.message.finish_tools","identity":run.identity,"operation_id":op,"results":results})).await.map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
 }
 
 async fn scan(
@@ -419,38 +644,17 @@ async fn scan(
                 continue;
             }
         }
-        let cache_path = home()
-            .join("runtime/openhuman-task-sessions")
-            .join(format!("{key}.json"));
-        let (mut session, mut restored) = select_session(
-            &cache_path,
+        let run = Run::new(
+            client,
+            &room,
+            identity.clone(),
+            json!({"kind":"task","task_id":task["task_id"],"team_id":entry["team_id"]}),
+            json!([entry["team_id"], task["task_id"]]),
             claimed["checkpoint_digest"]
                 .as_str()
                 .ok_or("missing checkpoint digest")?,
-            &json!([entry["team_id"], task["task_id"]]),
-        );
-        if !restored.is_empty() {
-            let view = rpc(json!({"action":"session.load","work":{"kind":"task","task_id":task["task_id"],"team_id":entry["team_id"]}})).await?;
-            let native = serde_json::to_value(&restored).map_err(|_| "invalid native history")?;
-            if rpc(json!({"action":"session.usable","snapshot":view,"native_ref":session,"native_digest":digest(&native)})).await? != true {
-                restored.clear();
-                session = uuid::Uuid::new_v4().to_string();
-            }
-        }
-        let run = Arc::new(Run {
-            identity,
-            admission: admission.clone(),
-            client: client.clone(),
-            room: room.clone(),
-            session: session.clone(),
-            native_history: Mutex::new(restored.clone()),
-            restored,
-            cache_path,
-            cancel: CancellationToken::new(),
-            started: AtomicBool::new(false),
-            finished: AtomicBool::new(false),
-            succeeded: AtomicBool::new(false),
-        });
+        )
+        .await?;
         if execution["checkpoint"]["delivery"] == "pending" {
             run.deliver(
                 claimed["saved_result"]
@@ -488,7 +692,7 @@ async fn scan(
                 .to_owned(),
             channel: "matrix".into(),
             timestamp: now(),
-            thread_ts: Some(session),
+            thread_ts: Some(run.session.clone()),
         };
         if tx.send(input).await.is_err() {
             run.close(&id, false).await;
@@ -525,6 +729,9 @@ pub(crate) fn start(
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+        // Prefer original assignment events already staged by the first SDK
+        // scan. Slow Matrix startup must not indefinitely block assigned Tasks.
+        let _ = tokio::time::timeout(Duration::from_secs(5), MATRIX_INBOX_READY.notified()).await;
         while !tx.is_closed() {
             if let Err(error) = scan(&client, &own, &tx).await {
                 tracing::warn!("Owned Task recovery deferred: {error}");

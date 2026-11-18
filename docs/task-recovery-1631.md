@@ -32,9 +32,18 @@ until shared verification evidence is saved; it does not start a replay turn.
 A released execution cannot admit another tool call. This requires verification
 before another effect; cancellation cannot prove an external service rolled back.
 
+The managed Worker consumes native Rust SDK sync responses using its own
+account/device cursor. Decrypted inputs and room gaps are committed before
+ordinary dispatch. A limited or first-time timeline with missing overlap uses
+SDK room history. Verified ordinary messages use the same native tool loop,
+Controller execution claims and device-bound delivery as Tasks. A native tool
+call is recorded before execution and its returned output is stored before the
+next call. A missing or uncertain result waits for verification. The supervisor
+receives its readiness signal after both Task discovery and Matrix recovery.
+
 ## Validation boundary
 
-- Shared Core dependency: `d49cc3a9af3dcbc38463f34b0e1b881dcfe56f55`. The native Task cache now checks the shared session descriptor and publishes its digest after writing the local native record. Earlier test proofs below retain their actual older Core SHA.
+- Shared Core dependency: `0f3489c73a774145a211798514399c8f6e899079`. The native Task cache now checks the shared session descriptor and publishes its digest after writing the local native record. Earlier test proofs below retain their actual older Core SHA.
 - Upstream: `v0.54.0`, `c25fc8e5fd3e7716f416571cd53b34247c94ddbe`.
 - All six packaged patches reapplied to that upstream; integrated files matched
   the edited source checkout.
