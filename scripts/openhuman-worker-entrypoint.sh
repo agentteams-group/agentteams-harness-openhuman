@@ -38,18 +38,16 @@ python3 "${AGENTTEAMS_LOG_LIB_DIR:-/opt/agentteams/scripts/lib}/runtime_observab
 #   TZ                            - Timezone (optional)
 
 set -e
+umask 077
 
 # Source shared environment bootstrap (provides ensure_mc_credentials in cloud mode)
 source /opt/agentteams/scripts/lib/agentteams-env.sh 2>/dev/null || true
 
 WORKER_NAME="${AGENTTEAMS_WORKER_NAME:?AGENTTEAMS_WORKER_NAME is required}"
 WORKER_CR_NAME="${AGENTTEAMS_WORKER_CR_NAME:-${WORKER_NAME}}"
-WORKSPACE="${OPENHUMAN_WORKSPACE:-/home/openhuman/.openhuman}"
-if [ "${AGENTTEAMS_AGENT_ROLE:-}" = "manager" ]; then
-    WORKSPACE="${AGENTTEAMS_WORKER_HOME:?AGENTTEAMS_WORKER_HOME is required}"
-    export HOME="${WORKSPACE}"
-    export OPENHUMAN_WORKSPACE="${WORKSPACE}"
-fi
+WORKSPACE="${AGENTTEAMS_WORKER_HOME:-/root/agentteams-fs/agents/${WORKER_NAME}}"
+export HOME="${WORKSPACE}"
+export OPENHUMAN_WORKSPACE="${WORKSPACE}"
 
 log() {
     echo "[agentteams-openhuman-worker $(date '+%Y-%m-%d %H:%M:%S')] $1"
@@ -89,31 +87,18 @@ mkdir -p "${WORKSPACE}" "${WORKSPACE}/shared" "${WORKSPACE}/memory" \
 
 log "Pulling Worker config from centralized storage..."
 ensure_mc_credentials 2>/dev/null || true
-mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/" "${WORKSPACE}/agent-config/" \
-    --overwrite 2>/dev/null || true
+# The native workspace uses a link to the Worker shared directory.
+# Older Harnesses can leave separate cached Task records under this prefix.
+WORKER_PULL_EXCLUDES=(--exclude "credentials/**" --exclude "workspace/shared/**")
+mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/" "${WORKSPACE}/" \
+    --overwrite "${WORKER_PULL_EXCLUDES[@]}" 2>/dev/null || true
 mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/shared/" "${WORKSPACE}/shared/" \
     --overwrite 2>/dev/null || true
 
-# Copy essential files from agent-config to workspace root
-for _f in SOUL.md AGENTS.md MEMORY.md; do
-    if [ -f "${WORKSPACE}/agent-config/${_f}" ]; then
-        cp -f "${WORKSPACE}/agent-config/${_f}" "${WORKSPACE}/${_f}"
-    fi
-done
-
-# Copy skills from agent-config
-if [ -d "${WORKSPACE}/agent-config/skills" ]; then
-    cp -rf "${WORKSPACE}/agent-config/skills/"* "${WORKSPACE}/skills/" 2>/dev/null || true
-    find "${WORKSPACE}/skills" -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
-fi
+find "${WORKSPACE}/skills" -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
 
 python3 /opt/agentteams/scripts/lib/agentteams_skill_warnings.py "${WORKSPACE}/skills" \
     || log "WARNING: skill validation unavailable; continuing startup"
-
-# Copy memory files
-if [ -d "${WORKSPACE}/agent-config/memory" ]; then
-    cp -rf "${WORKSPACE}/agent-config/memory/"* "${WORKSPACE}/memory/" 2>/dev/null || true
-fi
 
 # Mark pull completion for sync loop
 PULL_MARKER="${WORKSPACE}/.last-pull"
@@ -129,11 +114,8 @@ while [ ! -f "${WORKSPACE}/SOUL.md" ] || [ ! -f "${WORKSPACE}/AGENTS.md" ]; do
     fi
     log "Waiting for config files to appear in MinIO (attempt ${RETRY}/6)..."
     sleep 5
-    mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/" "${WORKSPACE}/agent-config/" \
-        --overwrite 2>/dev/null || true
-    for _f in SOUL.md AGENTS.md; do
-        [ -f "${WORKSPACE}/agent-config/${_f}" ] && cp -f "${WORKSPACE}/agent-config/${_f}" "${WORKSPACE}/${_f}"
-    done
+    mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/" "${WORKSPACE}/" \
+        --overwrite "${WORKER_PULL_EXCLUDES[@]}" 2>/dev/null || true
     touch "${PULL_MARKER}"
 done
 
@@ -144,16 +126,18 @@ ln -sfn "${WORKSPACE}/skills" "${HOME}/.agents/skills"
 log "Worker config pulled successfully"
 
 # ============================================================
-# Step 3: Generate config.toml — bridge from openclaw.json
+# Step 3: Generate config.toml from your standard Worker configuration
 # ============================================================
-# Primary source: openclaw.json (channels.matrix.*) pulled from MinIO in Step 2.
-# Fallback: MATRIX_* environment variables injected by the controller.
-# This keeps OpenHuman aligned with how hermes / copaw / openclaw runtimes
-# consume Matrix configuration — via a single config artifact rather than
-# per-field env vars.
+# The standard runtime record takes precedence over compatibility/native data.
+# Older Controllers without this record retain the external compatibility path.
 log "Generating OpenHuman config.toml..."
 
-OPENCLAW_JSON="${WORKSPACE}/agent-config/openclaw.json"
+OPENCLAW_JSON="${WORKSPACE}/openclaw.json"
+if [ -f "${WORKSPACE}/runtime/runtime.yaml" ]; then
+    python3 "${AGENTTEAMS_LOG_LIB_DIR:-/opt/agentteams/scripts/lib}/worker_runtime_config.py" \
+        --harness openhuman --worker-home "${WORKSPACE}"
+    OPENCLAW_JSON="${WORKSPACE}/runtime/compat-config.json"
+fi
 
 if [ -f "${OPENCLAW_JSON}" ] && command -v jq >/dev/null 2>&1; then
     log "Reading config from openclaw.json (bridge mode)"
@@ -168,7 +152,8 @@ if [ -f "${OPENCLAW_JSON}" ] && command -v jq >/dev/null 2>&1; then
         BRIDGE_HOMESERVER="${_HS:-${AGENTTEAMS_MATRIX_URL:-${MATRIX_HOMESERVER_URL:-}}}"
         BRIDGE_ACCESS_TOKEN="${_AT:-${AGENTTEAMS_WORKER_MATRIX_TOKEN:-${MATRIX_ACCESS_TOKEN:-}}}"
         BRIDGE_USER_ID="${_UID:-${AGENTTEAMS_MATRIX_USER_ID:-${MATRIX_USER_ID:-}}}"
-        BRIDGE_ROOM_ID="${AGENTTEAMS_WORKER_ROOM_ID:-${MATRIX_HOME_ROOM_ID:-}}"  # room_id is not in openclaw.json; always from env
+        _ROOM=$(jq -r '.channels.matrix.homeRoomId // empty' "${OPENCLAW_JSON}")
+        BRIDGE_ROOM_ID="${_ROOM:-${AGENTTEAMS_WORKER_ROOM_ID:-${MATRIX_HOME_ROOM_ID:-}}}"
 
         # Allowed users — merge dm.allowFrom + groupAllowFrom (deduplicated)
         BRIDGE_ALLOWED_USERS=$(
@@ -205,7 +190,7 @@ BRIDGE_LLM_API_KEY="${BRIDGE_LLM_API_KEY:-${AGENTTEAMS_WORKER_GATEWAY_KEY:-}}"
 BRIDGE_LLM_PRIMARY="${BRIDGE_LLM_PRIMARY:-${AGENTTEAMS_DEFAULT_MODEL:-qwen-plus}}"
 
 # If bridge didn't yield allowed users, fall back to MATRIX_ALLOWED_USERS env var.
-if [ -z "${BRIDGE_ALLOWED_USERS:-}" ] && [ -n "${MATRIX_ALLOWED_USERS:-}" ]; then
+if [ ! -f "${WORKSPACE}/runtime/runtime.yaml" ] && [ -z "${BRIDGE_ALLOWED_USERS:-}" ] && [ -n "${MATRIX_ALLOWED_USERS:-}" ]; then
     BRIDGE_ALLOWED_USERS=$(echo "${MATRIX_ALLOWED_USERS}" | tr ',' '\n')
 fi
 
@@ -293,11 +278,14 @@ python3 /opt/agentteams/scripts/configure-teamharness.py "${WORKSPACE}" /opt/age
 export OPENHUMAN_CONFIG="${WORKSPACE}/config.toml"
 if [ -n "${BRIDGE_LLM_BASE_URL}" ] && [ -n "${BRIDGE_LLM_API_KEY}" ]; then
     log "Configuring LLM: endpoint=${BRIDGE_LLM_BASE_URL} model=${BRIDGE_LLM_PRIMARY}"
-    openhuman-core config update_model_settings \
+    if ! openhuman-core config update_model_settings \
         --inference_url "${BRIDGE_LLM_BASE_URL}" \
         --api_key "${BRIDGE_LLM_API_KEY}" \
         --default_model "${BRIDGE_LLM_PRIMARY}" \
-        >/dev/null 2>&1 || log "WARNING: openhuman-core config update_model_settings failed"
+        >/dev/null 2>&1; then
+        log "FATAL: your native model configuration could not be applied; refusing to start"
+        exit 1
+    fi
 else
     log "FATAL: LLM gateway not configured (AGENTTEAMS_AI_GATEWAY_URL or AGENTTEAMS_WORKER_GATEWAY_KEY missing). AgentTeams-managed workers must route through the platform AI gateway; refusing to start to prevent silent fallback to external services."
     exit 1
@@ -339,7 +327,7 @@ fi
         CHANGED=$(find "${WORKSPACE}/" -type f -newer "${PULL_MARKER}" \
             -not -path "*/config.toml" \
             -not -path "*/.last-pull" \
-            -not -path "*/agent-config/*" \
+            -not -path "${WORKSPACE}/runtime/*" \
             2>/dev/null | head -1)
         if [ -n "${CHANGED}" ]; then
             ensure_mc_credentials 2>/dev/null || true
@@ -367,8 +355,8 @@ log "Local->Remote sync started (PID: ${SYNC_LOCAL_PID})"
     while true; do
         if [ "${AGENTTEAMS_AGENT_ROLE:-}" = "manager" ]; then
             sleep 5
-            if mc cp "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/openclaw.json" "${WORKSPACE}/agent-config/openclaw.json.next" 2>/dev/null; then
-                mv "${WORKSPACE}/agent-config/openclaw.json.next" "${WORKSPACE}/agent-config/openclaw.json"
+            if mc cp "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/openclaw.json" "${WORKSPACE}/openclaw.json.next" 2>/dev/null; then
+                mv "${WORKSPACE}/openclaw.json.next" "${WORKSPACE}/openclaw.json"
             fi
             mc cp "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/AGENTS.md" "${WORKSPACE}/AGENTS.md" 2>/dev/null || true
             write_manager_prompt > "${NATIVE_WORKSPACE}/SOUL.md"

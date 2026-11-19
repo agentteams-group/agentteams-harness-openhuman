@@ -179,7 +179,7 @@ index fc6fe91..6392b66 100644
  ) -> String {
      use std::fmt::Write;
      let mut prompt = String::with_capacity(8192);
-+    let native_manager = std::env::var("AGENTTEAMS_AGENT_ROLE").as_deref() == Ok("manager");
++    let native_tools = std::env::var("AGENTTEAMS_AGENT_ROLE").as_deref() == Ok("manager") || (std::env::var_os("AGENTTEAMS_CONTROLLER_URL").is_some() && std::env::var_os("AGENTTEAMS_PROCESS_ID").is_some());
 
      // ── 1. Tooling ──────────────────────────────────────────────
      if !tools.is_empty() {
@@ -193,7 +193,7 @@ index fc6fe91..6392b66 100644
 -        prompt.push_str("After tool execution, results appear in <tool_result> tags. ");
 -        prompt
 -            .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
-+        if native_manager {
++        if native_tools {
 +            prompt.push_str("Invoke registered functions with native tool calls. Tool invocations in ordinary text are not executed.\n\n");
 +        } else {
 +            prompt

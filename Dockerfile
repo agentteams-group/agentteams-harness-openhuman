@@ -101,6 +101,12 @@ RUN git -C /build/openhuman-src apply /tmp/session-receipts.patch
 COPY patches/task-coordination.patch /tmp/task-coordination.patch
 COPY patches/task_coordination.rs /build/openhuman-src/src/openhuman/channels/task_coordination.rs
 RUN git -C /build/openhuman-src apply /tmp/task-coordination.patch
+COPY patches/task-recovery.patch /tmp/task-recovery.patch
+COPY patches/task_recovery.rs /build/openhuman-src/src/openhuman/channels/task_recovery.rs
+RUN git -C /build/openhuman-src apply /tmp/task-recovery.patch
+COPY patches/worker-matrix.patch /tmp/worker-matrix.patch
+COPY patches/worker_matrix.rs /build/openhuman-src/src/openhuman/channels/providers/matrix/worker_sync.rs
+RUN git -C /build/openhuman-src apply /tmp/worker-matrix.patch
 
 WORKDIR /build/openhuman-src
 
@@ -132,6 +138,7 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
     ca-certificates \
     python3 \
     python3-yaml \
+    python3-venv \
     libssl3 \
     libasound2 \
     libxdo3 \
@@ -166,6 +173,9 @@ RUN mkdir -p /home/openhuman/.openhuman/skills \
 
 # Copy AgentTeams shared scripts
 COPY --from=agentteams shared/lib/ /opt/agentteams/scripts/lib/
+RUN python3 -m venv /opt/venv/agentteams \
+    && /opt/venv/agentteams/bin/pip install --no-cache-dir -r /opt/agentteams/scripts/lib/telemetry/requirements.txt
+ENV PATH="/opt/venv/agentteams/bin:${PATH}"
 RUN chmod +x /opt/agentteams/scripts/lib/*.sh 2>/dev/null || true
 
 # Install mc-wrapper as /usr/local/bin/mc (STS credential refresh proxy)
@@ -195,7 +205,6 @@ COPY --from=builder /build/openhuman-src/LICENSE /usr/share/licenses/openhuman/L
 USER root
 
 # Default environment
-ENV OPENHUMAN_WORKSPACE=/home/openhuman/.openhuman
 ENV OPENHUMAN_CORE_HOST=0.0.0.0
 ENV OPENHUMAN_CORE_PORT=7788
 ENV RUST_LOG=info

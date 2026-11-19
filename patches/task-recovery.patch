@@ -1,0 +1,519 @@
+--- a/src/openhuman/agent/harness/tool_loop.rs
++++ b/src/openhuman/agent/harness/tool_loop.rs
+@@ -170,6 +170,9 @@
+ 
+     let stop_hooks = current_stop_hooks();
+     for iteration in 0..max_iterations {
++        #[cfg(feature = "channel-matrix")]
++        { crate::openhuman::channels::task_recovery::check_authority(false).await?;
++          crate::openhuman::channels::task_recovery::attach_pending(history).await?; }
+         if let Some(ref sink) = on_progress {
+             if let Err(e) = sink
+                 .send(AgentProgress::IterationStarted {
+@@ -461,4 +464,14 @@
+         if tool_calls.is_empty() {
++            #[cfg(feature = "channel-matrix")]
++            if crate::openhuman::channels::task_recovery::unexecuted_tool_frame(&response_text) {
++                // Parsing did not dispatch anything. Ask for a real function call
++                // within the existing bounded turn, without replaying any tool.
++                history.push(ChatMessage::assistant(response_text));
++                history.push(ChatMessage::user(
++                    "That tool request was malformed and did not run. Use a registered function to continue.",
++                ));
++                continue;
++            }
+             tracing::debug!(
+                 iteration,
+                 "[agent_loop] no tool calls — returning final response"
+@@ -482,6 +484,8 @@
+                 }
+             }
+             history.push(ChatMessage::assistant(response_text.clone()));
++            #[cfg(feature = "channel-matrix")]
++            crate::openhuman::channels::task_recovery::checkpoint(history).await?;
+             log::info!(
+                 "[agent_loop] turn complete: iters={} provider_calls={} tokens_in={} tokens_out={} cached_in={} usd={:.4}",
+                 (iteration + 1),
+@@ -516,6 +520,8 @@
+         let mut tool_results = String::new();
+         let mut individual_results: Vec<String> = Vec::new();
+         for (call_idx, call) in tool_calls.iter().enumerate() {
++            #[cfg(feature = "channel-matrix")]
++            crate::openhuman::channels::task_recovery::check_authority(true).await?;
+             // Stable id threaded through the start/complete pair (and
+             // any preceding args-delta events) so consumers can
+             // reconcile tool rows by id. The fallback includes
+@@ -868,6 +874,8 @@
+                 history.push(ChatMessage::tool(tool_msg.to_string()));
+             }
+         }
++        #[cfg(feature = "channel-matrix")]
++        crate::openhuman::channels::task_recovery::checkpoint(history).await?;
+     }
+ 
+     // Return the typed `AgentError::MaxIterationsExceeded` variant (boxed
+--- a/src/openhuman/channels/mod.rs
++++ b/src/openhuman/channels/mod.rs
+@@ -69,3 +69,5 @@
+ 
+ #[cfg(feature = "channel-matrix")]
+ mod task_coordination;
++#[cfg(feature = "channel-matrix")]
++pub(crate) mod task_recovery;
+--- a/src/openhuman/channels/providers/matrix.rs
++++ b/src/openhuman/channels/providers/matrix.rs
+@@ -750,6 +750,9 @@
+             std::collections::HashSet::new(),
+         )));
+ 
++        let _task_recovery = crate::openhuman::channels::task_recovery::start(
++            client.clone(), my_user_id.to_string(), tx.clone());
++
+         let tx_handler = tx.clone();
+         let target_room_for_handler = target_room.clone();
+         let my_user_id_for_handler = my_user_id.clone();
+@@ -777,6 +780,14 @@
+                         &raw["content"], room.room_id().as_str(), event.sender.as_str(), my_user_id.as_str()).await
+                 } else { None };
+                 if control && coordination_body.is_none() { return; }
++                if crate::openhuman::channels::task_recovery::enabled() {
++                    if let Some(task_id) = coordination_body.as_ref().and_then(|packet| packet.task_id.as_deref()) {
++                        crate::openhuman::channels::task_recovery::source(
++                            room.room_id().as_str(), task_id, event.event_id.as_str());
++                        return;
++                    }
++                    crate::openhuman::channels::task_recovery::wait_ready().await;
++                }
+                 if !manager && coordination_body.is_none() && room.room_id().as_str() != target_room.as_str() {
+                     return;
+                 }
+--- a/src/openhuman/channels/runtime/dispatch.rs
++++ b/src/openhuman/channels/runtime/dispatch.rs
+@@ -785,7 +785,18 @@
+         }
+     }
+ 
++    #[cfg(feature = "channel-matrix")]
++    let task_run = crate::openhuman::channels::task_recovery::get(&msg.id);
+     let history_key = conversation_history_key(&msg);
++    #[cfg(feature = "channel-matrix")]
++    if let Some(run) = task_run.as_ref() {
++        if let Err(error) = run.current().await {
++            tracing::warn!("Task admission deferred: {error}");
++            return;
++        }
++        ctx.conversation_histories.lock().unwrap_or_else(|e| e.into_inner())
++            .insert(history_key.clone(), run.restore());
++    }
+     let route = get_route_selection(ctx.as_ref(), &history_key);
+     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
+         Ok(provider) => provider,
+@@ -877,7 +888,11 @@
+     }
+ 
+     // Determine if this channel supports streaming draft updates
+-    let use_streaming = target_channel
++    #[cfg(feature = "channel-matrix")]
++    let task_streaming_allowed = task_run.is_none();
++    #[cfg(not(feature = "channel-matrix"))]
++    let task_streaming_allowed = true;
++    let use_streaming = task_streaming_allowed && target_channel
+         .as_ref()
+         .is_some_and(|ch| ch.supports_draft_updates());
+ 
+@@ -1051,6 +1066,11 @@
+     );
+     let llm_future = tokio::time::timeout(Duration::from_secs(ctx.message_timeout_secs), async {
+         let turn = async {
++            #[cfg(feature = "channel-matrix")]
++            if let Some(run) = task_run.as_ref() {
++                run.current().await.map_err(anyhow::Error::msg)?;
++                run.started.store(true, std::sync::atomic::Ordering::Release);
++            }
+             request_native_global::<AgentTurnRequest, AgentTurnResponse>(
+                 AGENT_RUN_TURN_METHOD,
+                 turn_request,
+@@ -1095,7 +1115,13 @@
+     #[cfg(feature = "channel-matrix")]
+     let direct = crate::openhuman::channels::matrix_direct::get(&msg.id);
+     #[cfg(feature = "channel-matrix")]
+-    let llm_result = if let Some(run) = direct.as_ref() {
++    let llm_result = if let Some(run) = task_run.as_ref() {
++        tokio::select! {
++            biased;
++            _ = run.cancel.cancelled() => Ok(Err(anyhow::anyhow!("Task execution ownership changed"))),
++            result = crate::openhuman::channels::task_recovery::TASK_RUN.scope(run.clone(), llm_future) => result,
++        }
++    } else if let Some(run) = direct.as_ref() {
+         tokio::select! {
+             biased;
+             _ = run.cancel.cancelled() => Ok(Err(anyhow::anyhow!("Direct conversation stopped"))),
+@@ -1123,6 +1149,22 @@
+         // Matrix channel retains all supplements for the replacement turn.
+         ctx.conversation_histories.lock().unwrap_or_else(|e| e.into_inner())
+             .entry(history_key).or_default().push(ChatMessage::user(&enriched_message));
++        return;
++    }
++
++    #[cfg(feature = "channel-matrix")]
++    if let Some(run) = task_run.as_ref() {
++        match llm_result {
++            Ok(Ok(response)) => {
++                if let Err(error) = run.complete(&response).await {
++                    tracing::warn!("Task final result deferred: {error}");
++                } else {
++                    run.succeeded.store(true, std::sync::atomic::Ordering::Release);
++                }
++            }
++            Ok(Err(error)) => tracing::warn!("Task native execution stopped: {error}"),
++            Err(_) => tracing::warn!("Task native execution timed out; side effects require verification"),
++        }
+         return;
+     }
+ 
+@@ -1375,7 +1417,19 @@
+             } else { None };
+             #[cfg(feature = "channel-matrix")]
+             if let Some(run) = direct.as_ref() { run.start().await; }
++            #[cfg(feature = "channel-matrix")]
++            let task_run = crate::openhuman::channels::task_recovery::get(&msg.id);
++            #[cfg(feature = "channel-matrix")]
++            let guard = task_run.as_ref().map(|run| tokio::spawn(run.clone().guard()));
++            #[cfg(feature = "channel-matrix")]
++            let input_id = msg.id.clone();
+             process_channel_message(worker_ctx, msg).await;
++            #[cfg(feature = "channel-matrix")]
++            if let Some(run) = task_run {
++                run.close(&input_id, run.succeeded.load(std::sync::atomic::Ordering::Acquire)).await;
++            }
++            #[cfg(feature = "channel-matrix")]
++            if let Some(guard) = guard { guard.abort(); }
+             #[cfg(feature = "channel-matrix")]
+             if let Some(run) = direct { run.finish().await; }
+         });
+--- a/src/openhuman/mcp_client/stdio.rs
++++ b/src/openhuman/mcp_client/stdio.rs
+@@ -30,6 +30,18 @@
+     stdin: ChildStdin,
+     stdout: BufReader<ChildStdout>,
+     initialize: McpInitializeResult,
++    #[cfg(unix)]
++    _group: OwnedMcpGroup,
++}
++
++#[cfg(unix)]
++#[derive(Debug)]
++struct OwnedMcpGroup(nix::unistd::Pid);
++#[cfg(unix)]
++impl Drop for OwnedMcpGroup {
++    fn drop(&mut self) {
++        let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL);
++    }
+ }
+ 
+ impl McpStdioClient {
+@@ -72,9 +84,14 @@
+             command.env(key, value);
+         }
+ 
++        command.kill_on_drop(true);
++        #[cfg(unix)]
++        command.process_group(0);
+         let mut child = command
+             .spawn()
+             .with_context(|| format!("spawning MCP stdio server `{}`", self.command))?;
++        #[cfg(unix)]
++        let group = OwnedMcpGroup(nix::unistd::Pid::from_raw(child.id().expect("spawned MCP process") as i32));
+         let stdin = child
+             .stdin
+             .take()
+@@ -84,6 +101,8 @@
+             .take()
+             .ok_or_else(|| anyhow::anyhow!("stdio server missing stdout"))?;
+         let mut session = StdioSession {
++            #[cfg(unix)]
++            _group: group,
+             child,
+             stdin,
+             stdout: BufReader::new(stdout),
+@@ -144,12 +163,12 @@
+     ) -> anyhow::Result<McpServerToolResult> {
+         self.initialize().await?;
+         let mut state = self.state.lock().await;
+-        let session = state
+-            .as_mut()
++        let mut session = state
++            .take()
+             .ok_or_else(|| anyhow::anyhow!("stdio MCP session not initialized"))?;
+         let result = self
+             .send_request_on_session(
+-                session,
++                &mut session,
+                 "tools/call",
+                 json!({
+                     "name": name,
+@@ -157,6 +176,10 @@
+                 }),
+             )
+             .await?;
++        // Publish the reusable session only after its reply has been read.
++        // Cancellation drops this owned session and kills its entire group,
++        // rather than leaving a side-effecting MCP request running in memory.
++        *state = Some(session);
+         let rendered = render_tool_result(&result);
+         Ok(McpServerToolResult {
+             raw_result: result,
+--- a/src/openhuman/tools/impl/system/shell.rs
++++ b/src/openhuman/tools/impl/system/shell.rs
+@@ -152,6 +152,18 @@
+         for var in SAFE_ENV_VARS {
+             if let Ok(val) = std::env::var(var) {
+                 cmd.env(var, val);
++            }
++        }
++
++        // Task tools use this process's identity and projected credential file.
++        // Do not forward raw API keys or recover a prior startup identity.
++        #[cfg(feature = "channel-matrix")]
++        if crate::openhuman::channels::task_recovery::TASK_RUN.try_with(|_| ()).is_ok() {
++            for var in ["AGENTTEAMS_CONTROLLER_URL", "AGENTTEAMS_AUTH_TOKEN_FILE",
++                "AGENTTEAMS_PROCESS_ID", "AGENTTEAMS_STORAGE_PREFIX", "AGENTTEAMS_WORKER_HOME",
++                "AGENTTEAMS_WORKER_NAME", "AGENTTEAMS_WORKER_CR_NAME", "AGENTTEAMS_AGENT_ROLE",
++                "TEAMHARNESS_RUNTIME_CONFIG", "TEAMHARNESS_SHARED_DIR"] {
++                if let Ok(value) = std::env::var(var) { cmd.env(var, value); }
+             }
+         }
+ 
+--- a/src/openhuman/routing/provider.rs
++++ b/src/openhuman/routing/provider.rs
+@@ -370,7 +370,13 @@
+ #[async_trait]
+ impl Provider for IntelligentRoutingProvider {
+     fn capabilities(&self) -> ProviderCapabilities {
+-        self.remote.capabilities()
++        let mut capabilities = self.remote.capabilities();
++        // The reliable and model routers may expose tool support through the
++        // dedicated method. Preserve local routing policy when it is enabled.
++        if !self.local_enabled {
++            capabilities.native_tool_calling = self.remote.supports_native_tools();
++        }
++        capabilities
+     }
+
+     fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
+--- /dev/null
++++ b/tests/agentteams_task_recovery.rs
+@@ -0,0 +1,112 @@
++//! Native API/adapter tests; these do not replace real Controller/Matrix/model E2E.
++use openhuman_core::openhuman;
++use openhuman_core::openhuman::channels::traits;
++#[path = "../src/openhuman/channels/session_receipts.rs"]
++mod session_receipts;
++#[path = "../src/openhuman/channels/task_recovery.rs"]
++mod task_recovery;
++
++#[cfg(unix)]
++#[tokio::test]
++async fn cancelled_native_mcp_call_stops_server_and_child_and_can_reinitialize() {
++    use openhuman_core::openhuman::config::McpClientIdentityConfig;
++    use openhuman_core::openhuman::mcp_client::McpStdioClient;
++    use std::sync::Arc;
++    use std::time::Duration;
++    let directory = tempfile::tempdir().unwrap();
++    let script = directory.path().join("mcp.py");
++    let pidfile = directory.path().join("pids");
++    let marker = directory.path().join("must-not-run");
++    std::fs::write(&script, r#"import sys,json,os,subprocess,pathlib
++for line in sys.stdin:
++    request=json.loads(line)
++    if request['method']=='initialize':
++        result={'protocolVersion':'2025-11-25','capabilities':{},'serverInfo':{'name':'test','version':'1'}}
++    elif request['method']=='notifications/initialized': continue
++    elif request['method']=='tools/list': result={'tools':[]}
++    else:
++        child=subprocess.Popen(['sleep','30'])
++        pathlib.Path(sys.argv[1]).write_text(str(os.getpid())+','+str(child.pid))
++        child.wait()
++        pathlib.Path(sys.argv[2]).touch()
++        result={'content':[{'type':'text','text':'unexpected'}]}
++    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
++"#).unwrap();
++    let client = Arc::new(McpStdioClient::new(
++        "python3".into(),
++        vec![
++            script.display().to_string(),
++            pidfile.display().to_string(),
++            marker.display().to_string(),
++        ],
++        Vec::new(),
++        None,
++        McpClientIdentityConfig::default(),
++    ));
++    let original = client.clone();
++    let call =
++        tokio::spawn(async move { original.call_tool("effect", serde_json::json!({})).await });
++    for _ in 0..200 {
++        if pidfile.exists() {
++            break;
++        }
++        assert!(
++            !call.is_finished(),
++            "native call ended before its external operation started"
++        );
++        tokio::time::sleep(Duration::from_millis(25)).await;
++    }
++    let pids: Vec<u32> = std::fs::read_to_string(&pidfile)
++        .expect("operation started")
++        .split(',')
++        .map(|s| s.parse().unwrap())
++        .collect();
++    call.abort();
++    assert!(call.await.unwrap_err().is_cancelled());
++    let running = |pid: &u32| -> bool {
++        std::process::Command::new("ps")
++            .args(["-o", "stat=", "-p", &pid.to_string()])
++            .output()
++            .ok()
++            .is_some_and(|out| {
++                let state = String::from_utf8_lossy(&out.stdout);
++                !state.trim().is_empty() && !state.trim().starts_with('Z')
++            })
++    };
++    for _ in 0..200 {
++        if !pids.iter().any(&running) {
++            break;
++        }
++        tokio::time::sleep(Duration::from_millis(25)).await;
++    }
++    assert!(
++        !pids.iter().any(running),
++        "native MCP server and its tool child must both stop"
++    );
++    assert!(!marker.exists());
++    assert!(
++        client.list_tools().await.unwrap().is_empty(),
++        "cancelled stdio session must be rebuilt"
++    );
++    client.close_session().await.unwrap();
++}
++
++#[test]
++fn gateway_routing_preserves_structured_tool_capability() {
++    use openhuman_core::openhuman::config::Config;
++    use openhuman_core::openhuman::inference::provider::{
++        create_intelligent_routing_provider, ProviderRuntimeOptions,
++    };
++
++    let mut config = Config::default();
++    config.local_ai.runtime_enabled = false;
++    let provider = create_intelligent_routing_provider(
++        Some("http://127.0.0.1:8080/v1"),
++        None,
++        Some("fixture-worker-key"),
++        &config,
++        &ProviderRuntimeOptions::default(),
++    )
++    .unwrap();
++    assert!(provider.supports_native_tools());
++}
+diff --git a/src/openhuman/memory/conversations/store.rs b/src/openhuman/memory/conversations/store.rs
+index 577eeae..794fd24 100644
+--- a/src/openhuman/memory/conversations/store.rs
++++ b/src/openhuman/memory/conversations/store.rs
+@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
+ use log::{debug, warn};
+ use once_cell::sync::Lazy;
+ use parking_lot::Mutex;
++use sha2::{Digest, Sha256};
+ use tempfile::NamedTempFile;
+
+ use super::types::{
+@@ -24,6 +25,7 @@ use super::types::{
+ const LOG_PREFIX: &str = "[memory:conversations]";
+ const THREADS_FILENAME: &str = "threads.jsonl";
+ const THREAD_MESSAGES_DIR: &str = "threads";
++const MAX_HEX_THREAD_ID_BYTES: usize = (255 - ".jsonl".len()) / 2;
+ static CONVERSATION_STORE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+ fn redact_title_for_log(title: &str) -> String {
+@@ -411,9 +413,18 @@ impl ConversationStore {
+     }
+
+     fn thread_messages_path(&self, thread_id: &str) -> PathBuf {
++        // Long Matrix Task thread IDs cannot fit as hex in a 255-byte filename.
++        let name = if thread_id.len() <= MAX_HEX_THREAD_ID_BYTES {
++            hex::encode(thread_id.as_bytes())
++        } else {
++            format!(
++                "sha256-{}",
++                hex::encode(Sha256::digest(thread_id.as_bytes()))
++            )
++        };
+         self.root_dir()
+             .join(THREAD_MESSAGES_DIR)
+-            .join(format!("{}.jsonl", hex::encode(thread_id.as_bytes())))
++            .join(format!("{name}.jsonl"))
+     }
+
+     fn list_threads_unlocked(&self) -> Result<Vec<ConversationThread>, String> {
+diff --git a/src/openhuman/memory/conversations/store_tests.rs b/src/openhuman/memory/conversations/store_tests.rs
+index a95a350..8f2a111 100644
+--- a/src/openhuman/memory/conversations/store_tests.rs
++++ b/src/openhuman/memory/conversations/store_tests.rs
+@@ -40,6 +40,11 @@ fn store_roundtrips_threads_and_messages() {
+             },
+         )
+         .expect("append message");
++    let legacy_path = store
++        .root_dir()
++        .join("threads")
++        .join(format!("{}.jsonl", hex::encode("default-thread")));
++    assert!(legacy_path.is_file());
+
+     let threads = store.list_threads().expect("list threads");
+     assert_eq!(threads.len(), 1);
+@@ -736,3 +741,44 @@ fn read_jsonl_skips_invalid_lines_but_keeps_valid_ones() {
+     assert_eq!(messages[0].id, "m1");
+     assert_eq!(messages[1].id, "m2");
+ }
++
++#[test]
++fn store_roundtrips_long_matrix_task_thread() {
++    let (temp, store) = make_store();
++    let thread_id = format!(
++        "channel:matrix_@worker:example.org_!room:example.org_task:{}",
++        "任务".repeat(35)
++    );
++    let created_at = "2026-04-10T12:00:00Z";
++    store
++        .ensure_thread(CreateConversationThread {
++            parent_thread_id: None,
++            id: thread_id.clone(),
++            title: "Task continuation".into(),
++            created_at: created_at.into(),
++            labels: None,
++        })
++        .expect("ensure long thread");
++    store
++        .append_message(
++            &thread_id,
++            ConversationMessage {
++                id: "restored-input".into(),
++                content: "Continue the assigned task".into(),
++                message_type: "text".into(),
++                extra_metadata: json!({}),
++                sender: "worker".into(),
++                created_at: created_at.into(),
++            },
++        )
++        .expect("append message for a long Task thread");
++
++    let reopened = ConversationStore::new(temp.path().to_path_buf());
++    assert_eq!(reopened.list_threads().unwrap()[0].id, thread_id);
++    assert_eq!(
++        reopened.get_messages(&thread_id).unwrap()[0].id,
++        "restored-input"
++    );
++    assert!(reopened.delete_thread(&thread_id, created_at).unwrap());
++    assert!(reopened.get_messages(&thread_id).unwrap().is_empty());
++}

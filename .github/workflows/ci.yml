@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      export_native_binary:
+        description: Save the native executable for an isolated runtime-recovery run
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -20,10 +25,13 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@v4
+      - name: Read shared Core dependency
+        id: core
+        run: echo "ref=$(sed -n 's/^AT_REF=//p' versions.env)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: agentscope-ai/AgentTeams
-          ref: efa101387fdb1d7b7e3cd9199e6b1de4c2df517c
+          ref: ${{ steps.core.outputs.ref }}
           path: agentteams
       - uses: actions/checkout@v4
         with:
@@ -53,20 +61,51 @@ jobs:
           git -C native apply "$GITHUB_WORKSPACE/patches/session-receipts.patch"
           cp patches/task_coordination.rs native/src/openhuman/channels/task_coordination.rs
           git -C native apply "$GITHUB_WORKSPACE/patches/task-coordination.patch"
+          cp patches/task_recovery.rs native/src/openhuman/channels/task_recovery.rs
+          git -C native apply "$GITHUB_WORKSPACE/patches/task-recovery.patch"
+          mkdir -p native/src/openhuman/channels/providers/matrix
+          cp patches/worker_matrix.rs native/src/openhuman/channels/providers/matrix/worker_sync.rs
+          git -C native apply "$GITHUB_WORKSPACE/patches/worker-matrix.patch"
       - name: Verify native Matrix controls and tool cleanup
         working-directory: native
-        run: cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control
+        run: cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery
 
   image:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Read shared Core dependency
+        id: core
+        run: echo "ref=$(sed -n 's/^AT_REF=//p' versions.env)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: agentscope-ai/AgentTeams
-          ref: efa101387fdb1d7b7e3cd9199e6b1de4c2df517c
+          ref: ${{ steps.core.outputs.ref }}
           path: agentteams
       - uses: docker/setup-buildx-action@v3
       - run: make build VERSION=ci AT_CONTEXT=./agentteams
       - run: make smoke VERSION=ci
+
+      - name: Export native executable and build provenance
+        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+        run: |
+          mkdir test-binary
+          image=ghcr.io/agentteams-group/agentteams-harness-openhuman:ci
+          container=$(docker create "$image")
+          trap 'docker rm -f "$container" >/dev/null' EXIT
+          docker cp "$container:/usr/local/bin/openhuman-core" test-binary/openhuman-core
+          docker cp "$container:/usr/share/licenses/openhuman/LICENSE" test-binary/LICENSE
+          git rev-parse HEAD > test-binary/harness.sha
+          git -C agentteams rev-parse HEAD > test-binary/core.sha
+          cp versions.env test-binary/
+          docker inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' "$image" > test-binary/image.txt
+          docker run --rm --entrypoint sh "$image" -c 'dpkg-query -W && ldd /usr/local/bin/openhuman-core' > test-binary/dependencies.txt
+          (cd test-binary && sha256sum openhuman-core > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+        with:
+          name: openhuman-native-test-binary
+          path: test-binary/
+          retention-days: 1
+          if-no-files-found: error

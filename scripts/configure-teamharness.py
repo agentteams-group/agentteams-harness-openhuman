@@ -4,27 +4,46 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 import yaml
 
 
 def configure(workspace: Path, bundle: Path):
-    runtime = workspace / 'agent-config/runtime.yaml'
+    runtime = workspace / 'runtime/runtime.yaml'
     if not runtime.is_file():
         if os.getenv('TEAMHARNESS_COORDINATION_URL'):
             raise ValueError('Task coordination requires your Controller-projected runtime.yaml')
         return
     native = workspace / 'workspace'
-    (native / 'shared').mkdir(parents=True, exist_ok=True)
-    env = {'TEAMHARNESS_RUNTIME_CONFIG': str(runtime), 'TEAMHARNESS_SHARED_DIR': str(native / 'shared')}
+    shared = workspace / 'shared'
+    shared.mkdir(parents=True, exist_ok=True)
+    native_shared = native / 'shared'
+    if native_shared.is_symlink():
+        if native_shared.resolve() != shared.resolve():
+            raise ValueError('Your native shared directory points outside your Worker workspace')
+    else:
+        if native_shared.exists():
+            if not native_shared.is_dir():
+                raise ValueError('Your native shared path must be a directory')
+            if any(native_shared.iterdir()):
+                # Keep old local files for inspection without importing stale Task data.
+                backup = Path(tempfile.mkdtemp(prefix='openhuman-legacy-shared-', dir=runtime.parent))
+                native_shared.rename(backup / 'shared')
+                print(f'Preserved your previous native shared directory at {backup / "shared"}')
+            else:
+                native_shared.rmdir()
+        native_shared.symlink_to(shared, target_is_directory=True)
+    env = {'TEAMHARNESS_RUNTIME_CONFIG': str(runtime), 'TEAMHARNESS_SHARED_DIR': str(shared)}
     q = json.dumps
     block = '\n[mcp_client]\nenabled = true\n\n[[mcp_client.servers]]\nname = "teamharness"\ncommand = "python3"\n'
     block += 'args = [' + q(str(bundle / 'mcp/server.py')) + ']\n'
     block += 'env = {' + ', '.join(q(k) + ' = ' + q(v) for k, v in env.items()) + '}\n'
     with (workspace / 'config.toml').open('a') as target:
         target.write(block)
-    role = os.getenv('AGENTTEAMS_AGENT_ROLE', 'worker')
+    record = yaml.safe_load(runtime.read_text()) or {}
+    role = record.get('member', {}).get('role') or os.getenv('AGENTTEAMS_AGENT_ROLE', 'worker')
     native = workspace / 'workspace'
-    role = 'leader' if role == 'team_leader' else role
+    role = {'team_leader': 'leader', 'standalone': 'worker'}.get(role, role)
     manifest = yaml.safe_load((bundle / 'plugin.yaml').read_text())
     for skills in manifest['skills'].values():
         for skill in skills:
