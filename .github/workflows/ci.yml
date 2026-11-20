@@ -66,9 +66,11 @@ jobs:
           mkdir -p native/src/openhuman/channels/providers/matrix
           cp patches/worker_matrix.rs native/src/openhuman/channels/providers/matrix/worker_sync.rs
           git -C native apply "$GITHUB_WORKSPACE/patches/worker-matrix.patch"
+          git -C native apply "$GITHUB_WORKSPACE/patches/task-workspace.patch"
+          git -C native apply "$GITHUB_WORKSPACE/patches/mcp-tool-schema.patch"
       - name: Verify native Matrix controls and tool cleanup
         working-directory: native
-        run: cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery
+        run: cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery --test agentteams_mcp_schema
 
   image:
     runs-on: ubuntu-24.04
