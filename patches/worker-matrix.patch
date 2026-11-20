@@ -18,11 +18,11 @@ index 73224e7..039dcb0 100644
                  }
 +                #[cfg(feature = "channel-matrix")]
 +                if operation.is_some() {
-+                    if !success {
++                    if !success && call.name != "file_read" {
 +                        anyhow::bail!("Matrix tool outcome needs verification before another attempt");
 +                    }
 +                    crate::openhuman::channels::task_recovery::finish_message_tools(operation,
-+                        serde_json::json!([{"id":progress_call_id,"content":result_text}])).await?;
++                        serde_json::json!([{"id":progress_call_id,"content":result_text,"isError":!success}])).await?;
 +                }
                  result_text
              } else {
