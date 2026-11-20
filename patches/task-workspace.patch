@@ -170,6 +170,16 @@
              return Ok(ToolResult::error(format!(
                  "Resolved path escapes workspace: {}",
                  resolved.display()
+@@ -180,3 +188,9 @@
+         let _ = tokio::fs::remove_dir_all(&dir).await;
+     }
+ }
++
++#[cfg(all(test, feature = "channel-matrix"))]
++#[tokio::test]
++async fn native_directory_tools_stay_inside_the_owned_task() {
++    crate::openhuman::channels::task_recovery::tests::native_directory_tools_stay_inside_the_owned_task().await;
++}
 --- a/src/openhuman/tools/impl/filesystem/glob_search.rs
 +++ b/src/openhuman/tools/impl/filesystem/glob_search.rs
 @@ -64,6 +64,10 @@

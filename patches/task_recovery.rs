@@ -954,11 +954,10 @@ pub(crate) fn start(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn native_directory_tools_stay_inside_the_owned_task() {
+    pub(crate) async fn native_directory_tools_stay_inside_the_owned_task() {
         use crate::openhuman::security::SecurityPolicy;
         use crate::openhuman::tools::{GlobTool, ListFilesTool};
         use crate::openhuman::tools::traits::Tool;

@@ -72,7 +72,7 @@ jobs:
         working-directory: native
         run: |
           cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery --test agentteams_mcp_schema
-          cargo test --locked --no-default-features --features channel-matrix --lib channels::task_recovery::tests
+          cargo test --locked --no-default-features --features channel-matrix --lib native_directory_tools_stay_inside_the_owned_task
 
   image:
     runs-on: ubuntu-24.04
