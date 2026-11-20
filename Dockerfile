@@ -107,6 +107,10 @@ RUN git -C /build/openhuman-src apply /tmp/task-recovery.patch
 COPY patches/worker-matrix.patch /tmp/worker-matrix.patch
 COPY patches/worker_matrix.rs /build/openhuman-src/src/openhuman/channels/providers/matrix/worker_sync.rs
 RUN git -C /build/openhuman-src apply /tmp/worker-matrix.patch
+COPY patches/task-workspace.patch /tmp/task-workspace.patch
+RUN git -C /build/openhuman-src apply /tmp/task-workspace.patch
+COPY patches/mcp-tool-schema.patch /tmp/mcp-tool-schema.patch
+RUN git -C /build/openhuman-src apply /tmp/mcp-tool-schema.patch
 
 WORKDIR /build/openhuman-src
 

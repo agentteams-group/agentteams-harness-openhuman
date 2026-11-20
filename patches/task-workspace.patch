@@ -1,0 +1,228 @@
+diff --git a/src/openhuman/tools/impl/filesystem/file_read.rs b/src/openhuman/tools/impl/filesystem/file_read.rs
+index 3a692c4..fdc2a76 100644
+--- a/src/openhuman/tools/impl/filesystem/file_read.rs
++++ b/src/openhuman/tools/impl/filesystem/file_read.rs
+@@ -46,6 +46,10 @@ impl Tool for FileReadTool {
+     }
+
+     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
++        #[cfg(feature = "channel-matrix")]
++        let security = crate::openhuman::channels::task_recovery::tool_security(&self.security)?;
++        #[cfg(not(feature = "channel-matrix"))]
++        let security = self.security.clone();
+         let path = args
+             .get("path")
+             .and_then(|v| v.as_str())
+@@ -58,7 +62,9 @@ impl Tool for FileReadTool {
+         }
+
+         // Security check: validate path is within workspace
+-        if !self.security.is_path_allowed(path) {
++        #[cfg(feature = "channel-matrix")]
++        let path = crate::openhuman::channels::task_recovery::tool_path(&self.security, &security, path)?;
++        if !security.is_path_allowed(path) {
+             return Ok(ToolResult::error(format!(
+                 "Path not allowed by security policy: {path}"
+             )));
+@@ -73,7 +79,7 @@ impl Tool for FileReadTool {
+             ));
+         }
+
+-        let full_path = self.security.workspace_dir.join(path);
++        let full_path = security.workspace_dir.join(path);
+
+         // Resolve path before reading to block symlink escapes.
+         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
+@@ -85,7 +91,7 @@ impl Tool for FileReadTool {
+             }
+         };
+
+-        if !self.security.is_resolved_path_allowed(&resolved_path) {
++        if !security.is_resolved_path_allowed(&resolved_path) {
+             return Ok(ToolResult::error(format!(
+                 "Resolved path escapes workspace: {}",
+                 resolved_path.display()
+diff --git a/src/openhuman/tools/impl/filesystem/file_write.rs b/src/openhuman/tools/impl/filesystem/file_write.rs
+index 2b97765..0d6415a 100644
+--- a/src/openhuman/tools/impl/filesystem/file_write.rs
++++ b/src/openhuman/tools/impl/filesystem/file_write.rs
+@@ -43,6 +43,10 @@ impl Tool for FileWriteTool {
+     }
+
+     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
++        #[cfg(feature = "channel-matrix")]
++        let security = crate::openhuman::channels::task_recovery::tool_security(&self.security)?;
++        #[cfg(not(feature = "channel-matrix"))]
++        let security = self.security.clone();
+         let path = args
+             .get("path")
+             .and_then(|v| v.as_str())
+@@ -53,7 +57,7 @@ impl Tool for FileWriteTool {
+             .and_then(|v| v.as_str())
+             .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
+
+-        if !self.security.can_act() {
++        if !security.can_act() {
+             return Ok(ToolResult::error("Action blocked: autonomy is read-only"));
+         }
+
+@@ -64,13 +68,15 @@ impl Tool for FileWriteTool {
+         }
+
+         // Security check: validate path is within workspace
+-        if !self.security.is_path_allowed(path) {
++        #[cfg(feature = "channel-matrix")]
++        let path = crate::openhuman::channels::task_recovery::tool_path(&self.security, &security, path)?;
++        if !security.is_path_allowed(path) {
+             return Ok(ToolResult::error(format!(
+                 "Path not allowed by security policy: {path}"
+             )));
+         }
+
+-        let full_path = self.security.workspace_dir.join(path);
++        let full_path = security.workspace_dir.join(path);
+
+         let Some(parent) = full_path.parent() else {
+             return Ok(ToolResult::error("Invalid path: missing parent directory"));
+@@ -89,7 +95,7 @@ impl Tool for FileWriteTool {
+             }
+         };
+
+-        if !self.security.is_resolved_path_allowed(&resolved_parent) {
++        if !security.is_resolved_path_allowed(&resolved_parent) {
+             return Ok(ToolResult::error(format!(
+                 "Resolved path escapes workspace: {}",
+                 resolved_parent.display()
+diff --git a/src/openhuman/tools/impl/filesystem/glob_search.rs b/src/openhuman/tools/impl/filesystem/glob_search.rs
+index bf41e04..51f965c 100644
+--- a/src/openhuman/tools/impl/filesystem/glob_search.rs
++++ b/src/openhuman/tools/impl/filesystem/glob_search.rs
+@@ -64,22 +64,28 @@ impl Tool for GlobTool {
+     }
+
+     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
++        #[cfg(feature = "channel-matrix")]
++        let security = crate::openhuman::channels::task_recovery::tool_security(&self.security)?;
++        #[cfg(not(feature = "channel-matrix"))]
++        let security = self.security.clone();
+         let pattern_str = args
+             .get("pattern")
+             .and_then(|v| v.as_str())
+             .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' parameter"))?;
++        #[cfg(feature = "channel-matrix")]
++        let pattern_str = crate::openhuman::channels::task_recovery::tool_path(&self.security, &security, pattern_str)?;
+         let max_results = args
+             .get("max_results")
+             .and_then(|v| v.as_u64())
+             .map(|n| (n as usize).max(1))
+             .unwrap_or(DEFAULT_MAX_RESULTS);
+
+-        if self.security.is_rate_limited() {
++        if security.is_rate_limited() {
+             return Ok(ToolResult::error(
+                 "Rate limit exceeded: too many actions in the last hour",
+             ));
+         }
+-        if !self.security.record_action() {
++        if !security.record_action() {
+             return Ok(ToolResult::error(
+                 "Rate limit exceeded: action budget exhausted",
+             ));
+@@ -90,7 +96,7 @@ impl Tool for GlobTool {
+             Err(e) => return Ok(ToolResult::error(format!("Invalid glob pattern: {e}"))),
+         };
+
+-        let workspace = self.security.workspace_dir.clone();
++        let workspace = security.workspace_dir.clone();
+         let result =
+             tokio::task::spawn_blocking(move || collect_matches(&workspace, &pattern, max_results))
+                 .await
+diff --git a/src/openhuman/tools/impl/filesystem/list_files.rs b/src/openhuman/tools/impl/filesystem/list_files.rs
+index 0b8567d..ce39e84 100644
+--- a/src/openhuman/tools/impl/filesystem/list_files.rs
++++ b/src/openhuman/tools/impl/filesystem/list_files.rs
+@@ -51,30 +51,36 @@ impl Tool for ListFilesTool {
+     }
+
+     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
++        #[cfg(feature = "channel-matrix")]
++        let security = crate::openhuman::channels::task_recovery::tool_security(&self.security)?;
++        #[cfg(not(feature = "channel-matrix"))]
++        let security = self.security.clone();
+         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
++        #[cfg(feature = "channel-matrix")]
++        let path = crate::openhuman::channels::task_recovery::tool_path(&self.security, &security, path)?;
+
+-        if self.security.is_rate_limited() {
++        if security.is_rate_limited() {
+             return Ok(ToolResult::error(
+                 "Rate limit exceeded: too many actions in the last hour",
+             ));
+         }
+-        if !self.security.is_path_allowed(path) {
++        if !security.is_path_allowed(path) {
+             return Ok(ToolResult::error(format!(
+                 "Path not allowed by security policy: {path}"
+             )));
+         }
+-        if !self.security.record_action() {
++        if !security.record_action() {
+             return Ok(ToolResult::error(
+                 "Rate limit exceeded: action budget exhausted",
+             ));
+         }
+
+-        let full = self.security.workspace_dir.join(path);
++        let full = security.workspace_dir.join(path);
+         let resolved = match tokio::fs::canonicalize(&full).await {
+             Ok(p) => p,
+             Err(e) => return Ok(ToolResult::error(format!("Failed to resolve path: {e}"))),
+         };
+-        if !self.security.is_resolved_path_allowed(&resolved) {
++        if !security.is_resolved_path_allowed(&resolved) {
+             return Ok(ToolResult::error(format!(
+                 "Resolved path escapes workspace: {}",
+                 resolved.display()
+@@ -180,3 +186,9 @@ mod tests {
+         let _ = tokio::fs::remove_dir_all(&dir).await;
+     }
+ }
++
++#[cfg(all(test, feature = "channel-matrix"))]
++#[tokio::test]
++async fn native_directory_tools_stay_inside_the_owned_task() {
++    crate::openhuman::channels::task_recovery::tests::native_directory_tools_stay_inside_the_owned_task().await;
++}
+diff --git a/src/openhuman/tools/impl/system/shell.rs b/src/openhuman/tools/impl/system/shell.rs
+index d1cf031..bb068e9 100644
+--- a/src/openhuman/tools/impl/system/shell.rs
++++ b/src/openhuman/tools/impl/system/shell.rs
+@@ -93,6 +93,10 @@ impl Tool for ShellTool {
+     }
+
+     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
++        #[cfg(feature = "channel-matrix")]
++        let security = crate::openhuman::channels::task_recovery::tool_security(&self.security)?;
++        #[cfg(not(feature = "channel-matrix"))]
++        let security = self.security.clone();
+         let command = args
+             .get("command")
+             .and_then(|v| v.as_str())
+@@ -108,7 +112,7 @@ impl Tool for ShellTool {
+             ));
+         }
+
+-        match self.security.validate_command_execution(command, approved) {
++        match security.validate_command_execution(command, approved) {
+             Ok(_) => {}
+             Err(reason) => {
+                 return Ok(ToolResult::error(reason));
+@@ -126,7 +130,7 @@ impl Tool for ShellTool {
+         // (CWE-200), then re-add only safe, functional variables.
+         let mut cmd = match self
+             .runtime
+-            .build_shell_command(command, &self.security.workspace_dir)
++            .build_shell_command(command, &security.workspace_dir)
+         {
+             Ok(cmd) => cmd,
+             Err(e) => {

@@ -66,9 +66,15 @@ jobs:
           mkdir -p native/src/openhuman/channels/providers/matrix
           cp patches/worker_matrix.rs native/src/openhuman/channels/providers/matrix/worker_sync.rs
           git -C native apply "$GITHUB_WORKSPACE/patches/worker-matrix.patch"
+          git -C native apply "$GITHUB_WORKSPACE/patches/task-workspace.patch"
+          git -C native apply "$GITHUB_WORKSPACE/patches/mcp-tool-schema.patch"
       - name: Verify native Matrix controls and tool cleanup
         working-directory: native
-        run: cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery
+        run: |
+          cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery --test agentteams_mcp_schema
+          # Pin upstream test concatenations to &str when decancer adds another Add implementation.
+          git apply "$GITHUB_WORKSPACE/patches/native-test-fixtures.patch"
+          cargo test --locked --no-default-features --features channel-matrix --lib native_directory_tools_stay_inside_the_owned_task
 
   image:
     runs-on: ubuntu-24.04
@@ -88,7 +94,7 @@ jobs:
       - run: make smoke VERSION=ci
 
       - name: Export native executable and build provenance
-        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.export_native_binary)
         run: |
           mkdir test-binary
           image=ghcr.io/agentteams-group/agentteams-harness-openhuman:ci
@@ -103,7 +109,7 @@ jobs:
           docker run --rm --entrypoint sh "$image" -c 'dpkg-query -W && ldd /usr/local/bin/openhuman-core' > test-binary/dependencies.txt
           (cd test-binary && sha256sum openhuman-core > SHA256SUMS)
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.export_native_binary)
         with:
           name: openhuman-native-test-binary
           path: test-binary/

@@ -1,0 +1,69 @@
+--- a/src/openhuman/tokenjuice/tool_integration.rs
++++ b/src/openhuman/tokenjuice/tool_integration.rs
+@@ -74,11 +74,19 @@
+ ) -> (String, CompactionStats) {
+     let original_bytes = output.len();
+ 
+-    if original_bytes < MIN_COMPACT_INPUT_BYTES {
++    // MCP schemas and structured receipts are tool contracts, not logs.
++    let preserve_schema = matches!(tool_name, "mcp_list_tools" | "mcp_call_tool");
++    if preserve_schema || original_bytes < MIN_COMPACT_INPUT_BYTES {
++        let reason = if preserve_schema {
++            "tool-schema"
++        } else {
++            "too-small"
++        };
+         log::debug!(
+-            "[tokenjuice] skipping tool={} bytes={} reason=too-small",
++            "[tokenjuice] skipping tool={} bytes={} reason={}",
+             tool_name,
+-            original_bytes
++            original_bytes,
++            reason
+         );
+         return (
+             output.to_owned(),
+@@ -86,7 +94,7 @@
+                 tool_name: tool_name.to_owned(),
+                 original_bytes,
+                 compacted_bytes: original_bytes,
+-                rule_id: "none/too-small".to_owned(),
++                rule_id: format!("none/{reason}"),
+                 applied: false,
+             },
+         );
+--- /dev/null
++++ b/tests/agentteams_mcp_schema.rs
+@@ -0,0 +1,32 @@
++use openhuman_core::openhuman::tokenjuice::compact_tool_output;
++#[test]
++fn mcp_discovery_keeps_every_tool_schema() {
++    let tools: Vec<_> = (0..20).map(|i| serde_json::json!({"name":format!("task_tool_{i}"),"description":"Task coordination operation","input_schema":{"type":"object","properties":{"taskId":{"type":"string"},"mode":{"enum":["start_task","submit_task"]}},"required":["taskId"]}})).collect();
++    let output =
++        serde_json::to_string_pretty(&serde_json::json!({"server":"teamharness","tools":tools}))
++            .unwrap();
++    let (compacted, stats) = compact_tool_output("mcp_list_tools", None, &output, Some(0));
++    assert!(
++        !stats.applied,
++        "MCP discovery schemas must remain available to the next tool call"
++    );
++    assert_eq!(compacted, output);
++}
++#[test]
++fn shell_logs_still_compact() {
++    let output = (0..1000)
++        .map(|i| format!("build line {i}\n"))
++        .collect::<String>();
++    let (compacted, stats) = compact_tool_output("shell", None, &output, Some(0));
++    assert!(stats.applied);
++    assert!(compacted.len() < output.len());
++}
++
++#[test]
++fn mcp_task_receipt_remains_complete_json() {
++    let tasks: Vec<_> = (0..12).map(|i| serde_json::json!({"taskId":format!("delivery-{i}"),"status":"assigned","taskDirectory":format!("/workspace/shared/tasks/delivery-{i}"),"spec":"Keep the original request and verified execution contract."})).collect();
++    let output=serde_json::to_string_pretty(&serde_json::json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&serde_json::json!({"synced":true,"tasks":tasks,"nextAction":"wait_for_submission"})).unwrap()}]})).unwrap();
++    let (compacted,stats)=compact_tool_output("mcp_call_tool",None,&output,Some(0));
++    assert!(!stats.applied,"Structured MCP task receipts must not be truncated");
++    assert_eq!(compacted,output);
++}

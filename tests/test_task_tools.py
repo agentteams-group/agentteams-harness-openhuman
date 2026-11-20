@@ -25,9 +25,11 @@ def test_native_stdio_mapping_uses_the_projected_identity_and_role_skills(tmp_pa
     server = native['mcp_client']['servers'][0]
     assert server['command'] == 'python3'
     assert server['name'] == 'teamharness'
-    assert server['env']['TEAMHARNESS_SHARED_DIR'] == str(tmp_path / 'shared')
+    assert server['env']['TEAMHARNESS_SHARED_DIR'] == str(tmp_path / 'workspace/shared')
+    assert not (tmp_path / 'workspace/shared').is_symlink()
+    assert (tmp_path / 'shared').is_symlink()
     assert Path(server['env']['TEAMHARNESS_RUNTIME_CONFIG']) == tmp_path / 'runtime/runtime.yaml'
-    assert (tmp_path / 'workspace/shared').resolve() == tmp_path / 'shared'
+    assert (tmp_path / 'workspace/shared').resolve() == (tmp_path / 'shared').resolve()
     skills = {p.name for p in (tmp_path / 'workspace/skills').iterdir()}
     assert ('project-management' in skills) == (role == 'team_leader')
     assert ('task-execution' in skills) == (role in {'worker', 'standalone'})
@@ -61,7 +63,7 @@ def test_switch_from_a_harness_with_legacy_shared_data_uses_the_worker_directory
     for _ in range(2):
         (tmp_path / 'config.toml').write_text('')
         config.configure(tmp_path, agentteams / 'plugins/teamharness')
-        assert legacy.resolve() == shared
+        assert legacy.resolve() == shared.resolve()
         assert (legacy / 'meta.json').read_text() == 'current checkpoint'
         assert not (shared / 'unpublished.txt').exists()
 
@@ -84,4 +86,31 @@ def test_old_controller_without_member_contract_does_not_gain_a_broken_server(tm
     assert not (tmp_path / 'config.toml').exists()
     monkeypatch.setenv('TEAMHARNESS_COORDINATION_URL', 'http://controller/api/v1/coordination')
     with pytest.raises(ValueError):
+        config.configure(tmp_path, agentteams / 'plugins/teamharness')
+
+
+def test_old_native_shared_link_moves_authoritative_data_inside_native_workspace(tmp_path):
+    (tmp_path / 'runtime').mkdir()
+    (tmp_path / 'runtime/runtime.yaml').write_text('member:\n  role: team_leader\n')
+    (tmp_path / 'config.toml').write_text('')
+    shared = tmp_path / 'shared'
+    (shared / 'tasks/task/workspace').mkdir(parents=True)
+    artifact = shared / 'tasks/task/workspace/check.txt'
+    artifact.write_text('STABLE-128\n')
+    native = tmp_path / 'workspace'
+    native.mkdir()
+    (native / 'shared').symlink_to(shared)
+    config.configure(tmp_path, agentteams / 'plugins/teamharness')
+    assert artifact.read_text() == 'STABLE-128\n'
+    assert artifact.resolve().is_relative_to(native.resolve())
+    assert shared.is_symlink()
+    assert not (native / 'shared').is_symlink()
+
+
+def test_worker_shared_link_cannot_import_an_external_directory(tmp_path):
+    (tmp_path / 'runtime').mkdir()
+    (tmp_path / 'runtime/runtime.yaml').write_text('member:\n  role: worker\n')
+    (tmp_path / 'workspace').mkdir()
+    (tmp_path / 'shared').symlink_to(tmp_path / 'external')
+    with pytest.raises(ValueError, match='outside'):
         config.configure(tmp_path, agentteams / 'plugins/teamharness')

@@ -226,6 +226,16 @@ if [ -n "${WORKER_NAME}" ]; then
     # omits workspace identity and shell tools. Bind your assigned role explicitly.
     # OpenHuman resolves <config-dir>/workspace as its native workspace.
     NATIVE_ROLE="${AGENTTEAMS_AGENT_ROLE:-${AGENTTEAMS_WORKER_ROLE:-worker}}"
+    if [ -f "${WORKSPACE}/runtime/runtime.yaml" ]; then
+        NATIVE_ROLE="$(python3 - "${WORKSPACE}/runtime/runtime.yaml" "${NATIVE_ROLE}" <<'PYROLE'
+import sys
+import yaml
+with open(sys.argv[1]) as source:
+    record = yaml.safe_load(source) or {}
+print(record.get('member', {}).get('role') or sys.argv[2])
+PYROLE
+)"
+    fi
     NATIVE_WORKSPACE="${WORKSPACE}/workspace"
     mkdir -p "${NATIVE_WORKSPACE}/agents" "${NATIVE_WORKSPACE}/skills"
     write_member_prompt() {
@@ -256,15 +266,18 @@ omit_memory_md = false
 inline = "You are the AgentTeams ${NATIVE_ROLE} named ${WORKER_NAME}. Follow your assigned role and credentials, and use your available tools to complete tasks."
 
 [tools]
-named = ["shell", "file_read", "file_write", "query_memory", "memory_store", "memory_forget", "mcp_list_tools", "mcp_call_tool"]
+named = ["shell", "file_read", "file_write", "list", "glob", "todo", "query_memory", "memory_store", "memory_forget", "mcp_list_tools", "mcp_call_tool"]
 EOF
     cat >> "${WORKSPACE}/config.toml" <<'EOF'
 
+[agent]
+max_tool_iterations = 15
+
 [autonomy]
-allowed_commands = ["agt", "mc", "ls", "cat", "grep", "find", "echo", "pwd", "head", "tail"]
+allowed_commands = ["agt", "mc", "ls", "cat", "grep", "find", "echo", "pwd", "head", "tail", "wc", "md5sum", "sha256sum"]
 EOF
     if [ "${AGENTTEAMS_YOLO:-0}" = "1" ]; then
-        printf '\nlevel = "full"\nrequire_approval_for_medium_risk = false\n' >> "${WORKSPACE}/config.toml"
+        printf '\nlevel = "full"\nrequire_approval_for_medium_risk = false\nmax_actions_per_hour = 100\n' >> "${WORKSPACE}/config.toml"
     fi
 fi
 

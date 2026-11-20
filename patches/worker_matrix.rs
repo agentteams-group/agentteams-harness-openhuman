@@ -269,6 +269,18 @@ where
                 continue;
             }
         };
+        // Include persisted invitations too: an older consumer may already
+        // have advanced past the original invite in its durable sync cursor.
+        for room in client.invited_rooms() {
+            let Ok(invite) = room.invite_details().await else { continue; };
+            if !channel.allowed_users.is_empty() && MatrixChannel::agentteams_sender_allowed(
+                &channel.allowed_users, invite.invitee.event().sender().as_str(), false,
+            ) {
+                if let Err(error) = room.join().await {
+                    tracing::warn!("Worker Matrix room join deferred: {error}");
+                }
+            }
+        }
         // The SDK may already have consumed this response in its local store.
         // Keep the decoded batch across failed Controller CAS attempts.
         loop {

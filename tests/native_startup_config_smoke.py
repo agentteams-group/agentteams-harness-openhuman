@@ -15,10 +15,15 @@ import yaml
 def main():
     source = Path('/usr/local/bin/openhuman-worker-entrypoint.sh').read_text()
     projection = source[source.index('OPENCLAW_JSON='):source.index('\nif [ -n "${WORKER_NAME}" ]; then\n    # Native channel turns')]
+    boot_start = source.index('if [ -n "${WORKER_NAME}" ]; then\n    # Native channel turns')
+    bootstrap = source[boot_start:source.index('\npython3 /opt/agentteams/scripts/configure-teamharness.py', boot_start)]
     start = source.index('if [ -n "${BRIDGE_LLM_BASE_URL}" ] &&')
     model = source[start:source.index('\n# Preserve CLI context', start)]
     with tempfile.TemporaryDirectory() as temp:
         workspace = Path(temp)
+        (workspace / 'skills').mkdir()
+        (workspace / 'AGENTS.md').write_text('Complete your assigned task.')
+        (workspace / 'SOUL.md').write_text('Be accurate.')
         runtime = workspace / 'runtime/runtime.yaml'
         runtime.parent.mkdir()
         runtime.write_text(yaml.safe_dump({
@@ -31,9 +36,9 @@ def main():
             'credentials': {'matrixTokenEnv': 'SMOKE_MATRIX_BINDING', 'gatewayKeyEnv': 'SMOKE_MODEL_BINDING'},
         }))
         env = {**os.environ, 'WORKSPACE': temp, 'HOME': temp, 'OPENHUMAN_WORKSPACE': temp,
-               'OPENHUMAN_CONFIG': str(workspace / 'config.toml'), 'AGENTTEAMS_WORKER_NAME': 'worker',
+               'OPENHUMAN_CONFIG': str(workspace / 'config.toml'), 'AGENTTEAMS_WORKER_NAME': 'worker', 'WORKER_NAME': 'worker', 'WORKER_CR_NAME': 'worker', 'AGENTTEAMS_YOLO': '1',
                'SMOKE_MATRIX_BINDING': 'synthetic-matrix-token', 'SMOKE_MODEL_BINDING': 'synthetic-model-key'}
-        subprocess.run(['bash', '-e', '-c', 'umask 077\nlog() { :; }\n' + projection + '\n' + model],
+        subprocess.run(['bash', '-e', '-c', 'umask 077\nlog() { :; }\n' + projection + '\n' + bootstrap + '\n' + model],
                        env=env, check=True)
         assert not (workspace / 'openclaw.json').exists()
         assert not (workspace / 'agent-config').exists()
@@ -43,6 +48,11 @@ def main():
         native = json.loads(raw[raw.index('{'):])
         # The CLI response wraps the persisted configuration in config.
         cfg = native['result']['config']
+        assert cfg['agent']['max_tool_iterations'] == 15
+        assert cfg['autonomy']['max_actions_per_hour'] == 100
+        assert {'wc', 'md5sum', 'sha256sum'} <= set(cfg['autonomy']['allowed_commands'])
+        for command in cfg['autonomy']['allowed_commands']:
+            subprocess.run(['sh', '-c', 'command -v "$1"', '_', command], check=True, stdout=subprocess.DEVNULL)
         assert cfg['default_model'] == 'worker-standard-model'
         assert cfg['inference_url'] == 'http://gateway.invalid/v1'
         assert cfg['api_key'] == 'synthetic-model-key'

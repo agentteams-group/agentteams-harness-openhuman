@@ -10,7 +10,7 @@ index 140d4e9..ef7479d 100644
  
  use super::credentials::scrub_credentials;
  use super::parse::{build_native_assistant_history, parse_structured_tool_calls, parse_tool_calls};
-@@ -575,6 +576,10 @@ pub(crate) async fn run_tool_call_loop(
+@@ -575,6 +576,12 @@ pub(crate) async fn run_tool_call_loop(
              };
  
              // ── Approval hook ────────────────────────────────
@@ -18,8 +18,11 @@ index 140d4e9..ef7479d 100644
 +                .try_with(Arc::clone)
 +                .ok();
 +            let approval = approval.or_else(|| matrix_context.as_ref().map(|c| c.manager.as_ref()));
++            let builtin_teamharness = matches!(call.name.as_str(), "mcp_list_tools" | "mcp_call_tool")
++                && call.arguments.get("server").and_then(serde_json::Value::as_str) == Some("teamharness");
              if let Some(mgr) = approval {
-                 if mgr.needs_approval(&call.name) {
+-                if mgr.needs_approval(&call.name) {
++                if !builtin_teamharness && mgr.needs_approval(&call.name) {
                      let request = ApprovalRequest {
 @@ -585,6 +590,15 @@ pub(crate) async fn run_tool_call_loop(
                      // Only prompt interactively when approvals are supported; auto-approve on other channels.

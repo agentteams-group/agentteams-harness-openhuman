@@ -70,7 +70,7 @@ index 0000000..f97ed87
 +            "running" => "正在执行", "stopping" => "正在停止", "stopped" => "已停止",
 +            "completed" => "本轮已结束", _ => "执行失败",
 +        };
-+        let content = json!({"msgtype": "m.notice", "body": body,
++        let content = json!({"msgtype": "m.notice", "body": body, "org.agentteams.progress_only": true,
 +            "com.agentteams.execution": {"run_id": self.id, "status": status,
 +                "capabilities": ["stop", "steer"]}});
 +        if let Err(error) = self.room.send_raw("m.room.message", content).await {
@@ -385,7 +385,7 @@ index 0000000..f1d3ee2
 +    replacement.finish().await;
 +    let statuses: Vec<_> = server.received_requests().await.unwrap().into_iter()
 +        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
-+        .filter_map(|body| body.pointer("/com.agentteams.execution/status").and_then(|v| v.as_str()).map(str::to_owned)).collect();
++        .filter_map(|body| { if body.get("com.agentteams.execution").is_some() { assert_eq!(body.get("org.agentteams.progress_only"), Some(&serde_json::json!(true))); } body.pointer("/com.agentteams.execution/status").and_then(|v| v.as_str()).map(str::to_owned) }).collect();
 +    assert_eq!(statuses, ["running", "stopped", "running", "completed"]);
 +}
 +
