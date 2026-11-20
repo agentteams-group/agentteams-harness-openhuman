@@ -266,7 +266,7 @@ omit_memory_md = false
 inline = "You are the AgentTeams ${NATIVE_ROLE} named ${WORKER_NAME}. Follow your assigned role and credentials, and use your available tools to complete tasks."
 
 [tools]
-named = ["shell", "file_read", "file_write", "query_memory", "memory_store", "memory_forget", "mcp_list_tools", "mcp_call_tool"]
+named = ["shell", "file_read", "file_write", "list", "glob", "todo", "query_memory", "memory_store", "memory_forget", "mcp_list_tools", "mcp_call_tool"]
 EOF
     cat >> "${WORKSPACE}/config.toml" <<'EOF'
 

@@ -34,7 +34,7 @@ class NativeToolsTests(unittest.TestCase):
                 definition = home / 'workspace/agents/orchestrator.toml'
                 self.assertTrue(definition.exists(), 'native role definition is missing')
                 agent = tomllib.loads(definition.read_text())
-                self.assertTrue({'shell', 'file_read', 'file_write'} <= set(agent['tools']['named']))
+                self.assertTrue({'shell', 'file_read', 'file_write', 'list', 'glob', 'todo'} <= set(agent['tools']['named']))
                 self.assertIn('member.role: ' + role, (home / 'workspace/SOUL.md').read_text())
                 self.assertTrue((home / 'workspace/skills/task.md').exists())
                 config = tomllib.loads((home / 'config.toml').read_text())

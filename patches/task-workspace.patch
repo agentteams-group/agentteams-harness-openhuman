@@ -124,3 +124,86 @@
          {
              Ok(cmd) => cmd,
              Err(e) => {
+--- a/src/openhuman/tools/impl/filesystem/list_files.rs
++++ b/src/openhuman/tools/impl/filesystem/list_files.rs
+@@ -51,30 +51,38 @@
+     }
+ 
+     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
++        #[cfg(feature = "channel-matrix")]
++        let security = crate::openhuman::channels::task_recovery::tool_security(&self.security)?;
++        #[cfg(not(feature = "channel-matrix"))]
++        let security = self.security.clone();
+         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
++        let path = if security.workspace_dir != self.security.workspace_dir {
++            std::path::Path::new(path).strip_prefix(&security.workspace_dir)
++                .ok().and_then(|value| value.to_str()).unwrap_or(path)
++        } else { path };
+ 
+-        if self.security.is_rate_limited() {
++        if security.is_rate_limited() {
+             return Ok(ToolResult::error(
+                 "Rate limit exceeded: too many actions in the last hour",
+             ));
+         }
+-        if !self.security.is_path_allowed(path) {
++        if !security.is_path_allowed(path) {
+             return Ok(ToolResult::error(format!(
+                 "Path not allowed by security policy: {path}"
+             )));
+         }
+-        if !self.security.record_action() {
++        if !security.record_action() {
+             return Ok(ToolResult::error(
+                 "Rate limit exceeded: action budget exhausted",
+             ));
+         }
+ 
+-        let full = self.security.workspace_dir.join(path);
++        let full = security.workspace_dir.join(path);
+         let resolved = match tokio::fs::canonicalize(&full).await {
+             Ok(p) => p,
+             Err(e) => return Ok(ToolResult::error(format!("Failed to resolve path: {e}"))),
+         };
+-        if !self.security.is_resolved_path_allowed(&resolved) {
++        if !security.is_resolved_path_allowed(&resolved) {
+             return Ok(ToolResult::error(format!(
+                 "Resolved path escapes workspace: {}",
+                 resolved.display()
+--- a/src/openhuman/tools/impl/filesystem/glob_search.rs
++++ b/src/openhuman/tools/impl/filesystem/glob_search.rs
+@@ -64,6 +64,10 @@
+     }
+ 
+     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
++        #[cfg(feature = "channel-matrix")]
++        let security = crate::openhuman::channels::task_recovery::tool_security(&self.security)?;
++        #[cfg(not(feature = "channel-matrix"))]
++        let security = self.security.clone();
+         let pattern_str = args
+             .get("pattern")
+             .and_then(|v| v.as_str())
+@@ -74,12 +78,12 @@
+             .map(|n| (n as usize).max(1))
+             .unwrap_or(DEFAULT_MAX_RESULTS);
+ 
+-        if self.security.is_rate_limited() {
++        if security.is_rate_limited() {
+             return Ok(ToolResult::error(
+                 "Rate limit exceeded: too many actions in the last hour",
+             ));
+         }
+-        if !self.security.record_action() {
++        if !security.record_action() {
+             return Ok(ToolResult::error(
+                 "Rate limit exceeded: action budget exhausted",
+             ));
+@@ -90,7 +94,7 @@
+             Err(e) => return Ok(ToolResult::error(format!("Invalid glob pattern: {e}"))),
+         };
+ 
+-        let workspace = self.security.workspace_dir.clone();
++        let workspace = security.workspace_dir.clone();
+         let result =
+             tokio::task::spawn_blocking(move || collect_matches(&workspace, &pattern, max_results))
+                 .await

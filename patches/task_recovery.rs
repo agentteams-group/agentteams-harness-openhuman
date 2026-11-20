@@ -43,7 +43,7 @@ pub(crate) fn tool_security(default: &Arc<crate::openhuman::security::SecurityPo
     let task = run.work["task_id"].as_str().ok_or_else(|| anyhow::anyhow!("Missing Task identity"))?;
     let path = std::path::Path::new(task);
     anyhow::ensure!(path.components().count() == 1 && matches!(path.components().next(), Some(std::path::Component::Normal(_))), "Invalid Task identity");
-    let root = home().join("shared/tasks").canonicalize()?;
+    let root = default.workspace_dir.join("shared/tasks").canonicalize()?;
     let directory = root.join(task).canonicalize()?;
     anyhow::ensure!(directory.parent() == Some(root.as_path()), "Task directory escapes shared tasks");
     let mut security = (**default).clone();
@@ -956,6 +956,43 @@ pub(crate) fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_directory_tools_stay_inside_the_owned_task() {
+        use crate::openhuman::security::SecurityPolicy;
+        use crate::openhuman::tools::{GlobTool, ListFilesTool};
+        use crate::openhuman::tools::traits::Tool;
+        let temp = tempfile::tempdir().unwrap();
+        let native = temp.path().join("workspace");
+        let owned = native.join("shared/tasks/owned/workspace");
+        let foreign = native.join("shared/tasks/foreign");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(owned.join("owned.txt"), "owned").unwrap();
+        std::fs::write(foreign.join("foreign.txt"), "foreign").unwrap();
+        let security = Arc::new(SecurityPolicy { workspace_dir: native, ..SecurityPolicy::default() });
+        let client = Client::builder().homeserver_url("http://matrix.invalid").build().await.unwrap();
+        let run = Arc::new(Run {
+            identity: Value::Null, work: json!({"kind":"task","task_id":"owned"}), scope: Value::Null,
+            admission: String::new(), client, room: String::new(), session: String::new(),
+            restored: Vec::new(), native_history: Mutex::new(Vec::new()), cache_path: temp.path().join("unused"),
+            cancel: CancellationToken::new(), started: AtomicBool::new(false),
+            finished: AtomicBool::new(false), succeeded: AtomicBool::new(false),
+        });
+        TASK_RUN.scope(run, async {
+            let list = ListFilesTool::new(security.clone());
+            let result = list.execute(json!({"path":"workspace"})).await.unwrap();
+            assert!(!result.is_error);
+            assert!(result.output().contains("owned.txt"));
+            assert!(!result.output().contains("foreign.txt"));
+            let escaped = list.execute(json!({"path":foreign})).await.unwrap();
+            assert!(escaped.is_error);
+            let result = GlobTool::new(security.clone()).execute(json!({"pattern":"**/*.txt"})).await.unwrap();
+            assert!(!result.is_error);
+            assert!(result.output().contains("owned.txt"));
+            assert!(!result.output().contains("foreign.txt"));
+        }).await;
+    }
 
     #[test]
     fn late_assignment_enters_the_original_history_once() {

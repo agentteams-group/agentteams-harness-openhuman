@@ -70,7 +70,9 @@ jobs:
           git -C native apply "$GITHUB_WORKSPACE/patches/mcp-tool-schema.patch"
       - name: Verify native Matrix controls and tool cleanup
         working-directory: native
-        run: cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery --test agentteams_mcp_schema
+        run: |
+          cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery --test agentteams_mcp_schema
+          cargo test --locked --no-default-features --features channel-matrix --lib channels::task_recovery::tests
 
   image:
     runs-on: ubuntu-24.04
@@ -90,7 +92,7 @@ jobs:
       - run: make smoke VERSION=ci
 
       - name: Export native executable and build provenance
-        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.export_native_binary)
         run: |
           mkdir test-binary
           image=ghcr.io/agentteams-group/agentteams-harness-openhuman:ci
@@ -105,7 +107,7 @@ jobs:
           docker run --rm --entrypoint sh "$image" -c 'dpkg-query -W && ldd /usr/local/bin/openhuman-core' > test-binary/dependencies.txt
           (cd test-binary && sha256sum openhuman-core > SHA256SUMS)
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.export_native_binary)
         with:
           name: openhuman-native-test-binary
           path: test-binary/
