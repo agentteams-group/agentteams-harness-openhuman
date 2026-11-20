@@ -15,7 +15,7 @@ BOOTSTRAP = BOOTSTRAP[BOOTSTRAP.rfind('\nif [', 0, BOOTSTRAP.index('# Native cha
 
 class NativeToolsTests(unittest.TestCase):
     def test_controller_roles_have_real_tools_and_their_own_identity(self):
-        for role in ['manager', 'standalone', 'team_leader']:
+        for role in ['manager', 'standalone', 'team_leader', 'worker']:
             with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
                 home = Path(directory)
                 (home / 'skills').mkdir()
@@ -37,7 +37,7 @@ class NativeToolsTests(unittest.TestCase):
                 self.assertIn('member.role: ' + role, (home / 'workspace/SOUL.md').read_text())
                 self.assertTrue((home / 'workspace/skills/task.md').exists())
                 policy = tomllib.loads((home / 'config.toml').read_text())['autonomy']
-                self.assertIn('mc', policy['allowed_commands'])
+                self.assertTrue({'mc', 'wc', 'md5sum', 'sha256sum', 'xxd'} <= set(policy['allowed_commands']))
                 self.assertIn('agentteams/test-storage', (home / 'workspace/SOUL.md').read_text())
                 self.assertIn('AgentTeams ' + role, agent['system_prompt']['inline'])
 

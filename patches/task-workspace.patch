@@ -1,0 +1,126 @@
+--- a/src/openhuman/tools/impl/filesystem/file_write.rs
++++ b/src/openhuman/tools/impl/filesystem/file_write.rs
+@@ -43,6 +43,10 @@
+     }
+ 
+     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
++        #[cfg(feature = "channel-matrix")]
++        let security = crate::openhuman::channels::task_recovery::tool_security(&self.security)?;
++        #[cfg(not(feature = "channel-matrix"))]
++        let security = self.security.clone();
+         let path = args
+             .get("path")
+             .and_then(|v| v.as_str())
+@@ -53,7 +57,7 @@
+             .and_then(|v| v.as_str())
+             .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
+ 
+-        if !self.security.can_act() {
++        if !security.can_act() {
+             return Ok(ToolResult::error("Action blocked: autonomy is read-only"));
+         }
+ 
+@@ -64,13 +68,17 @@
+         }
+ 
+         // Security check: validate path is within workspace
+-        if !self.security.is_path_allowed(path) {
++        let path = if security.workspace_dir != self.security.workspace_dir {
++            std::path::Path::new(path).strip_prefix(&security.workspace_dir)
++                .ok().and_then(|value| value.to_str()).unwrap_or(path)
++        } else { path };
++        if !security.is_path_allowed(path) {
+             return Ok(ToolResult::error(format!(
+                 "Path not allowed by security policy: {path}"
+             )));
+         }
+ 
+-        let full_path = self.security.workspace_dir.join(path);
++        let full_path = security.workspace_dir.join(path);
+ 
+         let Some(parent) = full_path.parent() else {
+             return Ok(ToolResult::error("Invalid path: missing parent directory"));
+@@ -89,7 +97,7 @@
+             }
+         };
+ 
+-        if !self.security.is_resolved_path_allowed(&resolved_parent) {
++        if !security.is_resolved_path_allowed(&resolved_parent) {
+             return Ok(ToolResult::error(format!(
+                 "Resolved path escapes workspace: {}",
+                 resolved_parent.display()
+--- a/src/openhuman/tools/impl/filesystem/file_read.rs
++++ b/src/openhuman/tools/impl/filesystem/file_read.rs
+@@ -46,6 +46,10 @@
+     }
+ 
+     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
++        #[cfg(feature = "channel-matrix")]
++        let security = crate::openhuman::channels::task_recovery::tool_security(&self.security)?;
++        #[cfg(not(feature = "channel-matrix"))]
++        let security = self.security.clone();
+         let path = args
+             .get("path")
+             .and_then(|v| v.as_str())
+@@ -58,7 +62,11 @@
+         }
+ 
+         // Security check: validate path is within workspace
+-        if !self.security.is_path_allowed(path) {
++        let path = if security.workspace_dir != self.security.workspace_dir {
++            std::path::Path::new(path).strip_prefix(&security.workspace_dir)
++                .ok().and_then(|value| value.to_str()).unwrap_or(path)
++        } else { path };
++        if !security.is_path_allowed(path) {
+             return Ok(ToolResult::error(format!(
+                 "Path not allowed by security policy: {path}"
+             )));
+@@ -73,7 +81,7 @@
+             ));
+         }
+ 
+-        let full_path = self.security.workspace_dir.join(path);
++        let full_path = security.workspace_dir.join(path);
+ 
+         // Resolve path before reading to block symlink escapes.
+         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
+@@ -85,7 +93,7 @@
+             }
+         };
+ 
+-        if !self.security.is_resolved_path_allowed(&resolved_path) {
++        if !security.is_resolved_path_allowed(&resolved_path) {
+             return Ok(ToolResult::error(format!(
+                 "Resolved path escapes workspace: {}",
+                 resolved_path.display()
+--- a/src/openhuman/tools/impl/system/shell.rs
++++ b/src/openhuman/tools/impl/system/shell.rs
+@@ -105,6 +105,10 @@
+     }
+ 
+     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
++        #[cfg(feature = "channel-matrix")]
++        let security = crate::openhuman::channels::task_recovery::tool_security(&self.security)?;
++        #[cfg(not(feature = "channel-matrix"))]
++        let security = self.security.clone();
+         let command = args
+             .get("command")
+             .and_then(|v| v.as_str())
+@@ -120,7 +124,7 @@
+             ));
+         }
+ 
+-        match self.security.validate_command_execution(command, approved) {
++        match security.validate_command_execution(command, approved) {
+             Ok(_) => {}
+             Err(reason) => {
+                 return Ok(ToolResult::error(reason));
+@@ -138,7 +142,7 @@
+         // (CWE-200), then re-add only safe, functional variables.
+         let mut cmd = match self
+             .runtime
+-            .build_shell_command(command, &self.security.workspace_dir)
++            .build_shell_command(command, &security.workspace_dir)
+         {
+             Ok(cmd) => cmd,
+             Err(e) => {

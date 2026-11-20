@@ -35,6 +35,22 @@ pub(crate) async fn check_authority(for_tool: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Give native filesystem/shell tools the directory of the currently owned Task.
+/// Other conversations retain their configured workspace and policy.
+pub(crate) fn tool_security(default: &Arc<crate::openhuman::security::SecurityPolicy>) -> anyhow::Result<Arc<crate::openhuman::security::SecurityPolicy>> {
+    let Ok(run) = TASK_RUN.try_with(Arc::clone) else { return Ok(default.clone()); };
+    if run.work["kind"] != "task" { return Ok(default.clone()); }
+    let task = run.work["task_id"].as_str().ok_or_else(|| anyhow::anyhow!("Missing Task identity"))?;
+    let path = std::path::Path::new(task);
+    anyhow::ensure!(path.components().count() == 1 && matches!(path.components().next(), Some(std::path::Component::Normal(_))), "Invalid Task identity");
+    let root = home().join("shared/tasks").canonicalize()?;
+    let directory = root.join(task).canonicalize()?;
+    anyhow::ensure!(directory.parent() == Some(root.as_path()), "Task directory escapes shared tasks");
+    let mut security = (**default).clone();
+    security.workspace_dir = directory;
+    Ok(Arc::new(security))
+}
+
 pub(crate) fn unexecuted_tool_frame(text: &str) -> bool {
     TASK_RUN.try_with(|_| ()).is_ok() && text.trim_start().starts_with("<tool_call>")
 }
