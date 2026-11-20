@@ -5,8 +5,8 @@
      let original_bytes = output.len();
  
 -    if original_bytes < MIN_COMPACT_INPUT_BYTES {
-+    // Discovery schemas are executable tool contracts, not summarizable logs.
-+    let preserve_schema = tool_name == "mcp_list_tools";
++    // MCP schemas and structured receipts are tool contracts, not logs.
++    let preserve_schema = matches!(tool_name, "mcp_list_tools" | "mcp_call_tool");
 +    if preserve_schema || original_bytes < MIN_COMPACT_INPUT_BYTES {
 +        let reason = if preserve_schema {
 +            "tool-schema"
@@ -34,7 +34,7 @@
          );
 --- /dev/null
 +++ b/tests/agentteams_mcp_schema.rs
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,32 @@
 +use openhuman_core::openhuman::tokenjuice::compact_tool_output;
 +#[test]
 +fn mcp_discovery_keeps_every_tool_schema() {
@@ -57,4 +57,13 @@
 +    let (compacted, stats) = compact_tool_output("shell", None, &output, Some(0));
 +    assert!(stats.applied);
 +    assert!(compacted.len() < output.len());
++}
++
++#[test]
++fn mcp_task_receipt_remains_complete_json() {
++    let tasks: Vec<_> = (0..12).map(|i| serde_json::json!({"taskId":format!("delivery-{i}"),"status":"assigned","taskDirectory":format!("/workspace/shared/tasks/delivery-{i}"),"spec":"Keep the original request and verified execution contract."})).collect();
++    let output=serde_json::to_string_pretty(&serde_json::json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&serde_json::json!({"synced":true,"tasks":tasks,"nextAction":"wait_for_submission"})).unwrap()}]})).unwrap();
++    let (compacted,stats)=compact_tool_output("mcp_call_tool",None,&output,Some(0));
++    assert!(!stats.applied,"Structured MCP task receipts must not be truncated");
++    assert_eq!(compacted,output);
 +}
