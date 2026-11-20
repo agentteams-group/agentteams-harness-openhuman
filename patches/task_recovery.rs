@@ -51,6 +51,21 @@ pub(crate) fn tool_security(default: &Arc<crate::openhuman::security::SecurityPo
     Ok(Arc::new(security))
 }
 
+/// Keep shared workspace paths and Task-relative native paths in the same owned directory.
+pub(crate) fn tool_path<'a>(default: &crate::openhuman::security::SecurityPolicy, scoped: &crate::openhuman::security::SecurityPolicy, path: &'a str) -> anyhow::Result<&'a str> {
+    if default.workspace_dir == scoped.workspace_dir { return Ok(path); }
+    let candidate = std::path::Path::new(path);
+    let relative = if candidate.is_absolute() {
+        candidate.strip_prefix(&scoped.workspace_dir).unwrap_or(candidate)
+    } else if candidate.starts_with("shared/tasks") {
+        let workspace = default.workspace_dir.canonicalize()?;
+        let prefix = scoped.workspace_dir.strip_prefix(&workspace)?;
+        candidate.strip_prefix(prefix).map_err(|_| anyhow::anyhow!("Path belongs to another Task"))?
+    } else { candidate };
+    let value = relative.to_str().ok_or_else(|| anyhow::anyhow!("Invalid native Task path"))?;
+    Ok(if value.is_empty() { "." } else { value })
+}
+
 pub(crate) fn unexecuted_tool_frame(text: &str) -> bool {
     TASK_RUN.try_with(|_| ()).is_ok() && text.trim_start().starts_with("<tool_call>")
 }
@@ -898,10 +913,7 @@ async fn scan(
             id: id.clone(),
             sender: own.to_owned(),
             reply_target: room,
-            content: claimed["resume_text"]
-                .as_str()
-                .ok_or("missing recovery context")?
-                .to_owned(),
+            content: format!("{}\nYour native filesystem and shell tools use taskDirectory as their working root. Use workspace/... relative paths or absolute paths inside taskDirectory. MCP filesync and artifact shared/... paths still use the shared workspace namespace.\n", claimed["resume_text"].as_str().ok_or("missing recovery context")?),
             channel: "matrix".into(),
             timestamp: now(),
             thread_ts: Some(run.session.clone()),
@@ -959,7 +971,7 @@ pub(crate) mod tests {
 
     pub(crate) async fn native_directory_tools_stay_inside_the_owned_task() {
         use crate::openhuman::security::SecurityPolicy;
-        use crate::openhuman::tools::{GlobTool, ListFilesTool};
+        use crate::openhuman::tools::{GlobTool, ListFilesTool, FileReadTool, FileWriteTool};
         use crate::openhuman::tools::traits::Tool;
         let temp = tempfile::tempdir().unwrap();
         let native = temp.path().join("workspace");
@@ -979,6 +991,21 @@ pub(crate) mod tests {
             finished: AtomicBool::new(false), succeeded: AtomicBool::new(false),
         });
         TASK_RUN.scope(run, async {
+            let write = FileWriteTool::new(security.clone());
+            let read = FileReadTool::new(security.clone());
+            for path in ["workspace/check.txt".to_string(), "shared/tasks/owned/workspace/check.txt".to_string(), owned.join("check.txt").to_string_lossy().into_owned()] {
+                let result = write.execute(json!({"path":path,"content":"STABLE-128\n"})).await.unwrap();
+                assert!(!result.is_error, "{}", result.output());
+                assert_eq!(std::fs::read(owned.join("check.txt")).unwrap(), b"STABLE-128\n");
+                let result = read.execute(json!({"path":path})).await.unwrap();
+                assert!(!result.is_error && result.output().contains("STABLE-128"));
+            }
+            assert!(!owned.parent().unwrap().join("shared/tasks/owned").exists());
+            let foreign_write = write.execute(json!({"path":"shared/tasks/foreign/escape.txt","content":"blocked"})).await;
+            assert!(foreign_write.is_err() || foreign_write.as_ref().unwrap().is_error);
+            assert!(!foreign.join("escape.txt").exists());
+            let result = ListFilesTool::new(security.clone()).execute(json!({"path":"shared/tasks/owned/workspace"})).await.unwrap();
+            assert!(!result.is_error && result.output().contains("check.txt"));
             let list = ListFilesTool::new(security.clone());
             let result = list.execute(json!({"path":"workspace"})).await.unwrap();
             assert!(!result.is_error);
