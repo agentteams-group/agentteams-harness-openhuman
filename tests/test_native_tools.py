@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -43,9 +44,29 @@ class NativeToolsTests(unittest.TestCase):
                     self.assertEqual(policy['max_actions_per_hour'], 100)
                 else:
                     self.assertNotIn('max_actions_per_hour', policy)
-                self.assertTrue({'mc', 'wc', 'md5sum', 'sha256sum', 'xxd'} <= set(policy['allowed_commands']))
+                self.assertTrue({'mc', 'wc', 'md5sum', 'sha256sum'} <= set(policy['allowed_commands']))
                 self.assertIn('agentteams/test-storage', (home / 'workspace/SOUL.md').read_text())
                 self.assertIn('AgentTeams ' + role, agent['system_prompt']['inline'])
+
+    def test_projected_team_role_overrides_stale_container_role(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / 'skills').mkdir()
+            (home / 'runtime').mkdir()
+            (home / 'runtime/runtime.yaml').write_text('member:\n  role: team_leader\n')
+            (home / 'AGENTS.md').write_text('Use your assigned role.')
+            (home / 'SOUL.md').write_text('Be accurate.')
+            (home / 'config.toml').write_text('')
+            result = subprocess.run(['bash', '-e', '-c', BOOTSTRAP], capture_output=True, text=True,
+                env={**os.environ, 'PATH': str(Path(sys.executable).parent)+os.pathsep+os.environ['PATH'],
+                     'WORKSPACE': directory, 'WORKER_NAME': 'demo', 'WORKER_CR_NAME': 'demo',
+                     'AGENTTEAMS_AGENT_ROLE': 'standalone', 'BRIDGE_ROOM_ID': '!room:test',
+                     'BRIDGE_USER_ID': '@demo:test'})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            prompt = (home / 'workspace/SOUL.md').read_text()
+            self.assertIn('member.role: team_leader', prompt)
+            definition = tomllib.loads((home / 'workspace/agents/orchestrator.toml').read_text())
+            self.assertIn('AgentTeams team_leader', definition['system_prompt']['inline'])
 
 if __name__ == '__main__':
     unittest.main()

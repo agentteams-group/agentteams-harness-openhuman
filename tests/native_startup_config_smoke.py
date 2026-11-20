@@ -50,7 +50,9 @@ def main():
         cfg = native['result']['config']
         assert cfg['agent']['max_tool_iterations'] == 15
         assert cfg['autonomy']['max_actions_per_hour'] == 100
-        assert {'wc', 'md5sum', 'sha256sum', 'xxd'} <= set(cfg['autonomy']['allowed_commands'])
+        assert {'wc', 'md5sum', 'sha256sum'} <= set(cfg['autonomy']['allowed_commands'])
+        for command in cfg['autonomy']['allowed_commands']:
+            subprocess.run(['sh', '-c', 'command -v "$1"', '_', command], check=True, stdout=subprocess.DEVNULL)
         assert cfg['default_model'] == 'worker-standard-model'
         assert cfg['inference_url'] == 'http://gateway.invalid/v1'
         assert cfg['api_key'] == 'synthetic-model-key'

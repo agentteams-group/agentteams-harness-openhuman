@@ -226,6 +226,16 @@ if [ -n "${WORKER_NAME}" ]; then
     # omits workspace identity and shell tools. Bind your assigned role explicitly.
     # OpenHuman resolves <config-dir>/workspace as its native workspace.
     NATIVE_ROLE="${AGENTTEAMS_AGENT_ROLE:-${AGENTTEAMS_WORKER_ROLE:-worker}}"
+    if [ -f "${WORKSPACE}/runtime/runtime.yaml" ]; then
+        NATIVE_ROLE="$(python3 - "${WORKSPACE}/runtime/runtime.yaml" "${NATIVE_ROLE}" <<'PYROLE'
+import sys
+import yaml
+with open(sys.argv[1]) as source:
+    record = yaml.safe_load(source) or {}
+print(record.get('member', {}).get('role') or sys.argv[2])
+PYROLE
+)"
+    fi
     NATIVE_WORKSPACE="${WORKSPACE}/workspace"
     mkdir -p "${NATIVE_WORKSPACE}/agents" "${NATIVE_WORKSPACE}/skills"
     write_member_prompt() {
@@ -264,7 +274,7 @@ EOF
 max_tool_iterations = 15
 
 [autonomy]
-allowed_commands = ["agt", "mc", "ls", "cat", "grep", "find", "echo", "pwd", "head", "tail", "wc", "md5sum", "sha256sum", "xxd"]
+allowed_commands = ["agt", "mc", "ls", "cat", "grep", "find", "echo", "pwd", "head", "tail", "wc", "md5sum", "sha256sum"]
 EOF
     if [ "${AGENTTEAMS_YOLO:-0}" = "1" ]; then
         printf '\nlevel = "full"\nrequire_approval_for_medium_risk = false\nmax_actions_per_hour = 100\n' >> "${WORKSPACE}/config.toml"
