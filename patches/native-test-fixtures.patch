@@ -1,0 +1,51 @@
+--- a/src/openhuman/tokenjuice/reduce_tests.rs
++++ b/src/openhuman/tokenjuice/reduce_tests.rs
+@@ -824,7 +824,7 @@
+ fn help_family_uses_middle_clamping() {
+     // The generic/help rule matches --help argument
+     let long_help: String = "USAGE: tool [OPTIONS]\n".to_owned()
+-        + &"  --option-N  Description of option N\n".repeat(200);
++        + "  --option-N  Description of option N\n".repeat(200).as_str();
+     let input = ToolExecutionInput {
+         tool_name: "exec".to_owned(),
+         argv: Some(vec!["tool".to_owned(), "--help".to_owned()]),
+--- a/src/openhuman/tokenjuice/text/process.rs
++++ b/src/openhuman/tokenjuice/text/process.rs
+@@ -327,7 +327,7 @@
+     fn clamp_text_newline_at_early_position() {
+         // Newline at position < len/2 → trim_head_to_line_boundary returns text as-is
+         // (the newline is too early to use as a boundary)
+-        let text = "ab\n".to_owned() + &"x".repeat(200);
++        let text = "ab\n".to_owned() + "x".repeat(200).as_str();
+         let clamped = clamp_text(&text, 100);
+         assert!(clamped.ends_with("... truncated ..."));
+     }
+@@ -336,7 +336,7 @@
+     fn clamp_middle_no_newline_in_tail() {
+         // tail portion has no newline → trim_tail_to_line_boundary returns text as-is
+         // This exercises the "None" branch of trim_tail_to_line_boundary
+-        let text = "line1\nline2\n".to_owned() + &"x".repeat(300);
++        let text = "line1\nline2\n".to_owned() + "x".repeat(300).as_str();
+         let clamped = clamp_text_middle(&text, 40);
+         assert!(clamped.contains("... omitted ..."));
+     }
+@@ -360,7 +360,7 @@
+         // Construct text with many lines; the last chunk has no early newline
+         let many_lines: String = "head-line\n".repeat(100);
+         // Tail segment ends with long non-newline text followed by newline at end
+-        let text = many_lines + &"z".repeat(200) + "\nlast";
++        let text = many_lines + "z".repeat(200).as_str() + "\nlast";
+         let clamped = clamp_text_middle(&text, 300);
+         // Should produce output with the marker
+         assert!(clamped.contains("... omitted ..."));
+--- a/src/openhuman/tools/impl/agent/spawn_subagent.rs
++++ b/src/openhuman/tools/impl/agent/spawn_subagent.rs
+@@ -651,7 +651,7 @@
+ 
+     #[test]
+     fn build_worker_thread_title_collapses_whitespace_and_caps_length() {
+-        let prompt = "  draft\n a very long\tplan that\nrambles ".to_string() + &"x".repeat(200);
++        let prompt = "  draft\n a very long\tplan that\nrambles ".to_string() + "x".repeat(200).as_str();
+         let title = build_worker_thread_title(&prompt);
+         assert!(title.starts_with("draft a very long plan"));
+         assert!(title.chars().count() <= WORKER_THREAD_TITLE_MAX_CHARS + 1);

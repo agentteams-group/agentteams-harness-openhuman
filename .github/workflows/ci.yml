@@ -72,6 +72,8 @@ jobs:
         working-directory: native
         run: |
           cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery --test agentteams_mcp_schema
+          # Pin upstream test concatenations to &str when decancer adds another Add implementation.
+          git apply "$GITHUB_WORKSPACE/patches/native-test-fixtures.patch"
           cargo test --locked --no-default-features --features channel-matrix --lib native_directory_tools_stay_inside_the_owned_task
 
   image:
