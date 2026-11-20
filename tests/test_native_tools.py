@@ -15,8 +15,8 @@ BOOTSTRAP = BOOTSTRAP[BOOTSTRAP.rfind('\nif [', 0, BOOTSTRAP.index('# Native cha
 
 class NativeToolsTests(unittest.TestCase):
     def test_controller_roles_have_real_tools_and_their_own_identity(self):
-        for role in ['manager', 'standalone', 'team_leader', 'worker']:
-            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+        for role, yolo in [(role, yolo) for role in ['manager', 'standalone', 'team_leader', 'worker'] for yolo in ['0', '1']]:
+            with self.subTest(role=role, yolo=yolo), tempfile.TemporaryDirectory() as directory:
                 home = Path(directory)
                 (home / 'skills').mkdir()
                 (home / 'skills/task.md').write_text('Use your assigned task tools.')
@@ -28,7 +28,7 @@ class NativeToolsTests(unittest.TestCase):
                          'AGENTTEAMS_WORKER_NAME': 'demo', 'WORKER_CR_NAME': 'demo',
                          'AGENTTEAMS_AGENT_ROLE': role, 'BRIDGE_ROOM_ID': '!room:test',
                          'AGENTTEAMS_STORAGE_PREFIX': 'agentteams/test-storage',
-                         'BRIDGE_USER_ID': '@demo:test', 'AGENTTEAMS_YOLO': '0'})
+                         'BRIDGE_USER_ID': '@demo:test', 'AGENTTEAMS_YOLO': yolo})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 definition = home / 'workspace/agents/orchestrator.toml'
                 self.assertTrue(definition.exists(), 'native role definition is missing')
@@ -36,7 +36,13 @@ class NativeToolsTests(unittest.TestCase):
                 self.assertTrue({'shell', 'file_read', 'file_write'} <= set(agent['tools']['named']))
                 self.assertIn('member.role: ' + role, (home / 'workspace/SOUL.md').read_text())
                 self.assertTrue((home / 'workspace/skills/task.md').exists())
-                policy = tomllib.loads((home / 'config.toml').read_text())['autonomy']
+                config = tomllib.loads((home / 'config.toml').read_text())
+                self.assertEqual(config['agent']['max_tool_iterations'], agent['max_iterations'])
+                policy = config['autonomy']
+                if yolo == '1':
+                    self.assertEqual(policy['max_actions_per_hour'], 100)
+                else:
+                    self.assertNotIn('max_actions_per_hour', policy)
                 self.assertTrue({'mc', 'wc', 'md5sum', 'sha256sum', 'xxd'} <= set(policy['allowed_commands']))
                 self.assertIn('agentteams/test-storage', (home / 'workspace/SOUL.md').read_text())
                 self.assertIn('AgentTeams ' + role, agent['system_prompt']['inline'])

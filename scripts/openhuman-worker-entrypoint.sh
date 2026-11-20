@@ -260,11 +260,14 @@ named = ["shell", "file_read", "file_write", "query_memory", "memory_store", "me
 EOF
     cat >> "${WORKSPACE}/config.toml" <<'EOF'
 
+[agent]
+max_tool_iterations = 15
+
 [autonomy]
 allowed_commands = ["agt", "mc", "ls", "cat", "grep", "find", "echo", "pwd", "head", "tail", "wc", "md5sum", "sha256sum", "xxd"]
 EOF
     if [ "${AGENTTEAMS_YOLO:-0}" = "1" ]; then
-        printf '\nlevel = "full"\nrequire_approval_for_medium_risk = false\n' >> "${WORKSPACE}/config.toml"
+        printf '\nlevel = "full"\nrequire_approval_for_medium_risk = false\nmax_actions_per_hour = 100\n' >> "${WORKSPACE}/config.toml"
     fi
 fi
 
