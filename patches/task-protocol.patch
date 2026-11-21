@@ -93,19 +93,42 @@ index 279f7b1..563f943 100644
 +#[cfg(feature = "channel-matrix")]
 +pub(crate) mod task_telemetry;
 diff --git a/src/openhuman/channels/providers/matrix.rs b/src/openhuman/channels/providers/matrix.rs
-index 6d2f198..b3a2875 100644
+index 6d2f198..84ad696 100644
 --- a/src/openhuman/channels/providers/matrix.rs
 +++ b/src/openhuman/channels/providers/matrix.rs
-@@ -819,6 +819,9 @@ impl Channel for MatrixChannel {
+@@ -783,6 +783,9 @@ impl Channel for MatrixChannel {
+                 if control && coordination_body.is_none() { return; }
+                 if crate::openhuman::channels::task_recovery::enabled() {
+                     if let Some(task_id) = coordination_body.as_ref().and_then(|packet| packet.task_id.as_deref()) {
++                        let mut metadata = coordination_body.as_ref().unwrap().meta.clone();
++                        metadata["otel_carrier"] = raw["content"]["com.agentteams.trace"].clone();
++                        crate::openhuman::channels::task_protocol::register(event.event_id.as_str(), metadata);
+                         crate::openhuman::channels::task_recovery::source(
+                             room.room_id().as_str(), task_id, event.event_id.as_str());
+                         return;
+@@ -819,6 +822,11 @@ impl Channel for MatrixChannel {
  
                  // Use the real Matrix notification event as a native conversation thread.
                  let coordination_session = coordination_body.as_ref().map(|_| event.event_id.to_string());
 +                if let Some(packet) = coordination_body.as_ref() {
-+                    crate::openhuman::channels::task_protocol::register(event.event_id.as_str(), packet.meta.clone());
++                    let mut metadata = packet.meta.clone();
++                    metadata["otel_carrier"] = raw["content"]["com.agentteams.trace"].clone();
++                    crate::openhuman::channels::task_protocol::register(event.event_id.as_str(), metadata);
 +                }
                  let mut body = match coordination_body {
                      Some(packet) => packet.text,
                      None => match &event.content.msgtype {
+@@ -879,6 +887,10 @@ impl Channel for MatrixChannel {
+                         return;
+                     }
+                 }
++                if coordination_session.is_none() {
++                    crate::openhuman::channels::task_protocol::register(&event_id,
++                        serde_json::json!({"otel_carrier":raw["content"]["com.agentteams.trace"]}));
++                }
+                 if managed {
+                     if let Err(error) = worker_sync::admit(&client, &tx, &key, &room, &sender, &body, direct, inputs, source_event_ids).await {
+                         tracing::warn!("Matrix recovery deferred: {error}");
 diff --git a/src/openhuman/channels/runtime/dispatch.rs b/src/openhuman/channels/runtime/dispatch.rs
 index e18223e..cd79352 100644
 --- a/src/openhuman/channels/runtime/dispatch.rs

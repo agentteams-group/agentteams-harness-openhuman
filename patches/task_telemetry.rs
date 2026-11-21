@@ -89,7 +89,10 @@ pub(crate) async fn turn<F: Future>(future: F) -> F::Output {
         .tracer("agentteams.openhuman.native")
         .span_builder("agent.turn")
         .with_attributes(crate::openhuman::channels::task_protocol::trace_fields())
-        .start(&provider.tracer("agentteams.openhuman.native"));
+        .start_with_context(
+            &provider.tracer("agentteams.openhuman.native"),
+            &crate::openhuman::channels::task_protocol::trace_parent(),
+        );
     let context = Context::new().with_span(span);
     let result = PARENT.scope(context.clone(), future).await;
     context.span().end();

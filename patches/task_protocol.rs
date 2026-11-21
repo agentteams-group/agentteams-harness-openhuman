@@ -24,10 +24,20 @@ struct NativeTurn {
     session: String,
     coordination: Value,
     turn_id: String,
+    carrier: HashMap<String, String>,
 }
 
-pub(crate) fn register(event: &str, meta: Value) {
-    NOTIFICATIONS.lock().unwrap().insert(event.to_owned(), meta);
+pub(crate) fn register(event: &str, mut meta: Value) {
+    let mut notifications = NOTIFICATIONS.lock().unwrap();
+    if meta.get("otel_carrier").is_none() {
+        if let Some(carrier) = notifications
+            .get(event)
+            .and_then(|old| old.get("otel_carrier"))
+        {
+            meta["otel_carrier"] = carrier.clone();
+        }
+    }
+    notifications.insert(event.to_owned(), meta);
 }
 
 fn home() -> PathBuf {
@@ -71,7 +81,20 @@ pub(crate) async fn scope<F: Future>(
         .as_ref()
         .map(|value| value["teamharness_coordination"].clone())
         .unwrap_or(Value::Null);
-    if let Some(meta) = meta {
+    let carrier = meta
+        .as_ref()
+        .and_then(|meta| meta.get("otel_carrier"))
+        .and_then(Value::as_object)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(meta) = meta.filter(|meta| meta.get("teamharness_coordination").is_some()) {
         let mut event = meta["teamharness_coordination"].clone();
         if let Some(id) = event["id"].as_str() {
             let admitted = bridge(json!({"operation":"admit_event","eventId":id,
@@ -123,6 +146,7 @@ pub(crate) async fn scope<F: Future>(
         session: session.to_owned(),
         coordination,
         turn_id: uuid::Uuid::new_v4().to_string(),
+        carrier,
     });
     Ok(CURRENT
         .scope(turn, super::task_telemetry::turn(future))
@@ -428,6 +452,15 @@ pub(crate) fn trace_fields() -> Vec<opentelemetry::KeyValue> {
                 }
             }
             fields
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn trace_parent() -> opentelemetry::Context {
+    use opentelemetry::propagation::TextMapPropagator;
+    CURRENT
+        .try_with(|turn| {
+            opentelemetry_sdk::propagation::TraceContextPropagator::new().extract(&turn.carrier)
         })
         .unwrap_or_default()
 }

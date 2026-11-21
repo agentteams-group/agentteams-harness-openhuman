@@ -5,6 +5,15 @@ mod native;
 mod openhuman {
     pub mod channels {
         pub mod task_protocol {
+            pub fn trace_parent() -> opentelemetry::Context {
+                use opentelemetry::propagation::TextMapPropagator;
+                opentelemetry_sdk::propagation::TraceContextPropagator::new().extract(
+                    &std::collections::HashMap::from([(
+                        "traceparent".to_owned(),
+                        "00-123456789012345678901234567890ab-12345678901234ab-01".to_owned(),
+                    )]),
+                )
+            }
             pub fn trace_fields() -> Vec<opentelemetry::KeyValue> {
                 vec![
                     opentelemetry::KeyValue::new("agentteams.event.id", "$synthetic-native"),
@@ -94,4 +103,12 @@ async fn native_exporter_exports_real_boundary_usage_without_contents() {
     assert!(!body
         .windows(b"SYNTHETIC_PRIVATE_CONTENT".len())
         .any(|bytes| bytes == b"SYNTHETIC_PRIVATE_CONTENT"));
+    let trace_id = [
+        0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90,
+        0xab,
+    ];
+    assert!(
+        body.windows(16).filter(|bytes| *bytes == trace_id).count() >= 3,
+        "native turn/model/tool spans lost the incoming Matrix trace carrier"
+    );
 }
