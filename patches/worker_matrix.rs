@@ -45,6 +45,11 @@ pub(super) async fn admit(
                 inputs,
                 source_events,
             );
+            if let Some(run) = crate::openhuman::channels::matrix_direct::get(
+                record["event_id"].as_str().unwrap_or_default(),
+            ) {
+                run.set_transport(tx.clone());
+            }
         }
     })
     .await

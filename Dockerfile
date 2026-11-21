@@ -78,35 +78,21 @@ WORKDIR /build
 # Override via `docker --build-arg OPENHUMAN_REPO_URL=... OPENHUMAN_GIT_REF=...`
 # to use a fork or a different release tag / commit.
 #
-# Default pinned to v0.54.0 (released 2026-05-19), the latest stable
-# release of tinyhumansai/openhuman as of integration. Bump deliberately,
-# don't drift to `main`, so builds stay reproducible.
+# Pin the released native RunQueue integration; keep versions.env aligned.
 ARG OPENHUMAN_REPO_URL=https://github.com/tinyhumansai/openhuman.git
-ARG OPENHUMAN_GIT_REF=v0.54.0
+ARG OPENHUMAN_GIT_REF=v0.57.18
 
 # Pre-fetch openhuman source via git so the build is self-contained
 # (no requirement for an `openhuman-src/` directory in the build context).
 # Pinning to a tag / commit makes builds reproducible.
 RUN git clone --depth 1 --branch "${OPENHUMAN_GIT_REF}" "${OPENHUMAN_REPO_URL}" /build/openhuman-src
 
-COPY patches/manager-matrix.patch /tmp/manager-matrix.patch
-RUN git -C /build/openhuman-src apply /tmp/manager-matrix.patch
-COPY patches/dashboard-approvals.patch /tmp/dashboard-approvals.patch
-RUN git -C /build/openhuman-src apply /tmp/dashboard-approvals.patch
-COPY patches/direct-control.patch /tmp/direct-control.patch
-RUN git -C /build/openhuman-src apply /tmp/direct-control.patch
-COPY patches/session-receipts.patch /tmp/session-receipts.patch
 COPY patches/session_receipts.rs /build/openhuman-src/src/openhuman/channels/session_receipts.rs
-RUN git -C /build/openhuman-src apply /tmp/session-receipts.patch
-COPY patches/task-coordination.patch /tmp/task-coordination.patch
 COPY patches/task_coordination.rs /build/openhuman-src/src/openhuman/channels/task_coordination.rs
-RUN git -C /build/openhuman-src apply /tmp/task-coordination.patch
-COPY patches/task-recovery.patch /tmp/task-recovery.patch
 COPY patches/task_recovery.rs /build/openhuman-src/src/openhuman/channels/task_recovery.rs
-RUN git -C /build/openhuman-src apply /tmp/task-recovery.patch
-COPY patches/worker-matrix.patch /tmp/worker-matrix.patch
 COPY patches/worker_matrix.rs /build/openhuman-src/src/openhuman/channels/providers/matrix/worker_sync.rs
-RUN git -C /build/openhuman-src apply /tmp/worker-matrix.patch
+COPY patches/agentteams.patch /tmp/agentteams.patch
+RUN git -C /build/openhuman-src apply /tmp/agentteams.patch
 
 WORKDIR /build/openhuman-src
 
@@ -115,7 +101,7 @@ ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,id=agentteams-openhuman-target-${TARGETARCH},target=/build/openhuman-src/target,sharing=locked \
-    GGML_NATIVE=OFF cargo build --release --bin openhuman-core --features channel-matrix \
+    GGML_NATIVE=OFF cargo build --locked --release --bin openhuman-core --features channel-matrix \
     && cp target/release/openhuman-core /usr/local/bin/openhuman-core
 
 # ==========================================================================

@@ -1,0 +1,2494 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index e24e116..634b932 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5184,6 +5184,7 @@ dependencies = [
+  "mail-parser",
+  "matrix-sdk",
+  "motosan-ai-oauth",
++ "nix",
+  "nu-ansi-term 0.46.0",
+  "objc2 0.6.4",
+  "objc2-contacts",
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -86,6 +86,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
+ hkdf = "0.12"
+ hex = "0.4"
+ tokio-util = { version = "0.7", features = ["rt", "io"] }
++nix = { version = "0.30", features = ["signal", "process"] }
+ # tokio-tungstenite is declared per-target below so the TLS backend
+ # (native-tls on Windows, rustls on macOS / Linux) matches the reqwest
+ # backend selected at each TLS call site.
+diff --git a/src/lib.rs b/src/lib.rs
+index 166b5c4..4ea3dac 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,6 +5,8 @@
+ //! - Core system services (CLI, configuration, monitoring).
+ //! - Domain-specific logic for the OpenHuman agent runtime.
+ 
++#![recursion_limit = "256"]
++
+ pub mod api;
+ pub mod core;
+ pub mod openhuman;
+diff --git a/src/openhuman/agent/harness/engine/agentteams_steering_tests.rs b/src/openhuman/agent/harness/engine/agentteams_steering_tests.rs
+new file mode 100644
+index 0000000..5384b49
+--- /dev/null
++++ b/src/openhuman/agent/harness/engine/agentteams_steering_tests.rs
+@@ -0,0 +1,144 @@
++use super::*;
++use crate::openhuman::agent::harness::run_queue::{QueueMode, QueuedMessage, RunQueue};
++use crate::openhuman::inference::provider::{ChatRequest, ChatResponse, Provider};
++use crate::openhuman::tools::{Tool, ToolResult};
++use async_trait::async_trait;
++use std::sync::{
++    atomic::{AtomicBool, Ordering},
++    Arc,
++};
++use tokio::sync::Notify;
++
++struct Model(AtomicBool);
++#[async_trait]
++impl Provider for Model {
++    async fn chat_with_system(
++        &self,
++        _: Option<&str>,
++        _: &str,
++        _: &str,
++        _: f64,
++    ) -> anyhow::Result<String> {
++        unreachable!()
++    }
++    async fn chat(
++        &self,
++        request: ChatRequest<'_>,
++        _: &str,
++        _: f64,
++    ) -> anyhow::Result<ChatResponse> {
++        let text = if !self.0.swap(true, Ordering::SeqCst) {
++            "<tool_call>{\"name\":\"wait_for_supplements\",\"arguments\":{}}</tool_call>"
++        } else {
++            let text = request
++                .messages
++                .iter()
++                .map(|row| row.content.as_str())
++                .collect::<Vec<_>>()
++                .join("\n");
++            assert!(text.contains("original request"));
++            assert!(text.contains("native tool finished"));
++            assert!(
++                text.find("first supplement").unwrap() < text.find("second supplement").unwrap()
++            );
++            "steered result"
++        };
++        Ok(ChatResponse {
++            text: Some(text.into()),
++            tool_calls: vec![],
++            usage: None,
++            reasoning_content: None,
++        })
++    }
++}
++
++struct WaitTool {
++    started: Arc<Notify>,
++    release: Arc<Notify>,
++}
++#[async_trait]
++impl Tool for WaitTool {
++    fn name(&self) -> &str {
++        "wait_for_supplements"
++    }
++    fn description(&self) -> &str {
++        "Wait at the native tool boundary"
++    }
++    fn parameters_schema(&self) -> serde_json::Value {
++        serde_json::json!({"type":"object"})
++    }
++    async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
++        self.started.notify_one();
++        self.release.notified().await;
++        Ok(ToolResult::success("native tool finished"))
++    }
++}
++
++#[tokio::test]
++async fn agentteams_native_steer_reaches_the_next_request_without_cancelling_tools() {
++    let queue = RunQueue::new();
++    let started = Arc::new(Notify::new());
++    let release = Arc::new(Notify::new());
++    let tools: Vec<Box<dyn Tool>> = vec![Box::new(WaitTool {
++        started: started.clone(),
++        release: release.clone(),
++    })];
++    let mut history = vec![crate::openhuman::inference::provider::ChatMessage::user(
++        "original request",
++    )];
++    let model = Model(AtomicBool::new(false));
++    let mut source = RegistryToolSource::new(
++        &tools,
++        &[],
++        None,
++        &crate::openhuman::tools::policy::DefaultToolPolicy,
++        None,
++    );
++    let progress = TurnProgress::new(None);
++    let mut observer = NullObserver;
++    let multimodal = crate::openhuman::config::MultimodalConfig::default();
++    let files = crate::openhuman::config::MultimodalFileConfig::default();
++    let run = run_turn_engine(
++        &model,
++        &mut history,
++        &mut source,
++        &progress,
++        &mut observer,
++        &ErrorCheckpoint,
++        &DefaultParser,
++        "fixture",
++        "fixture-model",
++        0.0,
++        true,
++        &multimodal,
++        &files,
++        3,
++        None,
++        &[],
++        Some(queue.clone()),
++    );
++    tokio::pin!(run);
++    tokio::select! {
++        _ = started.notified() => {},
++        _ = &mut run => panic!("native tool did not wait"),
++    }
++    for text in ["first supplement", "second supplement"] {
++        queue
++            .push(QueuedMessage {
++                text: text.into(),
++                mode: QueueMode::Steer,
++                client_id: text.into(),
++                thread_id: "matrix-direct".into(),
++                queued_at_ms: 0,
++                model_override: None,
++                temperature: None,
++                profile_id: None,
++                locale: None,
++            })
++            .await;
++    }
++    assert_eq!(queue.status().await.steers, 2);
++    release.notify_one();
++    assert_eq!(run.await.unwrap().text, "steered result");
++    assert_eq!(queue.status().await.total, 0);
++}
+diff --git a/src/openhuman/agent/harness/engine/core.rs b/src/openhuman/agent/harness/engine/core.rs
+index f130ce3..4bc596f 100644
+--- a/src/openhuman/agent/harness/engine/core.rs
++++ b/src/openhuman/agent/harness/engine/core.rs
+@@ -117,6 +117,11 @@ pub(crate) async fn run_turn_engine(
+     let mut repeat_guard = RepeatOutputGuard::new();
+     let mut halt_reason: Option<String> = None;
+     for iteration in 0..max_iterations {
++        #[cfg(feature = "channel-matrix")]
++        {
++            crate::openhuman::channels::task_recovery::check_authority(false).await?;
++            crate::openhuman::channels::task_recovery::attach_pending(history).await?;
++        }
+         progress
+             .iteration_started((iteration + 1) as u32, max_iterations as u32)
+             .await;
+@@ -218,6 +223,13 @@ pub(crate) async fn run_turn_engine(
+                     );
+                     let steer_content = format!("[User steering message]: {}", s.text);
+                     history.push(ChatMessage::user(steer_content));
++                    #[cfg(feature = "channel-matrix")]
++                    crate::openhuman::channels::matrix_direct::delivered(
++                        &s.client_id,
++                        &s.text,
++                        history,
++                    )
++                    .await?;
+                     crate::core::event_bus::publish_global(
+                         crate::core::event_bus::DomainEvent::RunQueueMessageDelivered {
+                             thread_id: s.thread_id.clone(),
+@@ -429,6 +441,12 @@ pub(crate) async fn run_turn_engine(
+         };
+ 
+         if tool_calls.is_empty() {
++            #[cfg(feature = "channel-matrix")]
++            if crate::openhuman::channels::task_recovery::unexecuted_tool_frame(&response_text) {
++                history.push(ChatMessage::assistant(response_text));
++                history.push(ChatMessage::user("That tool request was malformed and did not run. Use a registered function to continue."));
++                continue;
++            }
+             tracing::debug!(
+                 iteration,
+                 "[agent_loop] no tool calls — returning final response"
+@@ -474,6 +492,8 @@ pub(crate) async fn run_turn_engine(
+                 }
+             }
+             history.push(ChatMessage::assistant(response_text.clone()));
++            #[cfg(feature = "channel-matrix")]
++            crate::openhuman::channels::task_recovery::checkpoint(history).await?;
+             observer
+                 .on_assistant(
+                     &final_out,
+@@ -572,6 +592,8 @@ pub(crate) async fn run_turn_engine(
+                 .unwrap_or_else(|| format!("loop-{iteration}-{call_idx}-{}", call.name));
+ 
+             // Full per-call lifecycle is owned by the ToolSource.
++            #[cfg(feature = "channel-matrix")]
++            crate::openhuman::channels::task_recovery::check_authority(true).await?;
+             let outcome = tools
+                 .execute_call(call, iteration, progress, &progress_call_id)
+                 .await;
+@@ -661,6 +683,8 @@ pub(crate) async fn run_turn_engine(
+         }
+ 
+         observer.after_iteration(history, iteration);
++        #[cfg(feature = "channel-matrix")]
++        crate::openhuman::channels::task_recovery::checkpoint(history).await?;
+ 
+         // Early-exit for ask_user_clarification: history already has the
+         // tool call + result appended, observer persisted the transcript.
+diff --git a/src/openhuman/agent/harness/engine/mod.rs b/src/openhuman/agent/harness/engine/mod.rs
+index df22ec0..b6f88aa 100644
+--- a/src/openhuman/agent/harness/engine/mod.rs
++++ b/src/openhuman/agent/harness/engine/mod.rs
+@@ -14,6 +14,8 @@
+ //! timeout → scrub/tokenjuice/cap/summarize → audit), which was previously
+ //! duplicated verbatim across all three loops.
+ 
++#[cfg(test)]
++mod agentteams_steering_tests;
+ pub(crate) mod checkpoint;
+ pub(crate) mod core;
+ pub(crate) mod parser;
+diff --git a/src/openhuman/agent/harness/engine/tools.rs b/src/openhuman/agent/harness/engine/tools.rs
+index 07297ec..8ccc657 100644
+--- a/src/openhuman/agent/harness/engine/tools.rs
++++ b/src/openhuman/agent/harness/engine/tools.rs
+@@ -189,6 +189,21 @@ pub(crate) async fn run_one_tool(
+         }
+     }
+ 
++    #[cfg(feature = "channel-matrix")]
++    let operation = match crate::openhuman::channels::task_recovery::begin_message_tools(
++        serde_json::json!([{"id":progress_call_id,"name":call.name,"arguments":call.arguments}]),
++    )
++    .await
++    {
++        Ok(operation) => operation,
++        Err(error) => {
++            crate::openhuman::channels::task_recovery::abort_unconfirmed();
++            return ToolRunResult {
++                text: error.to_string(),
++                success: false,
++            };
++        }
++    };
+     let tool_deadline = crate::openhuman::tool_timeout::tool_execution_timeout_duration();
+     let timeout_secs = crate::openhuman::tool_timeout::tool_execution_timeout_secs();
+     let tool_started = std::time::Instant::now();
+@@ -352,6 +367,23 @@ pub(crate) async fn run_one_tool(
+             iteration_u32,
+         )
+         .await;
++    #[cfg(feature = "channel-matrix")]
++    if operation.is_some() {
++        if !success {
++            crate::openhuman::channels::task_recovery::abort_unconfirmed();
++        } else if let Err(error) = crate::openhuman::channels::task_recovery::finish_message_tools(
++            operation,
++            serde_json::json!([{"id":progress_call_id,"content":result_text}]),
++        )
++        .await
++        {
++            crate::openhuman::channels::task_recovery::abort_unconfirmed();
++            return ToolRunResult {
++                text: error.to_string(),
++                success: false,
++            };
++        }
++    }
+     // ── Approval audit after-action row (#2135) ────
+     // Stamp the terminal status onto the same `pending_approvals` row the gate
+     // created before execution, so the audit trail carries both the before
+diff --git a/src/openhuman/agent/harness/tool_loop.rs b/src/openhuman/agent/harness/tool_loop.rs
+index 5f518a2..38647d5 100644
+--- a/src/openhuman/agent/harness/tool_loop.rs
++++ b/src/openhuman/agent/harness/tool_loop.rs
+@@ -372,7 +372,16 @@ pub(crate) async fn run_tool_call_loop(
+         max_iterations,
+         on_delta,
+         &[],
+-        None,
++        {
++            #[cfg(feature = "channel-matrix")]
++            {
++                crate::openhuman::channels::matrix_direct::current().map(|run| run.queue.clone())
++            }
++            #[cfg(not(feature = "channel-matrix"))]
++            {
++                None
++            }
++        },
+     )
+     .await
+     .map(|outcome| outcome.text)
+diff --git a/src/openhuman/agent_orchestration/tools/spawn_subagent.rs b/src/openhuman/agent_orchestration/tools/spawn_subagent.rs
+index db5af93..9c55e67 100644
+--- a/src/openhuman/agent_orchestration/tools/spawn_subagent.rs
++++ b/src/openhuman/agent_orchestration/tools/spawn_subagent.rs
+@@ -797,7 +797,7 @@ mod tests {
+ 
+     #[test]
+     fn build_worker_thread_title_collapses_whitespace_and_caps_length() {
+-        let prompt = "  draft\n a very long\tplan that\nrambles ".to_string() + &"x".repeat(200);
++        let prompt = "  draft\n a very long\tplan that\nrambles ".to_string() + "x".repeat(200).as_str();
+         let title = build_worker_thread_title(&prompt);
+         assert!(title.starts_with("draft a very long plan"));
+         assert!(title.chars().count() <= WORKER_THREAD_TITLE_MAX_CHARS + 1);
+diff --git a/src/openhuman/approval/matrix.rs b/src/openhuman/approval/matrix.rs
+new file mode 100644
+index 0000000..baa0667
+--- /dev/null
++++ b/src/openhuman/approval/matrix.rs
+@@ -0,0 +1,334 @@
++//! Request-bound Matrix approvals for channel turns.
++use super::{ApprovalChatContext, ApprovalDecision, ApprovalGate, APPROVAL_CHAT_CONTEXT};
++use crate::openhuman::channels::traits::Channel;
++use std::{
++    collections::HashMap,
++    sync::{Arc, LazyLock, Mutex},
++};
++use tokio::sync::oneshot;
++
++pub(crate) struct Context {
++    pub channel: Arc<dyn Channel>,
++    pub room: String,
++    pub sender: String,
++}
++
++tokio::task_local! { pub(crate) static CONTEXT: Arc<Context>; }
++
++pub struct ApprovalRequest {
++    pub tool_name: String,
++    pub arguments: serde_json::Value,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ApprovalResponse {
++    Yes,
++    No,
++}
++
++struct Surface {
++    context: Arc<Context>,
++    thread: String,
++}
++
++#[async_trait::async_trait]
++impl crate::core::event_bus::EventHandler for Surface {
++    fn name(&self) -> &str {
++        "agentteams-matrix-approval"
++    }
++    fn domains(&self) -> Option<&[&str]> {
++        Some(&["approval"])
++    }
++    async fn handle(&self, event: &crate::core::event_bus::DomainEvent) {
++        if let crate::core::event_bus::DomainEvent::ApprovalRequested {
++            request_id,
++            tool_name,
++            args_redacted,
++            thread_id,
++            client_id,
++            ..
++        } = event
++        {
++            if client_id.as_deref() != Some("agentteams-matrix")
++                || thread_id.as_deref() != Some(self.thread.as_str())
++            {
++                return;
++            }
++            let decision = self
++                .context
++                .channel
++                .request_approval(
++                    &self.context.room,
++                    &self.context.sender,
++                    &ApprovalRequest {
++                        tool_name: tool_name.clone(),
++                        arguments: args_redacted.clone(),
++                    },
++                )
++                .await;
++            if let Some(gate) = ApprovalGate::try_global() {
++                let decision = if decision == ApprovalResponse::Yes {
++                    ApprovalDecision::ApproveOnce
++                } else {
++                    ApprovalDecision::Deny
++                };
++                if let Err(error) = gate.decide(request_id, decision) {
++                    tracing::warn!("Matrix approval decision failed: {error}");
++                }
++            }
++        }
++    }
++}
++
++pub(crate) async fn scope<T>(
++    context: Arc<Context>,
++    thread: String,
++    turn: impl std::future::Future<Output = T>,
++) -> T {
++    let _surface = crate::core::event_bus::subscribe_global(Arc::new(Surface {
++        context: context.clone(),
++        thread: thread.clone(),
++    }));
++    CONTEXT
++        .scope(
++            context,
++            APPROVAL_CHAT_CONTEXT.scope(
++                ApprovalChatContext {
++                    thread_id: thread,
++                    client_id: "agentteams-matrix".into(),
++                },
++                turn,
++            ),
++        )
++        .await
++}
++
++struct Pending {
++    room: String,
++    sender: String,
++    admin: Option<String>,
++    context: String,
++    answer: oneshot::Sender<ApprovalResponse>,
++}
++static PENDING: LazyLock<Mutex<HashMap<String, Pending>>> =
++    LazyLock::new(|| Mutex::new(HashMap::new()));
++
++pub(crate) struct Waiter {
++    pub id: String,
++    pub context: String,
++    pub receiver: oneshot::Receiver<ApprovalResponse>,
++    pub on_cancel: Option<Box<dyn FnOnce() + Send>>,
++}
++
++impl Waiter {
++    pub fn new(room: &str, sender: &str, admin: Option<String>) -> Self {
++        let id = uuid::Uuid::new_v4().to_string();
++        let context = uuid::Uuid::new_v4().to_string();
++        let (answer, receiver) = oneshot::channel();
++        PENDING.lock().unwrap().insert(
++            id.clone(),
++            Pending {
++                room: room.into(),
++                sender: sender.into(),
++                admin,
++                context: context.clone(),
++                answer,
++            },
++        );
++        Self {
++            id,
++            context,
++            receiver,
++            on_cancel: None,
++        }
++    }
++}
++
++impl Drop for Waiter {
++    fn drop(&mut self) {
++        PENDING.lock().unwrap().remove(&self.id);
++        if let Some(cancel) = self.on_cancel.take() {
++            cancel();
++        }
++    }
++}
++
++/// Consume transport commands before the model sees them; only the original
++/// requester in the original room can resolve this exact waiter once.
++pub(crate) fn answer(room: &str, sender: &str, body: &str) -> bool {
++    let fields: Vec<_> = body
++        .split_whitespace()
++        .skip_while(|word| word.starts_with('@'))
++        .collect();
++    if fields.first() != Some(&"/agentteams-approval") {
++        return false;
++    }
++    if fields.len() != 4 || !matches!(fields[1], "approve" | "deny") {
++        return true;
++    }
++    let mut pending = PENDING.lock().unwrap();
++    let Some(entry) = pending.get(fields[2]) else {
++        return true;
++    };
++    if entry.room != room
++        || (entry.sender != sender && entry.admin.as_deref() != Some(sender))
++        || entry.context != fields[3]
++    {
++        return true;
++    }
++    let entry = pending.remove(fields[2]).unwrap();
++    let _ = entry.answer.send(if fields[1] == "approve" {
++        ApprovalResponse::Yes
++    } else {
++        ApprovalResponse::No
++    });
++    true
++}
++
++pub(crate) fn payload(
++    waiter: &Waiter,
++    request: &ApprovalRequest,
++    status: &str,
++) -> serde_json::Value {
++    serde_json::json!({
++        "version": 1, "runtime": "openhuman", "request_id": waiter.id,
++        "context_id": waiter.context, "status": status,
++        "tool_name": request.tool_name, "parameters": request.arguments.to_string(),
++        "expires_at": chrono::Utc::now().timestamp_millis() + 300_000,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn agentteams_native_approval_surface_resolves_the_upgraded_gate() {
++        use crate::openhuman::agent::turn_origin::{self, AgentTurnOrigin};
++        use crate::openhuman::channels::traits::{ChannelMessage, SendMessage};
++        struct SurfaceChannel;
++        #[async_trait::async_trait]
++        impl Channel for SurfaceChannel {
++            fn name(&self) -> &str {
++                "matrix"
++            }
++            async fn send(&self, _: &SendMessage) -> anyhow::Result<()> {
++                Ok(())
++            }
++            async fn listen(
++                &self,
++                _: tokio::sync::mpsc::Sender<ChannelMessage>,
++            ) -> anyhow::Result<()> {
++                Ok(())
++            }
++            async fn request_approval(
++                &self,
++                room: &str,
++                sender: &str,
++                request: &ApprovalRequest,
++            ) -> ApprovalResponse {
++                assert_eq!((room, sender), ("!native-approval", "@owner"));
++                if request.tool_name == "agentteams-test-allow" {
++                    ApprovalResponse::Yes
++                } else {
++                    ApprovalResponse::No
++                }
++            }
++        }
++        crate::core::event_bus::init_global(32);
++        let directory = tempfile::tempdir().unwrap();
++        let mut config = crate::openhuman::config::Config::default();
++        config.workspace_dir = directory.path().into();
++        config.autonomy.auto_approve.clear();
++        let gate = ApprovalGate::init_global(config, format!("session-{}", uuid::Uuid::new_v4()));
++        for (name, allowed) in [
++            ("agentteams-test-allow", true),
++            ("agentteams-test-deny", false),
++        ] {
++            let context = Arc::new(Context {
++                channel: Arc::new(SurfaceChannel),
++                room: "!native-approval".into(),
++                sender: "@owner".into(),
++            });
++            let origin = AgentTurnOrigin::ExternalChannel {
++                channel: "matrix".into(),
++                sender: Some("@owner".into()),
++                reply_target: "!native-approval".into(),
++                message_id: "$request".into(),
++            };
++            let outcome = tokio::time::timeout(
++                std::time::Duration::from_secs(5),
++                turn_origin::with_origin(
++                    origin,
++                    scope(
++                        context,
++                        "matrix-native-approval".into(),
++                        gate.intercept(name, "native test approval", serde_json::json!({})),
++                    ),
++                ),
++            )
++            .await
++            .unwrap();
++            assert_eq!(matches!(outcome, super::super::GateOutcome::Allow), allowed);
++        }
++    }
++
++    #[tokio::test]
++    async fn dropping_a_waiter_withdraws_its_control_and_reports_cancellation() {
++        use std::sync::atomic::{AtomicBool, Ordering};
++        let cancelled = Arc::new(AtomicBool::new(false));
++        let signal = cancelled.clone();
++        let mut waiter = Waiter::new("!cancel", "@owner", None);
++        waiter.on_cancel = Some(Box::new(move || {
++            signal.store(true, Ordering::SeqCst);
++        }));
++        let command = format!(
++            "/agentteams-approval approve {} {}",
++            waiter.id, waiter.context
++        );
++        drop(waiter);
++        assert!(cancelled.load(Ordering::SeqCst));
++        assert!(answer("!cancel", "@owner", &command));
++        assert!(!PENDING
++            .lock()
++            .unwrap()
++            .values()
++            .any(|entry| entry.room == "!cancel"));
++    }
++
++    #[tokio::test]
++    async fn decisions_are_bound_to_room_sender_and_context() {
++        for (action, expected) in [
++            ("approve", ApprovalResponse::Yes),
++            ("deny", ApprovalResponse::No),
++        ] {
++            let mut waiter = Waiter::new("!room", "@owner", Some("@admin".into()));
++            let body = format!(
++                "/agentteams-approval {action} {} {}",
++                waiter.id, waiter.context
++            );
++            assert!(answer("!other", "@owner", &body));
++            assert!(answer("!room", "@other", &body));
++            assert!(answer(
++                "!room",
++                "@owner",
++                &body.replace(&waiter.context, "stale")
++            ));
++            assert!(matches!(
++                waiter.receiver.try_recv(),
++                Err(oneshot::error::TryRecvError::Empty)
++            ));
++            assert!(answer(
++                "!room",
++                if action == "approve" {
++                    "@admin"
++                } else {
++                    "@owner"
++                },
++                &body
++            ));
++            assert_eq!((&mut waiter.receiver).await.unwrap(), expected);
++            assert!(answer("!room", "@owner", &body));
++        }
++    }
++}
+diff --git a/src/openhuman/approval/mod.rs b/src/openhuman/approval/mod.rs
+index 0eac1c4..d36adfa 100644
+--- a/src/openhuman/approval/mod.rs
++++ b/src/openhuman/approval/mod.rs
+@@ -14,11 +14,13 @@
+ //! became the sole control.
+ 
+ pub mod gate;
++pub mod matrix;
+ pub mod redact;
+ pub mod rpc;
+ pub mod schemas;
+ pub mod store;
+ pub mod types;
++pub use matrix::{ApprovalRequest, ApprovalResponse};
+ 
+ pub use gate::{parse_approval_reply, ApprovalChatContext, ApprovalGate, APPROVAL_CHAT_CONTEXT};
+ pub use redact::{redact_args, summarize_action};
+diff --git a/src/openhuman/channels/matrix_direct.rs b/src/openhuman/channels/matrix_direct.rs
+new file mode 100644
+index 0000000..bd28722
+--- /dev/null
++++ b/src/openhuman/channels/matrix_direct.rs
+@@ -0,0 +1,197 @@
++//! Run-scoped controls for verified human/agent Matrix direct conversations.
++#[cfg(test)]
++#[path = "matrix_direct_tests.rs"]
++mod tests;
++use super::traits::ChannelMessage;
++use crate::openhuman::agent::harness::run_queue::{QueueMode, QueuedMessage, RunQueue};
++use crate::openhuman::inference::provider::ChatMessage;
++use matrix_sdk::Room;
++use once_cell::sync::Lazy;
++use serde_json::json;
++use std::collections::{HashMap, HashSet};
++use std::sync::{Arc, Mutex};
++use tokio_util::sync::CancellationToken;
++
++pub(crate) struct DirectRun {
++    pub id: String,
++    pub sender: String,
++    pub inputs: Vec<String>,
++    pub source_event_ids: Vec<String>,
++    pub room: Room,
++    pub cancel: CancellationToken,
++    pub done: CancellationToken,
++    pub queue: Arc<RunQueue>,
++    pub delivered: Mutex<Vec<String>>,
++    seen: Mutex<HashSet<String>>,
++    admission: tokio::sync::Mutex<bool>,
++    transport: Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>,
++}
++
++static RUNS: Lazy<Mutex<HashMap<String, Arc<DirectRun>>>> =
++    Lazy::new(|| Mutex::new(HashMap::new()));
++static ACTIVE: Lazy<Mutex<HashMap<String, Arc<DirectRun>>>> =
++    Lazy::new(|| Mutex::new(HashMap::new()));
++
++pub(crate) fn register(
++    room: Room,
++    id: String,
++    sender: String,
++    inputs: Vec<String>,
++    source_event_ids: Vec<String>,
++) {
++    let run = Arc::new(DirectRun {
++        id: id.clone(),
++        sender,
++        inputs,
++        source_event_ids,
++        room,
++        cancel: CancellationToken::new(),
++        done: CancellationToken::new(),
++        queue: RunQueue::new(),
++        delivered: Mutex::new(Vec::new()),
++        seen: Mutex::new(HashSet::new()),
++        admission: tokio::sync::Mutex::new(true),
++        transport: Mutex::new(None),
++    });
++    RUNS.lock().unwrap().insert(id, run);
++}
++
++pub(crate) fn get(id: &str) -> Option<Arc<DirectRun>> {
++    RUNS.lock().unwrap().get(id).cloned()
++}
++
++pub(crate) fn active(room: &str) -> Option<Arc<DirectRun>> {
++    ACTIVE.lock().unwrap().get(room).cloned()
++}
++
++pub(crate) fn current() -> Option<Arc<DirectRun>> {
++    crate::openhuman::approval::matrix::CONTEXT
++        .try_with(|context| {
++            active(&context.room)
++                .filter(|run| run.sender == context.sender && !run.done.is_cancelled())
++        })
++        .ok()
++        .flatten()
++}
++
++pub(crate) async fn delivered(
++    event: &str,
++    text: &str,
++    history: &[ChatMessage],
++) -> anyhow::Result<()> {
++    if let Some(run) = current() {
++        crate::openhuman::channels::task_recovery::checkpoint(history).await?;
++        crate::openhuman::channels::task_recovery::commit_steer(event, history).await?;
++        run.delivered.lock().unwrap().push(text.to_owned());
++    }
++    Ok(())
++}
++
++impl DirectRun {
++    pub(crate) fn set_transport(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) {
++        *self.transport.lock().unwrap() = Some(tx);
++    }
++
++    pub(crate) async fn steer(&self, event: &str, text: &str) -> bool {
++        let open = self.admission.lock().await;
++        if !*open || self.cancel.is_cancelled() {
++            return false;
++        }
++        if !self.seen.lock().unwrap().insert(event.to_owned()) {
++            return true;
++        }
++        self.queue
++            .push(QueuedMessage {
++                text: text.to_owned(),
++                mode: QueueMode::Steer,
++                client_id: event.to_owned(),
++                thread_id: self.room.room_id().to_string(),
++                queued_at_ms: chrono::Utc::now().timestamp_millis() as u64,
++                model_override: None,
++                temperature: None,
++                profile_id: None,
++                locale: None,
++            })
++            .await;
++        true
++    }
++    pub async fn status(&self, status: &str) {
++        let body = match status {
++            "running" => "正在执行",
++            "stopping" => "正在停止",
++            "stopped" => "已停止",
++            "completed" => "本轮已结束",
++            _ => "执行失败",
++        };
++        let content = json!({"msgtype": "m.notice", "body": body,
++            "com.agentteams.execution": {"run_id": self.id, "status": status,
++                "capabilities": ["stop", "steer"], "steering_mode": "native"}});
++        if let Err(error) = self.room.send_raw("m.room.message", content).await {
++            tracing::warn!("Matrix execution status delivery failed: {error}");
++        }
++    }
++
++    pub async fn start(self: &Arc<Self>) {
++        // Preserve the native room history order for ordinary follow-up input.
++        loop {
++            let previous = {
++                let mut active = ACTIVE.lock().unwrap();
++                if let Some(previous) = active.get(self.room.room_id().as_str()) {
++                    Some(previous.clone())
++                } else {
++                    active.insert(self.room.room_id().to_string(), self.clone());
++                    None
++                }
++            };
++            let Some(previous) = previous else { break };
++            previous.done.cancelled().await;
++        }
++        self.status("running").await;
++    }
++
++    pub async fn finish(&self) {
++        let mut open = self.admission.lock().await;
++        *open = false;
++        let remaining = self.queue.drain_steers().await;
++        drop(open);
++        // Managed inputs stay pending in the durable Matrix feed until their
++        // native source is committed. Ordinary installs own their local handoff.
++        if !super::task_recovery::enabled() && !self.cancel.is_cancelled() {
++            let transport = self.transport.lock().unwrap().clone();
++            if let Some(tx) = transport {
++                for message in remaining {
++                    register(
++                        self.room.clone(),
++                        message.client_id.clone(),
++                        self.sender.clone(),
++                        vec![message.text.clone()],
++                        vec![message.client_id.clone()],
++                    );
++                    if let Some(next) = get(&message.client_id) {
++                        next.set_transport(tx.clone());
++                    }
++                    let _ = tx
++                        .send(ChannelMessage {
++                            id: message.client_id,
++                            sender: self.sender.clone(),
++                            reply_target: self.room.room_id().to_string(),
++                            content: message.text,
++                            channel: "matrix".into(),
++                            timestamp: message.queued_at_ms / 1000,
++                            thread_ts: None,
++                        })
++                        .await;
++                }
++            }
++        }
++        self.status(if self.cancel.is_cancelled() {
++            "stopped"
++        } else {
++            "completed"
++        })
++        .await;
++        RUNS.lock().unwrap().remove(&self.id);
++        ACTIVE.lock().unwrap().remove(self.room.room_id().as_str());
++        self.done.cancel();
++    }
++}
+diff --git a/src/openhuman/channels/matrix_direct_tests.rs b/src/openhuman/channels/matrix_direct_tests.rs
+new file mode 100644
+index 0000000..cbe3ce1
+--- /dev/null
++++ b/src/openhuman/channels/matrix_direct_tests.rs
+@@ -0,0 +1,127 @@
++use serde_json::json;
++
++#[tokio::test]
++async fn matrix_run_acknowledges_only_after_cleanup_and_retains_supplements() {
++    use matrix_sdk::{
++        authentication::matrix::MatrixSession, config::SyncSettings, Client, SessionMeta,
++        SessionTokens,
++    };
++    use wiremock::{
++        matchers::{method, path, path_regex},
++        Mock, MockServer, ResponseTemplate,
++    };
++    let server = MockServer::start().await;
++    Mock::given(method("GET"))
++        .and(path("/_matrix/client/versions"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"versions": ["v1.13"]})))
++        .mount(&server)
++        .await;
++    Mock::given(method("GET")).and(path("/_matrix/client/v3/sync"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++            "next_batch": "cursor", "rooms": {"join": {"!dm:test": {
++                "timeline": {"events": [], "limited": false},
++                "state": {"events": [
++                    {"type": "m.room.create", "state_key": "", "sender": "@agent:test", "event_id": "$create", "origin_server_ts": 1, "content": {"creator": "@agent:test", "room_version": "10"}},
++                    {"type": "m.room.member", "state_key": "@agent:test", "sender": "@agent:test", "event_id": "$member", "origin_server_ts": 2, "content": {"membership": "join"}}
++                ]}
++            }}}
++        }))).mount(&server).await;
++    Mock::given(method("PUT"))
++        .and(path_regex(
++            "/_matrix/client/v3/rooms/.*/send/m.room.message/.*",
++        ))
++        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": "$status"})))
++        .mount(&server)
++        .await;
++    Mock::given(method("GET"))
++        .and(path_regex(
++            "/_matrix/client/v3/rooms/.*/state/m.room.encryption/",
++        ))
++        .respond_with(
++            ResponseTemplate::new(404)
++                .set_body_json(json!({"errcode": "M_NOT_FOUND", "error": "Not encrypted"})),
++        )
++        .mount(&server)
++        .await;
++    let client = Client::builder()
++        .homeserver_url(server.uri())
++        .build()
++        .await
++        .unwrap();
++    client
++        .restore_session(MatrixSession {
++            meta: SessionMeta {
++                user_id: "@agent:test".try_into().unwrap(),
++                device_id: "TEST".into(),
++            },
++            tokens: SessionTokens {
++                access_token: "local-test-only".into(),
++                refresh_token: None,
++            },
++        })
++        .await
++        .unwrap();
++    client.sync_once(SyncSettings::default()).await.unwrap();
++    let room_id: matrix_sdk::ruma::OwnedRoomId = "!dm:test".try_into().unwrap();
++    let room = client.get_room(&room_id).unwrap();
++    super::register(
++        room.clone(),
++        "$original".into(),
++        "@human:test".into(),
++        vec!["原任务".into()],
++        vec!["$original".into()],
++    );
++    let original = super::get("$original").unwrap();
++    original.start().await;
++    assert_eq!(super::active("!dm:test").unwrap().sender, "@human:test");
++    assert!(original.steer("$one", "first supplement").await);
++    assert!(original.steer("$two", "second supplement").await);
++    assert!(original.steer("$one", "first supplement").await);
++    assert!(!original.cancel.is_cancelled());
++    let steers = original.queue.drain_steers().await;
++    assert_eq!(
++        steers
++            .iter()
++            .map(|message| message.text.as_str())
++            .collect::<Vec<_>>(),
++        ["first supplement", "second supplement"]
++    );
++    original.cancel.cancel();
++    assert!(
++        !original.done.is_cancelled(),
++        "request must not acknowledge cleanup"
++    );
++    original.finish().await;
++    assert!(!original.steer("$late", "late supplement").await);
++    assert!(original.done.is_cancelled());
++    assert!(super::active("!dm:test").is_none());
++    let mut inputs = original.inputs.clone();
++    inputs.push("补充杭州".into());
++    let mut source_event_ids = original.source_event_ids.clone();
++    source_event_ids.push("$supplement".into());
++    super::register(
++        room,
++        "$supplement".into(),
++        "@human:test".into(),
++        inputs,
++        source_event_ids,
++    );
++    let replacement = super::get("$supplement").unwrap();
++    replacement.start().await;
++    assert_eq!(replacement.inputs, ["原任务", "补充杭州"]);
++    assert_eq!(replacement.source_event_ids, ["$original", "$supplement"]);
++    replacement.finish().await;
++    let statuses: Vec<_> = server
++        .received_requests()
++        .await
++        .unwrap()
++        .into_iter()
++        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
++        .filter_map(|body| {
++            body.pointer("/com.agentteams.execution/status")
++                .and_then(|v| v.as_str())
++                .map(str::to_owned)
++        })
++        .collect();
++    assert_eq!(statuses, ["running", "stopped", "running", "completed"]);
++}
+diff --git a/src/openhuman/channels/mod.rs b/src/openhuman/channels/mod.rs
+index 6a2c2f1..d03833c 100644
+--- a/src/openhuman/channels/mod.rs
++++ b/src/openhuman/channels/mod.rs
+@@ -3,6 +3,8 @@
+ pub mod bus;
+ pub mod cli;
+ pub mod controllers;
++#[cfg(feature = "channel-matrix")]
++pub(crate) mod matrix_direct;
+ pub mod proactive;
+ pub mod providers;
+ pub mod traits;
+@@ -11,6 +13,7 @@ mod commands;
+ pub(crate) mod context;
+ mod routes;
+ mod runtime;
++mod session_receipts;
+ 
+ #[cfg(test)]
+ mod tests;
+@@ -68,3 +71,8 @@ pub use controllers::{ChannelAuthMode, ChannelDefinition};
+ // old `channels::build_system_prompt` path.
+ pub use crate::openhuman::context::channels_prompt::build_system_prompt;
+ pub use runtime::start_channels;
++
++#[cfg(feature = "channel-matrix")]
++mod task_coordination;
++#[cfg(feature = "channel-matrix")]
++pub(crate) mod task_recovery;
+diff --git a/src/openhuman/channels/providers/matrix.rs b/src/openhuman/channels/providers/matrix.rs
+index 1e343d5..1948fa7 100644
+--- a/src/openhuman/channels/providers/matrix.rs
++++ b/src/openhuman/channels/providers/matrix.rs
+@@ -1,9 +1,12 @@
+ use crate::openhuman::channels::traits::{Channel, ChannelMessage, SendMessage};
+ use async_trait::async_trait;
++mod worker_sync;
+ use matrix_sdk::{
+     authentication::matrix::MatrixSession,
+     config::SyncSettings,
++    event_handler::RawEvent,
+     ruma::{
++        events::room::member::{MembershipState, StrippedRoomMemberEvent},
+         events::room::message::{
+             MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+         },
+@@ -88,6 +91,70 @@ struct RoomAliasResponse {
+ }
+ 
+ impl MatrixChannel {
++    async fn direct_members(&self, room: &str, own: &str, sender: &str) -> bool {
++        let url = format!(
++            "{}/_matrix/client/v3/rooms/{}/joined_members",
++            self.homeserver.trim_end_matches('/'),
++            urlencoding::encode(room)
++        );
++        let Ok(response) = self
++            .http_client
++            .get(url)
++            .bearer_auth(&self.access_token)
++            .send()
++            .await
++        else {
++            return false;
++        };
++        let Ok(response) = response.error_for_status() else {
++            return false;
++        };
++        let Ok(payload) = response.json::<serde_json::Value>().await else {
++            return false;
++        };
++        payload
++            .get("joined")
++            .and_then(|v| v.as_object())
++            .is_some_and(|members| {
++                members.len() == 2 && members.contains_key(own) && members.contains_key(sender)
++            })
++    }
++
++    fn agentteams_manager() -> bool {
++        std::env::var("AGENTTEAMS_AGENT_ROLE").as_deref() == Ok("manager")
++    }
++
++    fn agentteams_sender_allowed(allowed_users: &[String], sender: &str, direct: bool) -> bool {
++        if !Self::agentteams_manager() {
++            return Self::is_sender_allowed(allowed_users, sender);
++        }
++        let Ok(home) = std::env::var("AGENTTEAMS_WORKER_HOME") else {
++            return false;
++        };
++        let Ok(data) =
++            std::fs::read_to_string(std::path::Path::new(&home).join("agent-config/openclaw.json"))
++        else {
++            return false;
++        };
++        let Ok(config) = serde_json::from_str::<serde_json::Value>(&data) else {
++            return false;
++        };
++        let paths = if direct {
++            vec!["/channels/matrix/dm/allowFrom"]
++        } else {
++            vec![
++                "/channels/matrix/groupAllowFrom",
++                "/channels/matrix/dm/allowFrom",
++            ]
++        };
++        paths.iter().any(|path| {
++            config
++                .pointer(path)
++                .and_then(|v| v.as_array())
++                .is_some_and(|users| users.iter().any(|user| user.as_str() == Some(sender)))
++        })
++    }
++
+     fn normalize_optional_field(value: Option<String>) -> Option<String> {
+         value
+             .map(|entry| entry.trim().to_string())
+@@ -480,9 +547,107 @@ impl Channel for MatrixChannel {
+         "matrix"
+     }
+ 
++    async fn request_approval(
++        &self,
++        recipient: &str,
++        sender: &str,
++        request: &crate::openhuman::approval::ApprovalRequest,
++    ) -> crate::openhuman::approval::ApprovalResponse {
++        use crate::openhuman::approval::{
++            matrix::{payload, Waiter},
++            ApprovalResponse,
++        };
++        let room = if recipient.starts_with('!') {
++            recipient.to_string()
++        } else {
++            match self.target_room_id().await {
++                Ok(room) => room,
++                Err(_) => return ApprovalResponse::No,
++            }
++        };
++        let admin = std::env::var("AGENTTEAMS_ADMIN_USER")
++            .ok()
++            .and_then(|name| {
++                if name.starts_with('@') {
++                    Some(name)
++                } else {
++                    std::env::var("AGENTTEAMS_MATRIX_DOMAIN")
++                        .ok()
++                        .map(|domain| format!("@{name}:{domain}"))
++                }
++            });
++        let mut waiter = Waiter::new(&room, sender, admin);
++        tracing::debug!(request_id = %waiter.id, "[matrix.approval] waiting for a human decision");
++        let base = payload(&waiter, request, "pending");
++        let cancelled = {
++            let client = self.http_client.clone();
++            let token = self.access_token.clone();
++            let url = format!(
++                "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
++                self.homeserver.trim_end_matches('/'),
++                urlencoding::encode(&room),
++                uuid::Uuid::new_v4()
++            );
++            let mut approval = base.clone();
++            approval["status"] = "cancelled".into();
++            let content = serde_json::json!({"msgtype": "m.text", "body": "Approval cancelled", "org.agentteams.approval": approval});
++            move || {
++                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
++                    runtime.spawn(async move {
++                        let _ = client
++                            .put(url)
++                            .bearer_auth(token)
++                            .json(&content)
++                            .send()
++                            .await;
++                    });
++                }
++            }
++        };
++        waiter.on_cancel = Some(Box::new(cancelled));
++        let send = |status: &str| {
++            let mut approval = base.clone();
++            approval["status"] = status.into();
++            let content = serde_json::json!({
++                "msgtype": "m.text", "body": format!("Tool approval: {} ({status})", request.tool_name),
++                "org.agentteams.approval": approval,
++            });
++            self.http_client
++                .put(format!(
++                    "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
++                    self.homeserver.trim_end_matches('/'),
++                    urlencoding::encode(&room),
++                    uuid::Uuid::new_v4()
++                ))
++                .bearer_auth(&self.access_token)
++                .json(&content)
++                .send()
++        };
++        if !matches!(send("pending").await, Ok(response) if response.status().is_success()) {
++            return ApprovalResponse::No;
++        }
++        let (decision, status) =
++            match tokio::time::timeout(std::time::Duration::from_secs(300), &mut waiter.receiver)
++                .await
++            {
++                Ok(Ok(ApprovalResponse::Yes)) => (ApprovalResponse::Yes, "approved"),
++                Ok(Ok(_)) => (ApprovalResponse::No, "rejected"),
++                Ok(Err(_)) => (ApprovalResponse::No, "cancelled"),
++                Err(_) => (ApprovalResponse::No, "expired"),
++            };
++        waiter.on_cancel = None;
++        let _ = send(status).await;
++        tracing::debug!(request_id = %waiter.id, status, "[matrix.approval] wait settled");
++        decision
++    }
++
+     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+         let client = self.matrix_client().await?;
+-        let target_room_id = self.target_room_id().await?;
++        let target_room_id = if Self::agentteams_manager() && message.recipient.starts_with('!') {
++            message.recipient.clone()
++        } else {
++            self.target_room_id().await?
++        };
+         let target_room: OwnedRoomId = target_room_id.parse()?;
+ 
+         let mut room = client.get_room(&target_room);
+@@ -499,15 +664,41 @@ impl Channel for MatrixChannel {
+             anyhow::bail!("Matrix room '{}' is not in joined state", target_room_id);
+         }
+ 
+-        room.send(RoomMessageEventContent::text_markdown(&message.content))
+-            .await?;
++        let mut content =
++            serde_json::to_value(RoomMessageEventContent::text_markdown(&message.content))?;
++        if crate::openhuman::channels::task_coordination::is_control_room(&target_room_id) {
++            content["org.agentteams.progress_only"] = serde_json::json!(true);
++            content["m.mentions"] = serde_json::json!({"user_ids": []});
++        }
++        let url = format!(
++            "{}/_matrix/client/v3/rooms/{}/joined_members",
++            self.homeserver,
++            Self::encode_path_segment(&target_room_id)
++        );
++        if let Ok(response) = self
++            .http_client
++            .get(url)
++            .bearer_auth(&self.access_token)
++            .send()
++            .await
++        {
++            if let Ok(value) = response.json::<serde_json::Value>().await {
++                if let Some(joined) = value.get("joined").and_then(|value| value.as_object()) {
++                    let members: Vec<_> = joined.iter().map(|(user, member)| serde_json::json!({
++                        "user_id": user, "display_name": member.get("display_name").and_then(|value| value.as_str()).unwrap_or(user), "kind": "member",
++                    })).collect();
++                    content["com.agentteams.read_audience"] =
++                        serde_json::json!({"version": 1, "members": members});
++                }
++            }
++        }
++        room.send_raw("m.room.message", content).await?;
+ 
+         Ok(())
+     }
+ 
+     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+         let target_room_id = self.target_room_id().await?;
+-        self.ensure_room_supported(&target_room_id).await?;
+ 
+         let target_room: OwnedRoomId = target_room_id.parse()?;
+         let my_user_id: OwnedUserId = match self.get_my_user_id().await {
+@@ -525,9 +716,49 @@ impl Channel for MatrixChannel {
+         };
+         let client = self.matrix_client().await?;
+ 
++        if Self::agentteams_manager() {
++            let own_user_id = my_user_id.clone();
++            client.add_event_handler(move |event: StrippedRoomMemberEvent, room: Room| {
++                let own_user_id = own_user_id.clone();
++                async move {
++                    if event.state_key == own_user_id
++                        && event.content.membership == MembershipState::Invite
++                        && MatrixChannel::agentteams_sender_allowed(
++                            &[],
++                            event.sender.as_str(),
++                            false,
++                        )
++                    {
++                        if let Err(error) = room.join().await {
++                            tracing::warn!("Manager Matrix room join failed: {error}");
++                        }
++                    }
++                }
++            });
++            client.join_room_by_id(&target_room).await?;
++        }
++        self.ensure_room_supported(&target_room_id).await?;
++
+         self.log_e2ee_diagnostics(&client).await;
+ 
+-        let _ = client.sync_once(SyncSettings::new()).await;
++        let first_sync = client.sync_once(SyncSettings::new()).await;
++        if Self::agentteams_manager() {
++            first_sync?;
++            if std::env::var_os("AGENTTEAMS_CONTROLLER_URL").is_some() {
++                if let Ok(name) = std::env::var("AGENTTEAMS_WORKER_CR_NAME") {
++                    match tokio::process::Command::new("agt")
++                        .args(["worker", "report-ready", "--name", &name])
++                        .status()
++                        .await
++                    {
++                        Ok(status) if status.success() => {}
++                        other => {
++                            tracing::warn!("Manager Matrix readiness report failed: {other:?}")
++                        }
++                    }
++                }
++            }
++        }
+ 
+         tracing::info!(
+             "Matrix channel listening on room {} (configured as {})...",
+@@ -540,39 +771,131 @@ impl Channel for MatrixChannel {
+             std::collections::HashSet::new(),
+         )));
+ 
++        let _task_recovery = crate::openhuman::channels::task_recovery::start(
++            client.clone(),
++            my_user_id.to_string(),
++            tx.clone(),
++        );
++
+         let tx_handler = tx.clone();
+         let target_room_for_handler = target_room.clone();
+         let my_user_id_for_handler = my_user_id.clone();
+         let allowed_users_for_handler = self.allowed_users.clone();
+         let dedupe_for_handler = Arc::clone(&recent_event_cache);
+-
+-        client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
++        let channel_for_handler = self.clone();
++
++        let managed = crate::openhuman::channels::task_recovery::enabled();
++        let worker_client = client.clone();
++        let handle = move |event: OriginalSyncRoomMessageEvent,
++                           room: Room,
++                           raw: serde_json::Value| {
++            let client = worker_client.clone();
+             let tx = tx_handler.clone();
+             let target_room = target_room_for_handler.clone();
+             let my_user_id = my_user_id_for_handler.clone();
+             let allowed_users = allowed_users_for_handler.clone();
+             let dedupe = Arc::clone(&dedupe_for_handler);
++            let channel = channel_for_handler.clone();
+ 
+             async move {
+-                if room.room_id().as_str() != target_room.as_str() {
++                let manager = MatrixChannel::agentteams_manager();
++                if raw
++                    .pointer("/content/org.agentteams.progress_only")
++                    .and_then(|v| v.as_bool())
++                    == Some(true)
++                {
++                    return;
++                }
++                let control = raw
++                    .pointer("/content/org.agentteams.coordination")
++                    .is_some();
++                let coordination_body = if control {
++                    crate::openhuman::channels::task_coordination::prepare(
++                        &raw["content"],
++                        room.room_id().as_str(),
++                        event.sender.as_str(),
++                        my_user_id.as_str(),
++                    )
++                    .await
++                } else {
++                    None
++                };
++                if control && coordination_body.is_none() {
++                    return;
++                }
++                if crate::openhuman::channels::task_recovery::enabled() {
++                    if let Some(task_id) = coordination_body
++                        .as_ref()
++                        .and_then(|packet| packet.task_id.as_deref())
++                    {
++                        crate::openhuman::channels::task_recovery::source(
++                            room.room_id().as_str(),
++                            task_id,
++                            event.event_id.as_str(),
++                        );
++                        return;
++                    }
++                    crate::openhuman::channels::task_recovery::wait_ready().await;
++                }
++                if !managed
++                    && !manager
++                    && coordination_body.is_none()
++                    && room.room_id().as_str() != target_room.as_str()
++                {
+                     return;
+                 }
+ 
+-                if event.sender == my_user_id {
++                if event.sender == my_user_id && coordination_body.is_none() {
+                     return;
+                 }
+ 
+                 let sender = event.sender.to_string();
+-                if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
++                if coordination_body.is_none()
++                    && !MatrixChannel::agentteams_sender_allowed(
++                        &allowed_users,
++                        &sender,
++                        room.room_id().as_str() == target_room.as_str(),
++                    )
++                {
+                     return;
+                 }
+ 
+-                let body = match &event.content.msgtype {
+-                    MessageType::Text(content) => content.body.clone(),
+-                    MessageType::Notice(content) => content.body.clone(),
+-                    _ => return,
++                if manager
++                    && room.room_id().as_str() != target_room.as_str()
++                    && !event
++                        .content
++                        .mentions
++                        .as_ref()
++                        .is_some_and(|mentions| mentions.user_ids.contains(&my_user_id))
++                {
++                    return;
++                }
++
++                // Use the real Matrix notification event as a native conversation thread.
++                let coordination_session = coordination_body
++                    .as_ref()
++                    .map(|_| event.event_id.to_string());
++                let body = match coordination_body {
++                    Some(packet) => packet.text,
++                    None => match &event.content.msgtype {
++                        MessageType::Text(content) => content.body.clone(),
++                        MessageType::Notice(content) => content.body.clone(),
++                        _ => return,
++                    },
+                 };
+ 
++                let key = worker_sync::event_key(room.room_id().as_str(), event.event_id.as_str());
++                if crate::openhuman::approval::matrix::answer(
++                    room.room_id().as_str(),
++                    &sender,
++                    &body,
++                ) {
++                    if managed {
++                        worker_sync::retire_control(&key).await;
++                    }
++                    return;
++                }
++
+                 if !MatrixChannel::has_non_empty_body(&body) {
+                     return;
+                 }
+@@ -581,27 +904,113 @@ impl Channel for MatrixChannel {
+                 {
+                     let mut guard = dedupe.lock().await;
+                     let (recent_order, recent_lookup) = &mut *guard;
+-                    if MatrixChannel::cache_event_id(&event_id, recent_order, recent_lookup) {
++                    if !managed
++                        && MatrixChannel::cache_event_id(&event_id, recent_order, recent_lookup)
++                    {
+                         return;
+                     }
+                 }
+ 
++                let inputs = vec![body.clone()];
++                let source_event_ids = vec![event_id.clone()];
++                let direct = channel
++                    .direct_members(room.room_id().as_str(), my_user_id.as_str(), &sender)
++                    .await;
++                if let Some(control) = raw.pointer("/content/com.agentteams.control") {
++                    let action = control.get("action").and_then(|v| v.as_str()).unwrap_or("");
++                    if !matches!(action, "stop" | "steer")
++                        || control.get("agent_id").and_then(|v| v.as_str())
++                            != Some(my_user_id.as_str())
++                    {
++                        return;
++                    }
++                    if let Some(run) =
++                        crate::openhuman::channels::matrix_direct::active(room.room_id().as_str())
++                    {
++                        if control.get("run_id").and_then(|v| v.as_str()) == Some(run.id.as_str()) {
++                            if !direct || run.sender != sender {
++                                return;
++                            }
++                            if action == "steer" {
++                                if run.steer(&event_id, &body).await {
++                                    return;
++                                }
++                                // Completion won admission; preserve this as ordinary input.
++                            } else {
++                                run.status("stopping").await;
++                                run.cancel.cancel();
++                                run.done.cancelled().await;
++                            }
++                        }
++                    }
++                    if action == "stop" {
++                        if managed {
++                            worker_sync::retire_control(&key).await;
++                        }
++                        return;
++                    }
++                }
++                if managed {
++                    if let Err(error) = worker_sync::admit(
++                        &client,
++                        &tx,
++                        &key,
++                        &room,
++                        &sender,
++                        &body,
++                        direct,
++                        inputs,
++                        source_event_ids,
++                    )
++                    .await
++                    {
++                        tracing::warn!("Matrix recovery deferred: {error}");
++                    }
++                    return;
++                }
++                if direct {
++                    crate::openhuman::channels::matrix_direct::register(
++                        room.clone(),
++                        event_id.clone(),
++                        sender.clone(),
++                        inputs,
++                        source_event_ids,
++                    );
++                    if let Some(run) = crate::openhuman::channels::matrix_direct::get(&event_id) {
++                        run.set_transport(tx.clone());
++                    }
++                }
++
+                 let msg = ChannelMessage {
+                     id: event_id,
+                     sender: sender.clone(),
+-                    reply_target: sender,
++                    reply_target: room.room_id().to_string(),
+                     content: body,
+                     channel: "matrix".to_string(),
+                     timestamp: std::time::SystemTime::now()
+                         .duration_since(std::time::UNIX_EPOCH)
+                         .unwrap_or_default()
+                         .as_secs(),
+-                    thread_ts: None,
++                    thread_ts: coordination_session,
+                 };
+ 
+                 let _ = tx.send(msg).await;
+             }
+-        });
++        };
++        if managed {
++            return worker_sync::listen(self, &client, &target_room, &my_user_id, &tx, handle)
++                .await;
++        }
++        client.add_event_handler(
++            move |event: OriginalSyncRoomMessageEvent, room: Room, raw: RawEvent| {
++                let handle = handle.clone();
++                async move {
++                    if let Ok(raw) = serde_json::from_str(raw.0.get()) {
++                        handle(event, room, raw).await;
++                    }
++                }
++            },
++        );
+ 
+         let sync_settings = SyncSettings::new().timeout(std::time::Duration::from_secs(30));
+         client
+diff --git a/src/openhuman/channels/providers/matrix_tests.rs b/src/openhuman/channels/providers/matrix_tests.rs
+index aec8edd..0a98ca7 100644
+--- a/src/openhuman/channels/providers/matrix_tests.rs
++++ b/src/openhuman/channels/providers/matrix_tests.rs
+@@ -1,5 +1,64 @@
+ use super::*;
+ 
++#[tokio::test]
++async fn dashboard_approval_round_trip_uses_native_waiter_and_committed_receipt() {
++    use crate::openhuman::approval::{matrix, ApprovalRequest, ApprovalResponse};
++    use wiremock::matchers::{header, method};
++    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
++    for (action, expected, status) in [
++        ("approve", ApprovalResponse::Yes, "approved"),
++        ("deny", ApprovalResponse::No, "rejected"),
++    ] {
++        let server = MockServer::start().await;
++        Mock::given(method("PUT"))
++            .and(header("authorization", "Bearer test-token"))
++            .respond_with(move |request: &Request| {
++                let content: serde_json::Value = request.body_json().unwrap();
++                let approval = &content["org.agentteams.approval"];
++                if approval["status"] == "pending" {
++                    let body = format!(
++                        "/agentteams-approval {action} {} {}",
++                        approval["request_id"].as_str().unwrap(),
++                        approval["context_id"].as_str().unwrap()
++                    );
++                    matrix::answer("!other:test", "@owner:test", &body);
++                    matrix::answer("!room:test", "@intruder:test", &body);
++                    matrix::answer("!room:test", "@owner:test", &body);
++                }
++                ResponseTemplate::new(200).set_body_json(serde_json::json!({"event_id": "$event"}))
++            })
++            .mount(&server)
++            .await;
++        let channel = MatrixChannel::new(
++            server.uri(),
++            "test-token".into(),
++            "!room:test".into(),
++            vec!["@owner:test".into()],
++        );
++        let result = channel
++            .request_approval(
++                "!room:test",
++                "@owner:test",
++                &ApprovalRequest {
++                    tool_name: "shell".into(),
++                    arguments: serde_json::json!({"command": "printf proof"}),
++                },
++            )
++            .await;
++        assert_eq!(result, expected);
++        let requests = server.received_requests().await.unwrap();
++        assert_eq!(requests.len(), 2);
++        let pending: serde_json::Value = requests[0].body_json().unwrap();
++        let receipt: serde_json::Value = requests[1].body_json().unwrap();
++        assert_eq!(pending["org.agentteams.approval"]["status"], "pending");
++        assert_eq!(receipt["org.agentteams.approval"]["status"], status);
++        assert_eq!(
++            pending["org.agentteams.approval"]["request_id"],
++            receipt["org.agentteams.approval"]["request_id"]
++        );
++    }
++}
++
+ fn make_channel() -> MatrixChannel {
+     MatrixChannel::new(
+         "https://matrix.org".to_string(),
+diff --git a/src/openhuman/channels/runtime/dispatch.rs b/src/openhuman/channels/runtime/dispatch.rs
+index 23a5fe9..222dc58 100644
+--- a/src/openhuman/channels/runtime/dispatch.rs
++++ b/src/openhuman/channels/runtime/dispatch.rs
+@@ -792,7 +792,20 @@ pub(crate) async fn process_channel_message(
+         }
+     }
+ 
++    #[cfg(feature = "channel-matrix")]
++    let task_run = crate::openhuman::channels::task_recovery::get(&msg.id);
+     let history_key = conversation_history_key(&msg);
++    #[cfg(feature = "channel-matrix")]
++    if let Some(run) = task_run.as_ref() {
++        if let Err(error) = run.current().await {
++            tracing::warn!("Task admission deferred: {error}");
++            return;
++        }
++        ctx.conversation_histories
++            .lock()
++            .unwrap_or_else(|e| e.into_inner())
++            .insert(history_key.clone(), run.restore());
++    }
+     let route = get_route_selection(ctx.as_ref(), &history_key);
+     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
+         Ok(provider) => provider,
+@@ -863,11 +876,50 @@ pub(crate) async fn process_channel_message(
+     let mut history = vec![ChatMessage::system(ctx.system_prompt.as_str())];
+     history.append(&mut prior_turns);
+     history.push(ChatMessage::user(&enriched_message));
++    #[cfg(feature = "channel-matrix")]
++    if msg.channel == "matrix" && msg.reply_target.starts_with('!') {
++        let source_event_ids = crate::openhuman::channels::matrix_direct::get(&msg.id)
++            .map(|run| run.source_event_ids.clone())
++            .unwrap_or_else(|| vec![msg.id.clone()]);
++        let receipt_workspace = std::env::var_os("AGENTTEAMS_WORKER_HOME")
++            .map(std::path::PathBuf::from)
++            .unwrap_or_else(|| ctx.workspace_dir.as_ref().clone());
++        if let Err(error) = crate::openhuman::channels::session_receipts::checkpoint(
++            &receipt_workspace,
++            &msg.reply_target,
++            &msg.id,
++            &history_key,
++            history.last().expect("native input was appended"),
++            &source_event_ids,
++        ) {
++            tracing::warn!("Matrix session input checkpoint failed: {error}");
++            if task_run.is_some() {
++                return;
++            }
++        } else if task_run.is_some() {
++            if let Err(error) = crate::openhuman::channels::task_recovery::commit_input(
++                &receipt_workspace,
++                &msg.reply_target,
++                &msg.id,
++                &history_key,
++            )
++            .await
++            {
++                tracing::warn!("Matrix native input registration deferred: {error}");
++                return;
++            }
++        }
++    }
+ 
+     // Determine if this channel supports streaming draft updates
+-    let use_streaming = target_channel
+-        .as_ref()
+-        .is_some_and(|ch| ch.supports_draft_updates());
++    #[cfg(feature = "channel-matrix")]
++    let task_streaming_allowed = task_run.is_none();
++    #[cfg(not(feature = "channel-matrix"))]
++    let task_streaming_allowed = true;
++    let use_streaming = task_streaming_allowed
++        && target_channel
++            .as_ref()
++            .is_some_and(|ch| ch.supports_draft_updates());
+ 
+     // Set up streaming channel if supported
+     let (progress_tx, progress_rx) = if use_streaming {
+@@ -1066,6 +1118,12 @@ pub(crate) async fn process_channel_message(
+         "[channels::dispatch] dispatching {AGENT_RUN_TURN_METHOD} via native bus"
+     );
+     let agent_call = async {
++        #[cfg(feature = "channel-matrix")]
++        if let Some(run) = task_run.as_ref() {
++            run.current().await.map_err(anyhow::Error::msg)?;
++            run.started
++                .store(true, std::sync::atomic::Ordering::Release);
++        }
+         request_native_global::<AgentTurnRequest, AgentTurnResponse>(
+             AGENT_RUN_TURN_METHOD,
+             turn_request,
+@@ -1096,8 +1154,19 @@ pub(crate) async fn process_channel_message(
+     // tool call, voiding the `supervised` autonomy tier on the channel.
+     // Discord / Slack / iMessage / Mattermost stay in the legacy bypass
+     // until each gets its own approval surface in a follow-up PR.
+-    let llm_result = tokio::time::timeout(Duration::from_secs(ctx.message_timeout_secs), async {
+-        if channel_has_approval_surface(&msg.channel) {
++    let llm_future = tokio::time::timeout(Duration::from_secs(ctx.message_timeout_secs), async {
++        if msg.channel == "matrix" {
++            use crate::openhuman::approval::matrix;
++            let channel = target_channel
++                .clone()
++                .ok_or_else(|| anyhow::anyhow!("Matrix channel is unavailable"))?;
++            let context = Arc::new(matrix::Context {
++                channel,
++                room: msg.reply_target.clone(),
++                sender: msg.sender.clone(),
++            });
++            matrix::scope(context, history_key.clone(), agent_call).await
++        } else if channel_has_approval_surface(&msg.channel) {
+             let approval_ctx = crate::openhuman::approval::ApprovalChatContext {
+                 thread_id: history_key.clone(),
+                 client_id: msg.channel.clone(),
+@@ -1108,8 +1177,34 @@ pub(crate) async fn process_channel_message(
+         } else {
+             agent_call.await
+         }
+-    })
+-    .await;
++    });
++    #[cfg(feature = "channel-matrix")]
++    let direct = crate::openhuman::channels::matrix_direct::get(&msg.id);
++    #[cfg(feature = "channel-matrix")]
++    let llm_result = if let Some(run) = task_run.as_ref() {
++        tokio::select! {
++            biased;
++            _ = run.cancel.cancelled() => Ok(Err(anyhow::anyhow!("Task execution ownership changed"))),
++            _ = async {
++                if let Some(direct) = direct.as_ref() {direct.cancel.cancelled().await;}
++                else { std::future::pending::<()>().await; }
++            } => {
++                run.cancel_message().await;
++                Ok(Err(anyhow::anyhow!("Direct conversation stopped")))
++            },
++            result = crate::openhuman::channels::task_recovery::TASK_RUN.scope(run.clone(), llm_future) => result,
++        }
++    } else if let Some(run) = direct.as_ref() {
++        tokio::select! {
++            biased;
++            _ = run.cancel.cancelled() => Ok(Err(anyhow::anyhow!("Direct conversation stopped"))),
++            result = llm_future => result,
++        }
++    } else {
++        llm_future.await
++    };
++    #[cfg(not(feature = "channel-matrix"))]
++    let llm_result = llm_future.await;
+ 
+     // Wait for draft updater to finish
+     if let Some(handle) = draft_updater {
+@@ -1123,6 +1218,41 @@ pub(crate) async fn process_channel_message(
+         log_worker_join_result(handle.await);
+     }
+ 
++    #[cfg(feature = "channel-matrix")]
++    if direct.as_ref().is_some_and(|run| run.cancel.is_cancelled()) {
++        // Keep the interrupted request in the same native conversation. The
++        // Matrix channel retains all supplements for the replacement turn.
++        let mut histories = ctx
++            .conversation_histories
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        let turns = histories.entry(history_key).or_default();
++        turns.push(ChatMessage::user(&enriched_message));
++        if let Some(run) = direct.as_ref() {
++            turns.extend(run.delivered.lock().unwrap().iter().map(ChatMessage::user));
++        }
++        return;
++    }
++
++    #[cfg(feature = "channel-matrix")]
++    if let Some(run) = task_run.as_ref() {
++        match llm_result {
++            Ok(Ok(response)) => {
++                if let Err(error) = run.complete(&response).await {
++                    tracing::warn!("Task final result deferred: {error}");
++                } else {
++                    run.succeeded
++                        .store(true, std::sync::atomic::Ordering::Release);
++                }
++            }
++            Ok(Err(error)) => tracing::warn!("Task native execution stopped: {error}"),
++            Err(_) => {
++                tracing::warn!("Task native execution timed out; side effects require verification")
++            }
++        }
++        return;
++    }
++
+     let (success, response_text) = match llm_result {
+         Ok(Ok(response)) => {
+             // Save user + assistant turn to per-sender history
+@@ -1133,6 +1263,10 @@ pub(crate) async fn process_channel_message(
+                     .unwrap_or_else(|e| e.into_inner());
+                 let turns = histories.entry(history_key).or_default();
+                 turns.push(ChatMessage::user(&enriched_message));
++                #[cfg(feature = "channel-matrix")]
++                if let Some(run) = direct.as_ref() {
++                    turns.extend(run.delivered.lock().unwrap().iter().map(ChatMessage::user));
++                }
+                 turns.push(ChatMessage::assistant(&response));
+                 // Trim to MAX_CHANNEL_HISTORY (keep recent turns)
+                 while turns.len() > MAX_CHANNEL_HISTORY {
+@@ -1368,7 +1502,41 @@ pub(crate) async fn run_message_dispatch_loop(
+         let worker_ctx = Arc::clone(&ctx);
+         workers.spawn(async move {
+             let _permit = permit;
++            #[cfg(feature = "channel-matrix")]
++            let direct = if msg.channel == "matrix" {
++                crate::openhuman::channels::matrix_direct::get(&msg.id)
++            } else {
++                None
++            };
++            #[cfg(feature = "channel-matrix")]
++            if let Some(run) = direct.as_ref() {
++                run.start().await;
++            }
++            #[cfg(feature = "channel-matrix")]
++            let task_run = crate::openhuman::channels::task_recovery::get(&msg.id);
++            #[cfg(feature = "channel-matrix")]
++            let guard = task_run
++                .as_ref()
++                .map(|run| tokio::spawn(run.clone().guard()));
++            #[cfg(feature = "channel-matrix")]
++            let input_id = msg.id.clone();
+             process_channel_message(worker_ctx, msg).await;
++            #[cfg(feature = "channel-matrix")]
++            if let Some(run) = task_run {
++                run.close(
++                    &input_id,
++                    run.succeeded.load(std::sync::atomic::Ordering::Acquire),
++                )
++                .await;
++            }
++            #[cfg(feature = "channel-matrix")]
++            if let Some(guard) = guard {
++                guard.abort();
++            }
++            #[cfg(feature = "channel-matrix")]
++            if let Some(run) = direct {
++                run.finish().await;
++            }
+         });
+ 
+         while let Some(result) = workers.try_join_next() {
+diff --git a/src/openhuman/channels/traits.rs b/src/openhuman/channels/traits.rs
+index d70c2c2..7659750 100644
+--- a/src/openhuman/channels/traits.rs
++++ b/src/openhuman/channels/traits.rs
+@@ -65,6 +65,16 @@ pub trait Channel: Send + Sync {
+     /// Send a message through this channel
+     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
+ 
++    /// Await a human decision for one tool call; unsupported transports deny.
++    async fn request_approval(
++        &self,
++        _room: &str,
++        _sender: &str,
++        _request: &crate::openhuman::approval::ApprovalRequest,
++    ) -> crate::openhuman::approval::ApprovalResponse {
++        crate::openhuman::approval::ApprovalResponse::No
++    }
++
+     /// Start listening for incoming messages (long-running)
+     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
+ 
+diff --git a/src/openhuman/context/channels_prompt.rs b/src/openhuman/context/channels_prompt.rs
+index 9133a45..5b4853e 100644
+--- a/src/openhuman/context/channels_prompt.rs
++++ b/src/openhuman/context/channels_prompt.rs
+@@ -83,6 +83,9 @@ pub fn build_system_prompt(
+ ) -> String {
+     use std::fmt::Write;
+     let mut prompt = String::with_capacity(8192);
++    let native_tools = std::env::var("AGENTTEAMS_AGENT_ROLE").as_deref() == Ok("manager")
++        || (std::env::var_os("AGENTTEAMS_CONTROLLER_URL").is_some()
++            && std::env::var_os("AGENTTEAMS_PROCESS_ID").is_some());
+ 
+     // ── 1. Tooling ──────────────────────────────────────────────
+     if !tools.is_empty() {
+@@ -92,12 +95,18 @@ pub fn build_system_prompt(
+             let _ = writeln!(prompt, "- **{name}**: {desc}");
+         }
+         prompt.push_str("\n## Tool Use Protocol\n\n");
+-        prompt.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
+-        prompt.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
+-        prompt.push_str("You may use multiple tool calls in a single response. ");
+-        prompt.push_str("After tool execution, results appear in <tool_result> tags. ");
+-        prompt
+-            .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
++        if native_tools {
++            prompt.push_str("Invoke registered functions with native tool calls. Tool invocations in ordinary text are not executed.\n\n");
++        } else {
++            prompt
++                .push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
++            prompt.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
++            prompt.push_str("You may use multiple tool calls in a single response. ");
++            prompt.push_str("After tool execution, results appear in <tool_result> tags. ");
++            prompt.push_str(
++                "Continue reasoning with the results until you can give a final answer.\n\n",
++            );
++        }
+     }
+ 
+     // ── 1b. Action instruction (avoid meta-summary) ───────────────
+@@ -105,7 +114,7 @@ pub fn build_system_prompt(
+         "## Your Task\n\n\
+          When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+          Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
+-         Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
++         Use the available tools to act. Just do what they ask.\n\n",
+     );
+ 
+     // ── 2. Safety ───────────────────────────────────────────────
+diff --git a/src/openhuman/mcp_client/stdio.rs b/src/openhuman/mcp_client/stdio.rs
+index 67c82ea..29e15d2 100644
+--- a/src/openhuman/mcp_client/stdio.rs
++++ b/src/openhuman/mcp_client/stdio.rs
+@@ -30,6 +30,18 @@ struct StdioSession {
+     stdin: ChildStdin,
+     stdout: BufReader<ChildStdout>,
+     initialize: McpInitializeResult,
++    #[cfg(unix)]
++    _group: OwnedMcpGroup,
++}
++
++#[cfg(unix)]
++#[derive(Debug)]
++struct OwnedMcpGroup(nix::unistd::Pid);
++#[cfg(unix)]
++impl Drop for OwnedMcpGroup {
++    fn drop(&mut self) {
++        let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL);
++    }
+ }
+ 
+ impl McpStdioClient {
+@@ -72,9 +84,16 @@ impl McpStdioClient {
+             command.env(key, value);
+         }
+ 
++        command.kill_on_drop(true);
++        #[cfg(unix)]
++        command.process_group(0);
+         let mut child = command
+             .spawn()
+             .with_context(|| format!("spawning MCP stdio server `{}`", self.command))?;
++        #[cfg(unix)]
++        let group = OwnedMcpGroup(nix::unistd::Pid::from_raw(
++            child.id().expect("spawned MCP process") as i32,
++        ));
+         let stdin = child
+             .stdin
+             .take()
+@@ -84,6 +103,8 @@ impl McpStdioClient {
+             .take()
+             .ok_or_else(|| anyhow::anyhow!("stdio server missing stdout"))?;
+         let mut session = StdioSession {
++            #[cfg(unix)]
++            _group: group,
+             child,
+             stdin,
+             stdout: BufReader::new(stdout),
+@@ -144,12 +165,12 @@ impl McpStdioClient {
+     ) -> anyhow::Result<McpServerToolResult> {
+         self.initialize().await?;
+         let mut state = self.state.lock().await;
+-        let session = state
+-            .as_mut()
++        let mut session = state
++            .take()
+             .ok_or_else(|| anyhow::anyhow!("stdio MCP session not initialized"))?;
+         let result = self
+             .send_request_on_session(
+-                session,
++                &mut session,
+                 "tools/call",
+                 json!({
+                     "name": name,
+@@ -157,6 +178,10 @@ impl McpStdioClient {
+                 }),
+             )
+             .await?;
++        // Publish the reusable session only after its reply has been read.
++        // Cancellation drops this owned session and kills its entire group,
++        // rather than leaving a side-effecting MCP request running in memory.
++        *state = Some(session);
+         let rendered = render_tool_result(&result);
+         Ok(McpServerToolResult {
+             raw_result: result,
+diff --git a/src/openhuman/memory_conversations/store.rs b/src/openhuman/memory_conversations/store.rs
+index 1dbc4a5..9877386 100644
+--- a/src/openhuman/memory_conversations/store.rs
++++ b/src/openhuman/memory_conversations/store.rs
+@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
+ use log::{debug, warn};
+ use once_cell::sync::Lazy;
+ use parking_lot::Mutex;
++use sha2::{Digest, Sha256};
+ use tempfile::NamedTempFile;
+ 
+ use super::inverted_index::InvertedIndex;
+@@ -25,6 +26,7 @@ use super::types::{
+ const LOG_PREFIX: &str = "[memory:conversations]";
+ const THREADS_FILENAME: &str = "threads.jsonl";
+ const THREAD_MESSAGES_DIR: &str = "threads";
++const MAX_HEX_THREAD_ID_BYTES: usize = (255 - ".jsonl".len()) / 2;
+ static CONVERSATION_STORE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+ 
+ /// Per-workspace inverted index cache. Keyed by the workspace's
+@@ -621,9 +623,18 @@ impl ConversationStore {
+     }
+ 
+     fn thread_messages_path(&self, thread_id: &str) -> PathBuf {
++        // Long Matrix Task thread IDs cannot fit as hex in a 255-byte filename.
++        let name = if thread_id.len() <= MAX_HEX_THREAD_ID_BYTES {
++            hex::encode(thread_id.as_bytes())
++        } else {
++            format!(
++                "sha256-{}",
++                hex::encode(Sha256::digest(thread_id.as_bytes()))
++            )
++        };
+         self.root_dir()
+             .join(THREAD_MESSAGES_DIR)
+-            .join(format!("{}.jsonl", hex::encode(thread_id.as_bytes())))
++            .join(format!("{name}.jsonl"))
+     }
+ 
+     fn list_threads_unlocked(&self) -> Result<Vec<ConversationThread>, String> {
+diff --git a/src/openhuman/memory_conversations/store_tests.rs b/src/openhuman/memory_conversations/store_tests.rs
+index 0c7b77a..2c940f2 100644
+--- a/src/openhuman/memory_conversations/store_tests.rs
++++ b/src/openhuman/memory_conversations/store_tests.rs
+@@ -41,6 +41,11 @@ fn store_roundtrips_threads_and_messages() {
+             },
+         )
+         .expect("append message");
++    let legacy_path = store
++        .root_dir()
++        .join("threads")
++        .join(format!("{}.jsonl", hex::encode("default-thread")));
++    assert!(legacy_path.is_file());
+ 
+     let threads = store.list_threads().expect("list threads");
+     assert_eq!(threads.len(), 1);
+diff --git a/src/openhuman/routing/provider.rs b/src/openhuman/routing/provider.rs
+index 60f6ea1..c1dd5a2 100644
+--- a/src/openhuman/routing/provider.rs
++++ b/src/openhuman/routing/provider.rs
+@@ -368,7 +368,13 @@ impl IntelligentRoutingProvider {
+ #[async_trait]
+ impl Provider for IntelligentRoutingProvider {
+     fn capabilities(&self) -> ProviderCapabilities {
+-        self.remote.capabilities()
++        let mut capabilities = self.remote.capabilities();
++        // The reliable and model routers may expose tool support through the
++        // dedicated method. Preserve local routing policy when it is enabled.
++        if !self.local_enabled {
++            capabilities.native_tool_calling = self.remote.supports_native_tools();
++        }
++        capabilities
+     }
+ 
+     fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
+diff --git a/src/openhuman/tokenjuice/reduce_tests.rs b/src/openhuman/tokenjuice/reduce_tests.rs
+index 45ba711..baf56b0 100644
+--- a/src/openhuman/tokenjuice/reduce_tests.rs
++++ b/src/openhuman/tokenjuice/reduce_tests.rs
+@@ -824,7 +824,7 @@ fn counter_source_pre_keep_counts_before_filtering() {
+ fn help_family_uses_middle_clamping() {
+     // The generic/help rule matches --help argument
+     let long_help: String = "USAGE: tool [OPTIONS]\n".to_owned()
+-        + &"  --option-N  Description of option N\n".repeat(200);
++        + "  --option-N  Description of option N\n".repeat(200).as_str();
+     let input = ToolExecutionInput {
+         tool_name: "exec".to_owned(),
+         argv: Some(vec!["tool".to_owned(), "--help".to_owned()]),
+diff --git a/src/openhuman/tokenjuice/text/process.rs b/src/openhuman/tokenjuice/text/process.rs
+index 481d4c0..057fcc5 100644
+--- a/src/openhuman/tokenjuice/text/process.rs
++++ b/src/openhuman/tokenjuice/text/process.rs
+@@ -327,7 +327,7 @@ mod tests {
+     fn clamp_text_newline_at_early_position() {
+         // Newline at position < len/2 → trim_head_to_line_boundary returns text as-is
+         // (the newline is too early to use as a boundary)
+-        let text = "ab\n".to_owned() + &"x".repeat(200);
++        let text = "ab\n".to_owned() + "x".repeat(200).as_str();
+         let clamped = clamp_text(&text, 100);
+         assert!(clamped.ends_with("... truncated ..."));
+     }
+@@ -336,7 +336,7 @@ mod tests {
+     fn clamp_middle_no_newline_in_tail() {
+         // tail portion has no newline → trim_tail_to_line_boundary returns text as-is
+         // This exercises the "None" branch of trim_tail_to_line_boundary
+-        let text = "line1\nline2\n".to_owned() + &"x".repeat(300);
++        let text = "line1\nline2\n".to_owned() + "x".repeat(300).as_str();
+         let clamped = clamp_text_middle(&text, 40);
+         assert!(clamped.contains("... omitted ..."));
+     }
+@@ -360,7 +360,7 @@ mod tests {
+         // Construct text with many lines; the last chunk has no early newline
+         let many_lines: String = "head-line\n".repeat(100);
+         // Tail segment ends with long non-newline text followed by newline at end
+-        let text = many_lines + &"z".repeat(200) + "\nlast";
++        let text = many_lines + "z".repeat(200).as_str() + "\nlast";
+         let clamped = clamp_text_middle(&text, 300);
+         // Should produce output with the marker
+         assert!(clamped.contains("... omitted ..."));
+diff --git a/src/openhuman/tools/impl/system/shell.rs b/src/openhuman/tools/impl/system/shell.rs
+index a883b46..7bf5ce4 100644
+--- a/src/openhuman/tools/impl/system/shell.rs
++++ b/src/openhuman/tools/impl/system/shell.rs
+@@ -11,6 +11,18 @@ use std::time::{Duration, Instant};
+ const SHELL_TIMEOUT_SECS: u64 = 60;
+ /// Maximum output size in bytes (1MB).
+ const MAX_OUTPUT_BYTES: usize = 1_048_576;
++
++#[cfg(unix)]
++struct OwnedShellGroup(nix::unistd::Pid);
++
++#[cfg(unix)]
++impl Drop for OwnedShellGroup {
++    fn drop(&mut self) {
++        // A dropped tool future must not leave a shell or its children running.
++        let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL);
++        let _ = nix::sys::wait::waitpid(self.0, None);
++    }
++}
+ /// Environment variables safe to pass to shell commands.
+ /// Only functional variables are included — never API keys or secrets.
+ const SAFE_ENV_VARS: &[&str] = &[
+@@ -264,6 +276,31 @@ impl ShellTool {
+             }
+         }
+ 
++        // Task tools use this process's identity and projected credential file.
++        // Do not forward raw API keys or recover a prior startup identity.
++        #[cfg(feature = "channel-matrix")]
++        if crate::openhuman::channels::task_recovery::TASK_RUN
++            .try_with(|_| ())
++            .is_ok()
++        {
++            for var in [
++                "AGENTTEAMS_CONTROLLER_URL",
++                "AGENTTEAMS_AUTH_TOKEN_FILE",
++                "AGENTTEAMS_PROCESS_ID",
++                "AGENTTEAMS_STORAGE_PREFIX",
++                "AGENTTEAMS_WORKER_HOME",
++                "AGENTTEAMS_WORKER_NAME",
++                "AGENTTEAMS_WORKER_CR_NAME",
++                "AGENTTEAMS_AGENT_ROLE",
++                "TEAMHARNESS_RUNTIME_CONFIG",
++                "TEAMHARNESS_SHARED_DIR",
++            ] {
++                if let Ok(value) = std::env::var(var) {
++                    cmd.env(var, value);
++                }
++            }
++        }
++
+         // If a managed Node.js install has already been resolved, transparently
+         // prepend its bin dir to PATH so this shell sees the managed toolchain.
+         // `try_cached()` never blocks and never triggers a download — unrelated
+@@ -286,8 +323,24 @@ impl ShellTool {
+             }
+         }
+ 
+-        let result =
+-            tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
++        cmd.kill_on_drop(true);
++        #[cfg(unix)]
++        cmd.process_group(0);
++        cmd.stdout(std::process::Stdio::piped())
++            .stderr(std::process::Stdio::piped());
++        let result = match cmd.spawn() {
++            Ok(child) => {
++                #[cfg(unix)]
++                let _group =
++                    OwnedShellGroup(nix::unistd::Pid::from_raw(child.id().unwrap() as i32));
++                tokio::time::timeout(
++                    Duration::from_secs(SHELL_TIMEOUT_SECS),
++                    child.wait_with_output(),
++                )
++                .await
++            }
++            Err(error) => Ok(Err(error)),
++        };
+ 
+         let tool_result = match result {
+             Ok(Ok(output)) => {
+diff --git a/tests/agentteams_direct_control.rs b/tests/agentteams_direct_control.rs
+new file mode 100644
+index 0000000..da4bcef
+--- /dev/null
++++ b/tests/agentteams_direct_control.rs
+@@ -0,0 +1,79 @@
++#![cfg(unix)]
++use openhuman_core::openhuman::{
++    agent::host_runtime::NativeRuntime,
++    security::{AutonomyLevel, SecurityPolicy},
++    tools::{ShellTool, Tool},
++};
++use serde_json::json;
++use std::os::unix::fs::PermissionsExt;
++use std::sync::Arc;
++use std::time::Duration;
++
++#[tokio::test]
++async fn shell_cancellation_stops_shell_and_children() {
++    let directory = tempfile::tempdir().unwrap();
++    let pidfile = directory.path().join("pid");
++    let marker = directory.path().join("must-not-run");
++    let security = Arc::new(SecurityPolicy {
++        autonomy: AutonomyLevel::Full,
++        workspace_dir: directory.path().to_path_buf(),
++        allowed_commands: vec!["at-dm-long-tool".into()],
++        ..SecurityPolicy::default()
++    });
++    let tool = ShellTool::new(security, Arc::new(NativeRuntime::new()));
++    let script = directory.path().join("at-dm-long-tool");
++    std::fs::write(&script, format!("#!/usr/bin/env python3\nimport os,pathlib,subprocess\nchild=subprocess.Popen(['sleep','30'])\npathlib.Path({:?}).write_text(str(os.getpid())+','+str(child.pid))\nchild.wait()\npathlib.Path({:?}).touch()\n", pidfile.to_str().unwrap(), marker.to_str().unwrap())).unwrap();
++    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
++    let command = "./at-dm-long-tool";
++    let task = tokio::spawn(async move {
++        tool.execute(json!({"command": command, "approved": true}))
++            .await
++    });
++    for _ in 0..200 {
++        if pidfile.exists() {
++            break;
++        }
++        tokio::time::sleep(Duration::from_millis(25)).await;
++    }
++    if !pidfile.exists() && task.is_finished() {
++        panic!("native shell rejected fixture: {:?}", task.await.unwrap());
++    }
++    assert!(pidfile.exists(), "native shell never started");
++    let pids: Vec<i32> = std::fs::read_to_string(&pidfile)
++        .unwrap()
++        .trim()
++        .split(',')
++        .map(|pid| pid.parse().unwrap())
++        .collect();
++    task.abort();
++    let _ = task.await;
++    for pid in pids {
++        let stopped = || {
++            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
++                == Err(nix::errno::Errno::ESRCH)
++            {
++                return true;
++            }
++            // Linux can retain an exited orphan as a zombie until init reaps
++            // it. kill(pid, 0) alone does not distinguish it from live work.
++            #[cfg(target_os = "linux")]
++            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
++                return stat
++                    .rsplit_once(')')
++                    .is_some_and(|(_, fields)| fields.trim_start().starts_with('Z'));
++            }
++            false
++        };
++        for _ in 0..100 {
++            if stopped() {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++        assert!(
++            stopped(),
++            "tool process {pid} remained alive after cancellation"
++        );
++    }
++    assert!(!marker.exists());
++}
+diff --git a/tests/agentteams_task_recovery.rs b/tests/agentteams_task_recovery.rs
+new file mode 100644
+index 0000000..4df0767
+--- /dev/null
++++ b/tests/agentteams_task_recovery.rs
+@@ -0,0 +1,112 @@
++//! Native API/adapter tests; these do not replace real Controller/Matrix/model E2E.
++use openhuman_core::openhuman;
++use openhuman_core::openhuman::channels::traits;
++#[path = "../src/openhuman/channels/session_receipts.rs"]
++mod session_receipts;
++#[path = "../src/openhuman/channels/task_recovery.rs"]
++mod task_recovery;
++
++#[cfg(unix)]
++#[tokio::test]
++async fn cancelled_native_mcp_call_stops_server_and_child_and_can_reinitialize() {
++    use openhuman_core::openhuman::config::McpClientIdentityConfig;
++    use openhuman_core::openhuman::mcp_client::McpStdioClient;
++    use std::sync::Arc;
++    use std::time::Duration;
++    let directory = tempfile::tempdir().unwrap();
++    let script = directory.path().join("mcp.py");
++    let pidfile = directory.path().join("pids");
++    let marker = directory.path().join("must-not-run");
++    std::fs::write(&script, r#"import sys,json,os,subprocess,pathlib
++for line in sys.stdin:
++    request=json.loads(line)
++    if request['method']=='initialize':
++        result={'protocolVersion':'2025-11-25','capabilities':{},'serverInfo':{'name':'test','version':'1'}}
++    elif request['method']=='notifications/initialized': continue
++    elif request['method']=='tools/list': result={'tools':[]}
++    else:
++        child=subprocess.Popen(['sleep','30'])
++        pathlib.Path(sys.argv[1]).write_text(str(os.getpid())+','+str(child.pid))
++        child.wait()
++        pathlib.Path(sys.argv[2]).touch()
++        result={'content':[{'type':'text','text':'unexpected'}]}
++    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
++"#).unwrap();
++    let client = Arc::new(McpStdioClient::new(
++        "python3".into(),
++        vec![
++            script.display().to_string(),
++            pidfile.display().to_string(),
++            marker.display().to_string(),
++        ],
++        Vec::new(),
++        None,
++        McpClientIdentityConfig::default(),
++    ));
++    let original = client.clone();
++    let call =
++        tokio::spawn(async move { original.call_tool("effect", serde_json::json!({})).await });
++    for _ in 0..200 {
++        if pidfile.exists() {
++            break;
++        }
++        assert!(
++            !call.is_finished(),
++            "native call ended before its external operation started"
++        );
++        tokio::time::sleep(Duration::from_millis(25)).await;
++    }
++    let pids: Vec<u32> = std::fs::read_to_string(&pidfile)
++        .expect("operation started")
++        .split(',')
++        .map(|s| s.parse().unwrap())
++        .collect();
++    call.abort();
++    assert!(call.await.unwrap_err().is_cancelled());
++    let running = |pid: &u32| -> bool {
++        std::process::Command::new("ps")
++            .args(["-o", "stat=", "-p", &pid.to_string()])
++            .output()
++            .ok()
++            .is_some_and(|out| {
++                let state = String::from_utf8_lossy(&out.stdout);
++                !state.trim().is_empty() && !state.trim().starts_with('Z')
++            })
++    };
++    for _ in 0..200 {
++        if !pids.iter().any(&running) {
++            break;
++        }
++        tokio::time::sleep(Duration::from_millis(25)).await;
++    }
++    assert!(
++        !pids.iter().any(running),
++        "native MCP server and its tool child must both stop"
++    );
++    assert!(!marker.exists());
++    assert!(
++        client.list_tools().await.unwrap().is_empty(),
++        "cancelled stdio session must be rebuilt"
++    );
++    client.close_session().await.unwrap();
++}
++
++#[test]
++fn gateway_routing_preserves_structured_tool_capability() {
++    use openhuman_core::openhuman::config::Config;
++    use openhuman_core::openhuman::inference::provider::{
++        create_intelligent_routing_provider, ProviderRuntimeOptions,
++    };
++
++    let mut config = Config::default();
++    config.local_ai.runtime_enabled = false;
++    let provider = create_intelligent_routing_provider(
++        Some("http://127.0.0.1:8080/v1"),
++        None,
++        Some("fixture-worker-key"),
++        &config,
++        &ProviderRuntimeOptions::default(),
++    )
++    .unwrap();
++    assert!(provider.supports_native_tools());
++}
