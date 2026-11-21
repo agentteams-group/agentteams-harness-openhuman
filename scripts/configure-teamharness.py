@@ -1,5 +1,6 @@
 """Project the existing TeamHarness stdio server into OpenHuman's native MCP client."""
 import json
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -11,7 +12,7 @@ import yaml
 def configure(workspace: Path, bundle: Path):
     runtime = workspace / 'runtime/runtime.yaml'
     if not runtime.is_file():
-        if os.getenv('TEAMHARNESS_COORDINATION_URL'):
+        if os.getenv('AGENTTEAMS_CONTROLLER_URL'):
             raise ValueError('Task coordination requires your Controller-projected runtime.yaml')
         return
     native = workspace / 'workspace'
@@ -44,13 +45,23 @@ def configure(workspace: Path, bundle: Path):
     role = record.get('member', {}).get('role') or os.getenv('AGENTTEAMS_AGENT_ROLE', 'worker')
     native = workspace / 'workspace'
     role = {'team_leader': 'leader', 'standalone': 'worker'}.get(role, role)
+    public_task = bundle / 'mcp/common/task_cli.py'
+    spec = importlib.util.spec_from_file_location('openhuman_public_task_cli', public_task)
+    task_cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(task_cli)
+    schema = task_cli.schema(role)
+    metadata = workspace / '.agentteams'
+    metadata.mkdir(exist_ok=True)
+    (metadata / 'native-task-schema.json').write_text(json.dumps(schema, ensure_ascii=False))
     manifest = yaml.safe_load((bundle / 'plugin.yaml').read_text())
     for skills in manifest['skills'].values():
         for skill in skills:
             if role in skill['roles']:
                 shutil.copytree(bundle / skill['path'], native / 'skills' / skill['id'], dirs_exist_ok=True)
     with (native / 'SOUL.md').open('a') as prompt:
-        prompt.write('\nYou have the native MCP bridge tools. When Task instructions name taskflow, projectflow, filesync, artifact, roomflow or message, call mcp_call_tool with server "teamharness", tool set to that name, and arguments set to its JSON arguments. Use mcp_list_tools on server "teamharness" for schemas. Preserve your assigned role; do not change Task metadata through shell uploads.\n')
+        prompt.write('\nUse your native task tool for Task operations. The task system prepares inputs, advances accepted dependencies and delivers results to the original conversation automatically. Preserve your assigned role; do not change Task metadata through shell uploads or send duplicate notifications. Use mcp_list_tools and mcp_call_tool only for your other configured MCP capabilities.\n')
+        contract = (bundle / 'skills/team/task-management/SKILL.md').read_text()
+        prompt.write('\n' + (contract.partition('## Plan as Leader')[0] if role == 'manager' else contract) + '\n')
 
 
 if __name__ == '__main__':

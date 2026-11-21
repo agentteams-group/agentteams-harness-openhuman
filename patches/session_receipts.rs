@@ -24,7 +24,9 @@ pub(crate) fn checkpoint(
         })).collect::<Vec<_>>(),
     });
     std::fs::write(&temporary, serde_json::to_vec(&snapshot)?)?;
-    std::fs::rename(temporary, path)
+    std::fs::File::open(&temporary)?.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    std::fs::File::open(directory)?.sync_all()
 }
 
 #[cfg(test)]

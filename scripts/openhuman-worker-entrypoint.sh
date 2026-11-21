@@ -46,6 +46,7 @@ source /opt/agentteams/scripts/lib/agentteams-env.sh 2>/dev/null || true
 WORKER_NAME="${AGENTTEAMS_WORKER_NAME:?AGENTTEAMS_WORKER_NAME is required}"
 WORKER_CR_NAME="${AGENTTEAMS_WORKER_CR_NAME:-${WORKER_NAME}}"
 WORKSPACE="${AGENTTEAMS_WORKER_HOME:-/root/agentteams-fs/agents/${WORKER_NAME}}"
+export AGENTTEAMS_WORKER_HOME="${WORKSPACE}"
 export HOME="${WORKSPACE}"
 export OPENHUMAN_WORKSPACE="${WORKSPACE}"
 
@@ -256,7 +257,7 @@ omit_memory_md = false
 inline = "You are the AgentTeams ${NATIVE_ROLE} named ${WORKER_NAME}. Follow your assigned role and credentials, and use your available tools to complete tasks."
 
 [tools]
-named = ["shell", "file_read", "file_write", "query_memory", "memory_store", "memory_forget", "mcp_list_tools", "mcp_call_tool"]
+named = ["task", "shell", "file_read", "file_write", "query_memory", "memory_store", "memory_forget", "mcp_list_tools", "mcp_call_tool"]
 EOF
     cat >> "${WORKSPACE}/config.toml" <<'EOF'
 
@@ -316,7 +317,7 @@ export OPENHUMAN_CORE_TOKEN="${OPENHUMAN_CORE_TOKEN:-$(openssl rand -hex 32 2>/d
 # ============================================================
 
 TASK_SYNC_EXCLUDES=()
-if [ -n "${TEAMHARNESS_COORDINATION_URL:-}" ]; then
+if [ -n "${AGENTTEAMS_CONTROLLER_URL:-}" ]; then
     TASK_SYNC_EXCLUDES=(--exclude "tasks/**" --exclude "projects/**")
 fi
 

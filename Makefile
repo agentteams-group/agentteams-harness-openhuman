@@ -15,6 +15,7 @@ push:
 test:
 	AT_SOURCE=$(abspath $(AT_SOURCE)) python3 -m pytest tests -q
 	cargo test --locked --manifest-path tests/session-receipts/Cargo.toml
+	AT_SOURCE=$(abspath $(AT_SOURCE)) cargo test --locked --manifest-path tests/task-protocol/Cargo.toml
 	bash -n scripts/openhuman-worker-entrypoint.sh scripts/agt
 smoke:
 	docker run --rm --entrypoint openhuman-core $(IMAGE):$(VERSION) --help

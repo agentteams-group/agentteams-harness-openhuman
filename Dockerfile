@@ -107,6 +107,10 @@ RUN git -C /build/openhuman-src apply /tmp/task-recovery.patch
 COPY patches/worker-matrix.patch /tmp/worker-matrix.patch
 COPY patches/worker_matrix.rs /build/openhuman-src/src/openhuman/channels/providers/matrix/worker_sync.rs
 RUN git -C /build/openhuman-src apply /tmp/worker-matrix.patch
+COPY patches/task-protocol.patch /tmp/task-protocol.patch
+COPY patches/task_protocol.rs /build/openhuman-src/src/openhuman/channels/task_protocol.rs
+COPY patches/task_telemetry.rs /build/openhuman-src/src/openhuman/channels/task_telemetry.rs
+RUN git -C /build/openhuman-src apply /tmp/task-protocol.patch
 
 WORKDIR /build/openhuman-src
 

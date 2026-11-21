@@ -33,6 +33,14 @@ def test_native_stdio_mapping_uses_the_projected_identity_and_role_skills(tmp_pa
     assert ('task-execution' in skills) == (role in {'worker', 'standalone'})
     assert ('resource-management' in skills) == (role == 'manager')
     assert 'mcp_call_tool' in (tmp_path / 'workspace/SOUL.md').read_text()
+    public_schema = __import__('json').loads((tmp_path / '.agentteams/native-task-schema.json').read_text())
+    actions = public_schema['inputSchema']['properties']['action']['enum']
+    assert ('create' in actions) == (role == 'manager')
+    assert ('plan' in actions) == (role == 'team_leader')
+    assert ('submit' in actions) == (role in {'worker', 'standalone'})
+    prompt = (tmp_path / 'workspace/SOUL.md').read_text()
+    assert 'Use your native task tool' in prompt
+    assert 'When Task instructions name taskflow' not in prompt
 
 def test_restarting_retains_worker_shared_artifacts_and_standard_role(tmp_path, monkeypatch):
     (tmp_path / 'runtime').mkdir()
@@ -79,9 +87,9 @@ def test_native_shared_link_cannot_point_outside_the_worker_directory(tmp_path):
         config.configure(tmp_path, agentteams / 'plugins/teamharness')
 
 def test_old_controller_without_member_contract_does_not_gain_a_broken_server(tmp_path, monkeypatch):
-    monkeypatch.delenv('TEAMHARNESS_COORDINATION_URL', raising=False)
+    monkeypatch.delenv('AGENTTEAMS_CONTROLLER_URL', raising=False)
     config.configure(tmp_path, agentteams / 'plugins/teamharness')
     assert not (tmp_path / 'config.toml').exists()
-    monkeypatch.setenv('TEAMHARNESS_COORDINATION_URL', 'http://controller/api/v1/coordination')
+    monkeypatch.setenv('AGENTTEAMS_CONTROLLER_URL', 'http://controller')
     with pytest.raises(ValueError):
         config.configure(tmp_path, agentteams / 'plugins/teamharness')
