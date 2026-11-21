@@ -11,6 +11,7 @@ index e24e116..634b932 100644
   "objc2 0.6.4",
   "objc2-contacts",
 diff --git a/Cargo.toml b/Cargo.toml
+index f98c8df..83fa806 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -86,6 +86,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -2291,14 +2292,14 @@ index a883b46..7bf5ce4 100644
              Ok(Ok(output)) => {
 diff --git a/tests/agentteams_direct_control.rs b/tests/agentteams_direct_control.rs
 new file mode 100644
-index 0000000..da4bcef
+index 0000000..6ebd727
 --- /dev/null
 +++ b/tests/agentteams_direct_control.rs
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,84 @@
 +#![cfg(unix)]
 +use openhuman_core::openhuman::{
 +    agent::host_runtime::NativeRuntime,
-+    security::{AutonomyLevel, SecurityPolicy},
++    security::{audit::AuditLogger, AutonomyLevel, SecurityPolicy},
 +    tools::{ShellTool, Tool},
 +};
 +use serde_json::json;
@@ -2314,10 +2315,15 @@ index 0000000..da4bcef
 +    let security = Arc::new(SecurityPolicy {
 +        autonomy: AutonomyLevel::Full,
 +        workspace_dir: directory.path().to_path_buf(),
++        action_dir: directory.path().to_path_buf(),
 +        allowed_commands: vec!["at-dm-long-tool".into()],
 +        ..SecurityPolicy::default()
 +    });
-+    let tool = ShellTool::new(security, Arc::new(NativeRuntime::new()));
++    let tool = ShellTool::new(
++        security,
++        Arc::new(NativeRuntime::new()),
++        AuditLogger::disabled(),
++    );
 +    let script = directory.path().join("at-dm-long-tool");
 +    std::fs::write(&script, format!("#!/usr/bin/env python3\nimport os,pathlib,subprocess\nchild=subprocess.Popen(['sleep','30'])\npathlib.Path({:?}).write_text(str(os.getpid())+','+str(child.pid))\nchild.wait()\npathlib.Path({:?}).touch()\n", pidfile.to_str().unwrap(), marker.to_str().unwrap())).unwrap();
 +    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
