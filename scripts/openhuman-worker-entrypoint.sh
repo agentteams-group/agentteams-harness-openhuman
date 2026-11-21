@@ -48,6 +48,7 @@ WORKER_CR_NAME="${AGENTTEAMS_WORKER_CR_NAME:-${WORKER_NAME}}"
 WORKSPACE="${AGENTTEAMS_WORKER_HOME:-/root/agentteams-fs/agents/${WORKER_NAME}}"
 export HOME="${WORKSPACE}"
 export OPENHUMAN_WORKSPACE="${WORKSPACE}"
+export OPENHUMAN_ACTION_DIR="${WORKSPACE}"
 
 log() {
     echo "[agentteams-openhuman-worker $(date '+%Y-%m-%d %H:%M:%S')] $1"

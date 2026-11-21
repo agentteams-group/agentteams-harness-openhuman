@@ -64,6 +64,36 @@ pub(crate) async fn checkpoint(history: &[ChatMessage]) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) async fn commit_steer(event: &str, history: &[ChatMessage]) -> anyhow::Result<()> {
+    if let Ok(run) = TASK_RUN.try_with(Arc::clone) {
+        let input = history
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("Missing native steering input"))?;
+        super::session_receipts::checkpoint(
+            &home(),
+            &run.room,
+            event,
+            &run.session,
+            input,
+            &[event.to_owned()],
+        )?;
+        commit_input(&home(), &run.room, event, &run.session)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let control = rpc(
+            json!({"action":"matrix.message.claim","event_key":digest(&json!([run.room,event]))}),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        if control["recovery"] == "resume" {
+            rpc(json!({"action":"matrix.message.cancel","identity":control["identity"]}))
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct Run {
     identity: Value,
     work: Value,
@@ -767,6 +797,12 @@ pub(crate) async fn begin_message_tools(calls: Value) -> anyhow::Result<Option<S
             .ok_or_else(|| anyhow::anyhow!("missing tool operation identity"))?
             .to_owned(),
     ))
+}
+
+pub(crate) fn abort_unconfirmed() {
+    if let Ok(run) = TASK_RUN.try_with(Arc::clone) {
+        run.cancel.cancel();
+    }
 }
 
 pub(crate) async fn finish_message_tools(op: Option<String>, results: Value) -> anyhow::Result<()> {

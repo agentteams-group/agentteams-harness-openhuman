@@ -1,5 +1,12 @@
 # AgentTeams OpenHuman Harness
 
+The native runtime is pinned to OpenHuman **v0.57.18**. Direct-conversation
+supplements use its native `RunQueue::Steer` at the next engine boundary;
+Stop still cancels the captured execution and cleans up native tools. Late
+supplements are retained as follow-up input. The Matrix approval bridge uses
+the upgraded native `ApprovalGate`, with request-bound Dashboard cards and
+sender/room/context checks.
+
 The managed OpenHuman runtime integration: native Matrix patches, entrypoint,
 Task-tool configuration, container packaging and compatibility tests. This code
 was extracted without changing behavior from AgentTeams Core commit
