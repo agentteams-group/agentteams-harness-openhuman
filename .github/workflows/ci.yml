@@ -1,120 +1,102 @@
-name: OpenHuman Harness
-
+name: OpenHuman v057 native protocol artifact validation
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
-    inputs:
-      export_native_binary:
-        description: Save the native executable for an isolated runtime-recovery run
-        type: boolean
-        default: false
-
 permissions:
   contents: read
-
+concurrency:
+  group: openhuman-v057-native-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  native-controls:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    env:
-      GGML_NATIVE: 'OFF'
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      AT_SOURCE: ${{ github.workspace }}/agentteams
+  native-artifact:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-      - name: Read shared Core dependency
-        id: core
+      - name: Check isolated runner resources
         run: |
-          echo "ref=$(sed -n 's/^AT_REF=//p' versions.env)" >> "$GITHUB_OUTPUT"
-          echo "native_ref=$(sed -n 's/^OPENHUMAN_GIT_REF=//p' versions.env)" >> "$GITHUB_OUTPUT"
+          uname -a
+          free -m
+          df -h
+          test "$(uname -m)" = aarch64
+          test "$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')" -ge 14680064
+          test "$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)" -ge 10485760
+      - uses: actions/checkout@v4
+        with:
+          ref: 103e2f103ae4c4bb99d6a92da209a71fbd2c7f61
+          path: harness
       - uses: actions/checkout@v4
         with:
           repository: agentscope-ai/AgentTeams
-          ref: ${{ steps.core.outputs.ref }}
-          path: agentteams
-      - uses: actions/checkout@v4
+          ref: 663615d7e5d5a85887999b75b510347a1edfdbcc
+          path: at
+      - uses: actions/setup-python@v5
         with:
-          repository: tinyhumansai/openhuman
-          ref: ${{ steps.core.outputs.native_ref }}
-          path: native
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: '1.93.0'
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: native
-      - name: Install native runtime build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev libssl-dev libxdo-dev libxtst-dev libx11-dev libevdev-dev cmake clang pkg-config
-      - name: Verify Task tool configuration and receipt guards
+          python-version: '3.11'
+      - name: Validate startup and prepare one native compiler/test phase
         run: |
-          python3 -m pip install 'pytest>=8,<9' 'PyYAML>=6,<7'
-          AT_SOURCE="$GITHUB_WORKSPACE/agentteams" python3 -m pytest -q tests
-          cargo test --locked --manifest-path tests/session-receipts/Cargo.toml
-          cargo test --locked --manifest-path tests/task-protocol/Cargo.toml
-          bash -n scripts/openhuman-worker-entrypoint.sh scripts/agt
-      - name: Apply the packaged patches
-        run: |
-          cp patches/session_receipts.rs native/src/openhuman/channels/session_receipts.rs
-          cp patches/task_coordination.rs native/src/openhuman/channels/task_coordination.rs
-          cp patches/task_recovery.rs native/src/openhuman/channels/task_recovery.rs
-          mkdir -p native/src/openhuman/channels/providers/matrix
-          cp patches/worker_matrix.rs native/src/openhuman/channels/providers/matrix/worker_sync.rs
-          cp patches/task_protocol.rs native/src/openhuman/channels/task_protocol.rs
-          cp patches/task_telemetry.rs native/src/openhuman/channels/task_telemetry.rs
-          sudo mkdir -p /opt/agentteams/scripts/lib
-          sudo cp agentteams/shared/lib/*.py /opt/agentteams/scripts/lib/
-          git -C native apply "$GITHUB_WORKSPACE/patches/agentteams.patch"
-      - name: Verify native Matrix controls and tool cleanup
-        working-directory: native
-        run: |
-          cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery
-          cargo test --locked --lib --no-default-features --features channel-matrix agentteams_native_task_protocol_ -- --test-threads=1
-          cargo test --locked --lib --no-default-features --features channel-matrix agentteams_native_steer_
-          cargo test --locked --lib --no-default-features --features channel-matrix channels::task_recovery::tests
-          cargo test --locked --lib --no-default-features --features channel-matrix channels::session_receipts::tests
-          cargo test --locked --lib --no-default-features --features channel-matrix channels::matrix_direct::tests
-          cargo test --locked --lib --no-default-features --features channel-matrix approval::matrix::tests
-
-  image:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - name: Read shared Core dependency
-        id: core
-        run: echo "ref=$(sed -n 's/^AT_REF=//p' versions.env)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
-        with:
-          repository: agentscope-ai/AgentTeams
-          ref: ${{ steps.core.outputs.ref }}
-          path: agentteams
+          python -m pip install 'pytest>=8,<9' 'PyYAML>=6,<7'
+          AT_SOURCE="$GITHUB_WORKSPACE/at" python -m pytest harness/tests -q -p no:cacheprovider
+          bash -n harness/scripts/openhuman-worker-entrypoint.sh harness/scripts/agt
+          python - <<'PY'
+          from pathlib import Path
+          source=Path('harness/Dockerfile').read_text()
+          source=source.replace('    mold \\\n','    mold \\\n    python3 \\\n    python3-yaml \\\n')
+          marker='WORKDIR /build/openhuman-src\n'
+          assert source.count(marker)==1
+          extras='''COPY --from=agentteams /plugins/teamharness/ /opt/core-fixture/plugins/teamharness/
+          COPY --from=agentteams /shared/lib/ /opt/core-fixture/shared/lib/
+          RUN mkdir -p /opt/agentteams/scripts/lib && cp /opt/core-fixture/shared/lib/*.py /opt/agentteams/scripts/lib/
+          COPY tests/task-protocol/ /binding-fixture/
+          COPY patches/task_protocol.rs /patches/task_protocol.rs
+          COPY patches/task_telemetry.rs /patches/task_telemetry.rs
+          COPY patches/session_receipts.rs /patches/session_receipts.rs
+          ENV AT_SOURCE=/opt/core-fixture
+          '''
+          source=source.replace(marker,extras+'\n'+marker)
+          old='''    GGML_NATIVE=OFF cargo build --locked --release --bin openhuman-core --features channel-matrix \\
+              && cp target/release/openhuman-core /usr/local/bin/openhuman-core'''
+          assert source.count(old)==1
+          replacement='''    GGML_NATIVE=OFF CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 bash -euo pipefail -c '\\
+              mkdir -p /tmp/agentteams-evidence; \\
+              CARGO_TARGET_DIR=/build/openhuman-src/target/binding-fixture cargo test --locked --manifest-path /binding-fixture/Cargo.toml > /tmp/agentteams-evidence/binding.log 2>&1 || { cat /tmp/agentteams-evidence/binding.log; exit 1; }; \\
+              AGENTTEAMS_NATIVE_TRACE_EVIDENCE=/tmp/agentteams-evidence/native-otlp.bin cargo test --locked --release --lib --no-default-features --features channel-matrix agentteams_native_task_protocol_ -- --test-threads=1 --nocapture > /tmp/agentteams-evidence/native-joint.log 2>&1 || { cat /tmp/agentteams-evidence/native-joint.log; exit 1; }; \\
+              for filter in agentteams_native_steer_ channels::matrix_direct::tests approval::matrix::tests channels::task_recovery::tests channels::session_receipts::tests; do cargo test --locked --release --lib --no-default-features --features channel-matrix "$filter" -- --test-threads=1 >> /tmp/agentteams-evidence/native-regressions.log 2>&1 || { cat /tmp/agentteams-evidence/native-regressions.log; exit 1; }; done; \\
+              cargo test --locked --release --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery > /tmp/agentteams-evidence/native-cleanup.log 2>&1 || { cat /tmp/agentteams-evidence/native-cleanup.log; exit 1; }; \\
+              grep -q "test result: ok. 1 passed" /tmp/agentteams-evidence/native-joint.log; \
+              if grep -q "^running 0 tests" /tmp/agentteams-evidence/native-regressions.log; then cat /tmp/agentteams-evidence/native-regressions.log; exit 1; fi; \
+              cargo build --locked --release --bin openhuman-core --features channel-matrix; \\
+              cp target/release/openhuman-core /usr/local/bin/openhuman-core; \\
+              cat /tmp/agentteams-evidence/native-joint.log /tmp/agentteams-evidence/native-regressions.log /tmp/agentteams-evidence/native-cleanup.log' '''
+          source=source.replace(old,replacement)
+          Path('harness/.native-v057-artifact.Dockerfile').write_text(source)
+          PY
       - uses: docker/setup-buildx-action@v3
-      - run: make build VERSION=ci AT_CONTEXT=./agentteams
-      - run: make smoke VERSION=ci
-
-      - name: Export native executable and build provenance
-        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+      - name: Compile new ABI and run actual native joint fixtures once
         run: |
-          mkdir test-binary
-          image=ghcr.io/agentteams-group/agentteams-harness-openhuman:ci
-          container=$(docker create "$image")
-          trap 'docker rm -f "$container" >/dev/null' EXIT
-          docker cp "$container:/usr/local/bin/openhuman-core" test-binary/openhuman-core
-          docker cp "$container:/usr/share/licenses/openhuman/LICENSE" test-binary/LICENSE
-          git rev-parse HEAD > test-binary/harness.sha
-          git -C agentteams rev-parse HEAD > test-binary/core.sha
-          cp versions.env test-binary/
-          docker inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' "$image" > test-binary/image.txt
-          docker run --rm --entrypoint sh "$image" -c 'dpkg-query -W && ldd /usr/local/bin/openhuman-core' > test-binary/dependencies.txt
-          (cd test-binary && sha256sum openhuman-core > SHA256SUMS)
+          set -o pipefail
+          mkdir -p artifact
+          docker buildx build --load --platform linux/arm64 --target builder --build-context agentteams=./at --metadata-file artifact/build-metadata.json -f harness/.native-v057-artifact.Dockerfile -t openhuman-v057-native:local ./harness 2>&1 | tee artifact/build.log
+      - name: Export new native executable and exact provenance
+        run: |
+          container=$(docker create openhuman-v057-native:local)
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:/usr/local/bin/openhuman-core" artifact/openhuman-core
+          docker cp "$container:/tmp/agentteams-evidence/." artifact/
+          docker run --rm --entrypoint sh openhuman-v057-native:local -c 'git -C /build/openhuman-src rev-parse HEAD; rustc -Vv; dpkg-query -W; ldd /usr/local/bin/openhuman-core' > artifact/build-dependencies.txt
+          docker run --rm --entrypoint /usr/local/bin/openhuman-core openhuman-v057-native:local --help > artifact/native-help.txt
+          git -C harness rev-parse HEAD > artifact/runtime.sha
+          git -C at rev-parse HEAD > artifact/core.sha
+          printf '%s\n' "${{ github.sha }}" > artifact/workflow.sha
+          printf '%s\n' 'release; CARGO_PROFILE_RELEASE_DEBUG=0; native ABI rebuilt, no v054 binary reused' > artifact/build-profile.txt
+          cp harness/versions.env artifact/
+          sha256sum harness/patches/agentteams.patch harness/patches/task_protocol.rs harness/patches/task_telemetry.rs harness/patches/task_recovery.rs harness/.native-v057-artifact.Dockerfile > artifact/build-inputs.sha256
+          (cd artifact && sha256sum openhuman-core | tee SHA256SUMS)
+          docker inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' openhuman-v057-native:local > artifact/image.txt
+          file artifact/openhuman-core
+          df -h
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+        if: always()
         with:
-          name: openhuman-native-test-binary
-          path: test-binary/
-          retention-days: 1
-          if-no-files-found: error
+          name: openhuman-v057-native-arm64-validation
+          path: artifact/
+          retention-days: 3
+          if-no-files-found: warn
