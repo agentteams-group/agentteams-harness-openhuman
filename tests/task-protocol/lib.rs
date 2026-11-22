@@ -157,6 +157,9 @@ except Exception as error:
                 &event,
                 json!({"teamharness_coordination":{"id":format!("{:032x}",index),"kind":"task_assigned","task_id":id,"main_task_id":"main","project_id":"","delivery_id":"dispatch"}}),
             );
+            native::register_recovered(&event, json!({"teamharness_coordination": {
+                "kind":"task_assigned", "task_id":id,"delivery_id":"fallback"
+            }}));
             let msg = ChannelMessage {
                 id: event,
                 reply_target: "!room:test".into(),
@@ -164,6 +167,8 @@ except Exception as error:
             };
             native::scope(&msg, "native-session", async {
                 tokio::task::yield_now().await;
+                assert!(native::trace_fields().iter().any(|field|
+                    field.key.as_str() == "agentteams.coordination.id" && field.value.to_string() == format!("{:032x}", index)));
                 let expected = base.join("tasks").join(&id).join("workspace");
                 assert_eq!(native::output_directory(), Some(expected.clone()));
                 assert_eq!(native::scratch_directory(), Some(expected.join(".scratch")));

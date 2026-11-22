@@ -46,10 +46,10 @@ index 166b5c4..4ea3dac 100644
  pub mod openhuman;
 diff --git a/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs b/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs
 new file mode 100644
-index 0000000..8d6fbcc
+index 0000000..ecf9fcf
 --- /dev/null
 +++ b/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,277 @@
 +//! Actual v0.57 engine, public Task bridge and native RunQueue. Synthetic API/provider only.
 +use super::*;
 +use crate::openhuman::agent::harness::run_queue::{QueueMode, QueuedMessage, RunQueue};
@@ -165,7 +165,7 @@ index 0000000..8d6fbcc
 + assert arguments['action']=='submit' and arguments['taskId']=='native-exec'
 + return {'task':{'id':'native-exec','status':'submitted','submissionId':'candidate'},'notification':{'eventId':'notice','status':'queued','recipient':'leader'}}
 +async def notify(event,native,action):
-+ assert native=='$native-source', 'NativePhase requires the raw Matrix event ID'
++ assert event=='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' and native=='$native-source', 'NativePhase requires the exact original phase and raw Matrix event ID'
 + return {'active':True}
 +print(json.dumps(module.invoke(request,call=call,notify=notify)))
 +"#;
@@ -249,6 +249,12 @@ index 0000000..8d6fbcc
 +    native::register(
 +        "$native-source",
 +        json!({"teamharness_coordination":{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"task_assigned","task_id":"native-exec","main_task_id":"main","project_id":"","delivery_id":"dispatch"},"otel_carrier":{"traceparent":"00-123456789012345678901234567890ab-12345678901234ab-01"}}),
++    );
++    crate::openhuman::channels::task_recovery::bind_protocol_source(
++        "$native-source",
++        &json!({
++            "task_plan_id":"plan", "task_id":"native-exec", "main_task_id":"main", "notifyTxn":"dispatch"
++        }),
 +    );
 +    let message = ChannelMessage {
 +        id: "$native-source".into(),
