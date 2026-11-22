@@ -1,116 +1,80 @@
-name: OpenHuman v057 headless release artifact validation
+name: OpenHuman release artifact Gateway authentication
 on:
   workflow_dispatch:
+    inputs:
+      build_run:
+        description: Exact native ARM build run containing the executable
+        required: true
+        default: '45006188507'
 permissions:
   contents: read
-concurrency:
-  group: openhuman-v057-headless-${{ github.ref }}
-  cancel-in-progress: false
+  actions: read
 jobs:
-  native-artifact:
+  release-gateway:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 20
     steps:
-      - name: Check isolated runner resources
+      - name: Check native runner resources
         run: |
-          uname -a
-          free -m
-          df -h
           test "$(uname -m)" = aarch64
           test "$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')" -ge 14680064
-          test "$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)" -ge 10485760
+          free -m
+          df -h
       - uses: actions/checkout@v4
         with:
-          ref: 94e3ef58e1ee0cdd15bba694f988649db669e18e
+          ref: ceda9dfdfe4afe53b52bfa07d225b7e1909a9563
           path: harness
       - uses: actions/checkout@v4
         with:
           repository: agentscope-ai/AgentTeams
           ref: 663615d7e5d5a85887999b75b510347a1edfdbcc
           path: at
-      - uses: actions/setup-python@v5
+      - uses: actions/download-artifact@v4
         with:
-          python-version: '3.11'
-      - name: Validate source and prepare production compiler stage
+          name: openhuman-v057-headless-native-arm64
+          path: binary
+          run-id: ${{ inputs.build_run }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify original binary and unchanged production source
         run: |
-          python -m pip install 'pytest>=8,<9' 'PyYAML>=6,<7'
-          AT_SOURCE="$GITHUB_WORKSPACE/at" python -m pytest harness/tests -q -p no:cacheprovider
-          bash -n harness/scripts/openhuman-worker-entrypoint.sh harness/scripts/agt
-          python - <<'PYCODE'
+          (cd binary && sha256sum -c SHA256SUMS)
+          chmod +x binary/openhuman-core
+          # ceda changes the fixture only; all binary/production inputs must
+          # still match the original build's exact source and hashes.
+          test "$(cat binary/runtime.sha)" = 94e3ef58e1ee0cdd15bba694f988649db669e18e
+          test "$(cat binary/core.sha)" = 663615d7e5d5a85887999b75b510347a1edfdbcc
+          sha256sum -c binary/build-inputs.sha256 --ignore-missing
+          mkdir -p evidence
+          cp binary/SHA256SUMS binary/runtime.sha binary/core.sha binary/upstream.sha evidence/
+          git -C harness rev-parse HEAD > evidence/fixture.sha
+          printf '%s\n' '${{ inputs.build_run }}' > evidence/build-run.txt
+      - name: Prepare production native environment without compiling Rust
+        run: |
+          python3 - <<'PY'
           from pathlib import Path
           source=Path('harness/Dockerfile').read_text()
           source=source[:source.index('# Build with channel-matrix feature enabled')]
           continuation=chr(92)+chr(10)
           source=source.replace('    mold '+continuation, ''.join('    '+name+' '+continuation for name in ('mold','python3','python3-yaml','jq')))
           source+='\nCOPY --from=agentteams /shared/lib/ /opt/agentteams/scripts/lib/\nCOPY scripts/openhuman-worker-entrypoint.sh /usr/local/bin/openhuman-worker-entrypoint.sh\n'
+          assert 'cargo build' not in source
           Path('harness/.native-headless.Dockerfile').write_text(source)
-          PYCODE
-          mkdir -p artifact native-registry native-git native-target
-      - uses: actions/cache/restore@v4
-        id: cargo-cache
-        with:
-          path: |
-            native-registry
-            native-git
-            native-target
-          key: openhuman-v057-arm64-release-rust193-${{ hashFiles('harness/versions.env') }}-${{ github.sha }}
-          restore-keys: |
-            openhuman-v057-arm64-release-rust193-${{ hashFiles('harness/versions.env') }}-
-      - uses: docker/setup-buildx-action@v3
-      - name: Prepare exact production compiler and patched source
-        run: |
-          set -o pipefail
-          docker buildx build --load --platform linux/arm64 --target builder --build-context agentteams=./at --metadata-file artifact/build-metadata.json -f harness/.native-headless.Dockerfile -t openhuman-headless-builder:local ./harness 2>&1 | tee artifact/prepare.log
-      - name: Compile only the release executable with persistent native Cargo cache
-        run: |
-          set -o pipefail
-          docker run --rm --entrypoint bash \
-            -v "$GITHUB_WORKSPACE/native-registry:/usr/local/cargo/registry" \
-            -v "$GITHUB_WORKSPACE/native-git:/usr/local/cargo/git" \
-            -v "$GITHUB_WORKSPACE/native-target:/build/openhuman-src/target" \
-            -v "$GITHUB_WORKSPACE/artifact:/artifact" \
-            openhuman-headless-builder:local -euo pipefail -c '
-              GGML_NATIVE=OFF CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --locked --release --bin openhuman-core --features channel-matrix
-              cp target/release/openhuman-core /artifact/openhuman-core
-              git rev-parse HEAD > /artifact/upstream.sha
-              rustc -Vv > /artifact/rustc.txt
-              sha256sum Cargo.lock > /artifact/cargo-lock.sha256
-              ldd /artifact/openhuman-core > /artifact/native-ldd.txt
-            ' 2>&1 | tee artifact/build.log
+          PY
+          docker buildx build --load --platform linux/arm64 --target builder --build-context agentteams=./at -f harness/.native-headless.Dockerfile -t openhuman-release-env:local ./harness
+          sha256sum -c binary/build-inputs.sha256 --ignore-missing
       - name: Actual release startup and authenticated Gateway native IO
         run: |
           set -o pipefail
           docker run --rm --network none --entrypoint bash \
-            -v "$GITHUB_WORKSPACE/artifact/openhuman-core:/usr/local/bin/openhuman-core:ro" \
+            -v "$GITHUB_WORKSPACE/binary/openhuman-core:/usr/local/bin/openhuman-core:ro" \
             -v "$GITHUB_WORKSPACE/harness/tests:/validation:ro" \
-            openhuman-headless-builder:local -euo pipefail -c '
+            openhuman-release-env:local -euo pipefail -c '
               python3 /validation/native_startup_config_smoke.py
               python3 /validation/native_headless_gateway_smoke.py
-            ' 2>&1 | tee artifact/release-headless.log
-      - name: Save exact artifact provenance
-        if: always()
-        run: |
-          git -C harness rev-parse HEAD > artifact/runtime.sha
-          git -C at rev-parse HEAD > artifact/core.sha
-          printf '%s\n' "${{ github.sha }}" > artifact/workflow.sha
-          printf '%s\n' 'release; CARGO_PROFILE_RELEASE_DEBUG=0; binary-only rebuild; actual release auth/native IO; previous cfg(test) joint fixtures not recounted' > artifact/build-profile.txt
-          cp harness/versions.env artifact/
-          sha256sum harness/patches/agentteams.patch harness/patches/task_protocol.rs harness/patches/task_telemetry.rs harness/patches/task_recovery.rs harness/scripts/openhuman-worker-entrypoint.sh harness/.native-headless.Dockerfile > artifact/build-inputs.sha256
-          if test -f artifact/openhuman-core; then (cd artifact && sha256sum openhuman-core > SHA256SUMS); file artifact/openhuman-core; fi
-          docker inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' openhuman-headless-builder:local > artifact/compiler-image.txt || true
-          df -h
-      - uses: actions/cache/save@v4
-        if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
-        with:
-          path: |
-            native-registry
-            native-git
-            native-target
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+            ' 2>&1 | tee evidence/release-headless.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: openhuman-v057-headless-native-arm64
-          path: artifact/
+          name: openhuman-release-gateway-proof
+          path: evidence/
           retention-days: 3
-          if-no-files-found: warn
