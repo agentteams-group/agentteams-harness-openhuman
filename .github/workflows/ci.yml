@@ -1,31 +1,30 @@
-name: OpenHuman Harness
-
+name: OpenHuman native arm64 artifact validation
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
-    inputs:
-      export_native_binary:
-        description: Save the native executable for an isolated runtime-recovery run
-        type: boolean
-        default: false
-
 permissions:
   contents: read
-
+concurrency:
+  group: openhuman-native-artifact-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  native-controls:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
+  native-artifact:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
     env:
-      GGML_NATIVE: 'OFF'
-      CARGO_BUILD_JOBS: '2'
+      CARGO_BUILD_JOBS: '1'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
+      - name: Check isolated runner resources
+        run: |
+          uname -a
+          free -m
+          df -h
+          test "$(uname -m)" = aarch64
+          test "$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')" -ge 14680064
+          test "$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)" -ge 10485760
       - uses: actions/checkout@v4
-      - name: Read shared Core dependency
+      - name: Read exact shared Core dependency
         id: core
         run: echo "ref=$(sed -n 's/^AT_REF=//p' versions.env)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
@@ -33,79 +32,51 @@ jobs:
           repository: agentscope-ai/AgentTeams
           ref: ${{ steps.core.outputs.ref }}
           path: agentteams
-      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          repository: tinyhumansai/openhuman
-          ref: v0.54.0
-          path: native
+          python-version: '3.11'
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.93.0'
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: native
-      - name: Install native runtime build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev libssl-dev libxdo-dev libxtst-dev libx11-dev libevdev-dev cmake clang pkg-config
-      - name: Verify Task tool configuration and receipt guards
+      - name: Run normal Harness and native binding tests
         run: |
-          python3 -m pip install 'pytest>=8,<9' 'PyYAML>=6,<7'
-          AT_SOURCE="$GITHUB_WORKSPACE/agentteams" python3 -m pytest -q tests
+          python -m pip install 'pytest>=8,<9' 'PyYAML>=6,<7'
+          AT_SOURCE="$GITHUB_WORKSPACE/agentteams" python -m pytest tests -q -p no:cacheprovider
           cargo test --locked --manifest-path tests/session-receipts/Cargo.toml
+          AT_SOURCE="$GITHUB_WORKSPACE/agentteams" cargo test --locked --manifest-path tests/task-protocol/Cargo.toml
           bash -n scripts/openhuman-worker-entrypoint.sh scripts/agt
-      - name: Apply the packaged patches
-        run: |
-          git -C native apply "$GITHUB_WORKSPACE/patches/manager-matrix.patch"
-          git -C native apply "$GITHUB_WORKSPACE/patches/dashboard-approvals.patch"
-          git -C native apply "$GITHUB_WORKSPACE/patches/direct-control.patch"
-          cp patches/session_receipts.rs native/src/openhuman/channels/session_receipts.rs
-          git -C native apply "$GITHUB_WORKSPACE/patches/session-receipts.patch"
-          cp patches/task_coordination.rs native/src/openhuman/channels/task_coordination.rs
-          git -C native apply "$GITHUB_WORKSPACE/patches/task-coordination.patch"
-          cp patches/task_recovery.rs native/src/openhuman/channels/task_recovery.rs
-          git -C native apply "$GITHUB_WORKSPACE/patches/task-recovery.patch"
-          mkdir -p native/src/openhuman/channels/providers/matrix
-          cp patches/worker_matrix.rs native/src/openhuman/channels/providers/matrix/worker_sync.rs
-          git -C native apply "$GITHUB_WORKSPACE/patches/worker-matrix.patch"
-      - name: Verify native Matrix controls and tool cleanup
-        working-directory: native
-        run: cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery
-
-  image:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - name: Read shared Core dependency
-        id: core
-        run: echo "ref=$(sed -n 's/^AT_REF=//p' versions.env)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
-        with:
-          repository: agentscope-ai/AgentTeams
-          ref: ${{ steps.core.outputs.ref }}
-          path: agentteams
       - uses: docker/setup-buildx-action@v3
-      - run: make build VERSION=ci AT_CONTEXT=./agentteams
-      - run: make smoke VERSION=ci
-
-      - name: Export native executable and build provenance
-        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+      - name: Build frozen native SDK with one compiler job
         run: |
-          mkdir test-binary
-          image=ghcr.io/agentteams-group/agentteams-harness-openhuman:ci
-          container=$(docker create "$image")
-          trap 'docker rm -f "$container" >/dev/null' EXIT
-          docker cp "$container:/usr/local/bin/openhuman-core" test-binary/openhuman-core
-          docker cp "$container:/usr/share/licenses/openhuman/LICENSE" test-binary/LICENSE
-          git rev-parse HEAD > test-binary/harness.sha
-          git -C agentteams rev-parse HEAD > test-binary/core.sha
-          cp versions.env test-binary/
-          docker inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' "$image" > test-binary/image.txt
-          docker run --rm --entrypoint sh "$image" -c 'dpkg-query -W && ldd /usr/local/bin/openhuman-core' > test-binary/dependencies.txt
-          (cd test-binary && sha256sum openhuman-core > SHA256SUMS)
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('Dockerfile').read_text()
+          old = 'GGML_NATIVE=OFF cargo build --release --bin openhuman-core --features channel-matrix'
+          assert text.count(old) == 1
+          text = text.replace(old, 'GGML_NATIVE=OFF CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --release --bin openhuman-core --features channel-matrix')
+          Path('.native-artifact.Dockerfile').write_text(text)
+          PY
+          docker buildx build --load --platform linux/arm64 --target builder -f .native-artifact.Dockerfile -t openhuman-native-artifact:local .
+      - name: Export exact binary and provenance
+        run: |
+          mkdir artifact
+          container=$(docker create openhuman-native-artifact:local)
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:/usr/local/bin/openhuman-core" artifact/openhuman-core
+          git rev-parse HEAD > artifact/harness.sha
+          git -C agentteams rev-parse HEAD > artifact/core.sha
+          cp versions.env artifact/
+          docker run --rm --entrypoint sh openhuman-native-artifact:local -c 'git -C /build/openhuman-src rev-parse HEAD; rustc -Vv; dpkg-query -W; ldd /usr/local/bin/openhuman-core' > artifact/build-dependencies.txt
+          docker inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' openhuman-native-artifact:local > artifact/image.txt
+          sha256sum patches/task-protocol.patch patches/task_protocol.rs patches/task_telemetry.rs .native-artifact.Dockerfile > artifact/build-inputs.sha256
+          (cd artifact && sha256sum openhuman-core > SHA256SUMS)
+          file artifact/openhuman-core
+          docker run --rm --network none --entrypoint /usr/local/bin/openhuman-core openhuman-native-artifact:local --help > artifact/native-help.txt
+          df -h
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'workflow_dispatch' && inputs.export_native_binary
+        if: always()
         with:
-          name: openhuman-native-test-binary
-          path: test-binary/
-          retention-days: 1
-          if-no-files-found: error
+          name: openhuman-native-arm64-test-binary
+          path: artifact/
+          retention-days: 3
+          if-no-files-found: warn
