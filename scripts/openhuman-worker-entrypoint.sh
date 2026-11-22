@@ -45,7 +45,8 @@ source /opt/agentteams/scripts/lib/agentteams-env.sh 2>/dev/null || true
 
 WORKER_NAME="${AGENTTEAMS_WORKER_NAME:?AGENTTEAMS_WORKER_NAME is required}"
 WORKER_CR_NAME="${AGENTTEAMS_WORKER_CR_NAME:-${WORKER_NAME}}"
-WORKSPACE="${AGENTTEAMS_WORKER_HOME:-/root/agentteams-fs/agents/${WORKER_NAME}}"
+# Keep managed Task files within the native filesystem policy.
+WORKSPACE="${AGENTTEAMS_WORKER_HOME:-/home/openhuman/agents/${WORKER_NAME}}"
 export AGENTTEAMS_WORKER_HOME="${WORKSPACE}"
 export TEAMHARNESS_SHARED_DIR="${WORKSPACE}/shared"
 export HOME="${WORKSPACE}"
