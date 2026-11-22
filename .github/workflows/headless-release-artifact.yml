@@ -1,0 +1,80 @@
+name: OpenHuman release artifact Gateway authentication
+on:
+  workflow_dispatch:
+    inputs:
+      build_run:
+        description: Exact native ARM build run containing the executable
+        required: true
+        default: '45006188507'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  release-gateway:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - name: Check native runner resources
+        run: |
+          test "$(uname -m)" = aarch64
+          test "$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')" -ge 14680064
+          free -m
+          df -h
+      - uses: actions/checkout@v4
+        with:
+          ref: ceda9dfdfe4afe53b52bfa07d225b7e1909a9563
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: agentscope-ai/AgentTeams
+          ref: 663615d7e5d5a85887999b75b510347a1edfdbcc
+          path: at
+      - uses: actions/download-artifact@v4
+        with:
+          name: openhuman-v057-headless-native-arm64
+          path: binary
+          run-id: ${{ inputs.build_run }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify original binary and unchanged production source
+        run: |
+          (cd binary && sha256sum -c SHA256SUMS)
+          chmod +x binary/openhuman-core
+          # ceda changes the fixture only; all binary/production inputs must
+          # still match the original build's exact source and hashes.
+          test "$(cat binary/runtime.sha)" = 94e3ef58e1ee0cdd15bba694f988649db669e18e
+          test "$(cat binary/core.sha)" = 663615d7e5d5a85887999b75b510347a1edfdbcc
+          sha256sum -c binary/build-inputs.sha256 --ignore-missing
+          mkdir -p evidence
+          cp binary/SHA256SUMS binary/runtime.sha binary/core.sha binary/upstream.sha evidence/
+          git -C harness rev-parse HEAD > evidence/fixture.sha
+          printf '%s\n' '${{ inputs.build_run }}' > evidence/build-run.txt
+      - name: Prepare production native environment without compiling Rust
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          source=Path('harness/Dockerfile').read_text()
+          source=source[:source.index('# Build with channel-matrix feature enabled')]
+          continuation=chr(92)+chr(10)
+          source=source.replace('    mold '+continuation, ''.join('    '+name+' '+continuation for name in ('mold','python3','python3-yaml','jq')))
+          source+='\nCOPY --from=agentteams /shared/lib/ /opt/agentteams/scripts/lib/\nCOPY scripts/openhuman-worker-entrypoint.sh /usr/local/bin/openhuman-worker-entrypoint.sh\n'
+          assert 'cargo build' not in source
+          Path('harness/.native-headless.Dockerfile').write_text(source)
+          PY
+          docker buildx build --load --platform linux/arm64 --target builder --build-context agentteams=./at -f harness/.native-headless.Dockerfile -t openhuman-release-env:local ./harness
+          sha256sum -c binary/build-inputs.sha256 --ignore-missing
+      - name: Actual release startup and authenticated Gateway native IO
+        run: |
+          set -o pipefail
+          docker run --rm --network none --entrypoint bash \
+            -v "$GITHUB_WORKSPACE/binary/openhuman-core:/usr/local/bin/openhuman-core:ro" \
+            -v "$GITHUB_WORKSPACE/harness/tests:/validation:ro" \
+            openhuman-release-env:local -euo pipefail -c '
+              python3 /validation/native_startup_config_smoke.py
+              python3 /validation/native_headless_gateway_smoke.py
+            ' 2>&1 | tee evidence/release-headless.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: openhuman-release-gateway-proof
+          path: evidence/
+          retention-days: 3
