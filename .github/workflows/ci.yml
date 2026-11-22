@@ -42,7 +42,7 @@ jobs:
           source=source[:source.index('# Build with channel-matrix feature enabled')]
           continuation=chr(92)+chr(10)
           source=source.replace('    mold '+continuation, ''.join('    '+name+' '+continuation for name in ('mold','python3','python3-yaml','jq')))
-          source+='\nCOPY --from=agentteams /shared/lib/ /opt/agentteams/scripts/lib/\nCOPY scripts/openhuman-worker-entrypoint.sh /usr/local/bin/openhuman-worker-entrypoint.sh\nCOPY tests/native_startup_config_smoke.py tests/native_headless_gateway_smoke.py /validation/\n'
+          source+='\nCOPY --from=agentteams /shared/lib/ /opt/agentteams/scripts/lib/\nCOPY scripts/openhuman-worker-entrypoint.sh /usr/local/bin/openhuman-worker-entrypoint.sh\n'
           Path('harness/.native-headless.Dockerfile').write_text(source)
           PYCODE
           mkdir -p artifact native-registry native-git native-target
@@ -82,6 +82,7 @@ jobs:
           set -o pipefail
           docker run --rm --network none --entrypoint bash \
             -v "$GITHUB_WORKSPACE/artifact/openhuman-core:/usr/local/bin/openhuman-core:ro" \
+            -v "$GITHUB_WORKSPACE/harness/tests:/validation:ro" \
             openhuman-headless-builder:local -euo pipefail -c '
               python3 /validation/native_startup_config_smoke.py
               python3 /validation/native_headless_gateway_smoke.py
