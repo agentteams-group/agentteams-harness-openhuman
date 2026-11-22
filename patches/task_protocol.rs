@@ -40,6 +40,22 @@ pub(crate) fn register(event: &str, mut meta: Value) {
     notifications.insert(event.to_owned(), meta);
 }
 
+/// A scan may recover the same source after its verified Matrix packet arrived.
+/// Fill absent metadata only; never replace the authoritative source packet.
+pub(crate) fn register_recovered(event: &str, meta: Value) {
+    let mut notifications = NOTIFICATIONS.lock().unwrap();
+    let existing = notifications
+        .entry(event.to_owned())
+        .or_insert_with(|| json!({}));
+    if let Some(fields) = meta.as_object() {
+        for (key, value) in fields {
+            if existing.get(key).is_none() {
+                existing[key] = value.clone();
+            }
+        }
+    }
+}
+
 fn home() -> PathBuf {
     std::env::var_os("AGENTTEAMS_WORKER_HOME")
         .map(PathBuf::from)

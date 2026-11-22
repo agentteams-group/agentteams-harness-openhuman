@@ -823,6 +823,16 @@ pub(crate) async fn finish_message_tools(op: Option<String>, results: Value) -> 
     Ok(())
 }
 
+/// The same binding used by scan and the actual native ingress regression.
+pub(crate) fn bind_protocol_source(id: &str, task: &Value) {
+    if task.get("task_plan_id").and_then(Value::as_str).is_some() {
+        super::task_protocol::register_recovered(id, json!({"teamharness_coordination": {
+            "kind":"task_assigned", "task_id":task["task_id"], "main_task_id":task["main_task_id"],
+            "project_id":task.get("project_id").cloned().unwrap_or(json!("")), "delivery_id":task["notifyTxn"]
+        }}));
+    }
+}
+
 async fn scan(
     client: &Client,
     own: &str,
@@ -923,12 +933,7 @@ async fn scan(
             .and_then(|ids| ids.first())
             .cloned()
             .unwrap_or_else(|| format!("recovery:{}", uuid::Uuid::new_v4()));
-        if task.get("task_plan_id").and_then(Value::as_str).is_some() {
-            super::task_protocol::register(&id, json!({"teamharness_coordination": {
-                "kind":"task_assigned", "task_id":task["task_id"], "main_task_id":task["main_task_id"],
-                "project_id":task.get("project_id").cloned().unwrap_or(json!("")), "delivery_id":task["notifyTxn"]
-            }}));
-        }
+        bind_protocol_source(&id, &task);
         RUNS.lock().unwrap().insert(id.clone(), run.clone());
         let input = ChannelMessage {
             id: id.clone(),
