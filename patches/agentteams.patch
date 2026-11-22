@@ -2650,7 +2650,7 @@ diff --git a/src/openhuman/tools/impl/filesystem/file_read.rs b/src/openhuman/to
 index 3e07a9f..ddf9821 100644
 --- a/src/openhuman/tools/impl/filesystem/file_read.rs
 +++ b/src/openhuman/tools/impl/filesystem/file_read.rs
-@@ -67,12 +67,36 @@ impl Tool for FileReadTool {
+@@ -67,12 +67,38 @@ impl Tool for FileReadTool {
              ));
          }
  
@@ -2662,8 +2662,10 @@ index 3e07a9f..ddf9821 100644
 +        let mut native_path = path.to_owned();
 +        #[cfg(feature = "channel-matrix")]
 +        if task_scoped {
-+            let (root, relative) =
-+                crate::openhuman::channels::task_protocol::file_scope(&scoped, path, false)?;
++            let (root, relative) = match crate::openhuman::channels::task_protocol::file_scope(&scoped, path, false) {
++                Ok(scope) => scope,
++                Err(error) => return Ok(ToolResult::error(error.to_string())),
++            };
 +            scoped.action_dir = root.clone();
 +            scoped
 +                .trusted_roots
@@ -2706,7 +2708,7 @@ index 169f4e1..837286b 100644
          };
          // Sync `stat` — intentionally blocking, since the `Tool` trait makes
          // this method sync. Fast for local paths; would only need
-@@ -101,14 +106,38 @@ impl Tool for FileWriteTool {
+@@ -101,14 +106,40 @@ impl Tool for FileWriteTool {
              ));
          }
  
@@ -2718,8 +2720,10 @@ index 169f4e1..837286b 100644
 +        let mut native_path = path.to_owned();
 +        #[cfg(feature = "channel-matrix")]
 +        if task_scoped {
-+            let (root, relative) =
-+                crate::openhuman::channels::task_protocol::file_scope(&scoped, path, true)?;
++            let (root, relative) = match crate::openhuman::channels::task_protocol::file_scope(&scoped, path, true) {
++                Ok(scope) => scope,
++                Err(error) => return Ok(ToolResult::error(error.to_string())),
++            };
 +            scoped.action_dir = root.clone();
 +            scoped
 +                .trusted_roots

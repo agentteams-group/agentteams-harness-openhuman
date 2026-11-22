@@ -14,6 +14,14 @@ BOOTSTRAP = re.search(r'if \[ .*?\n    # Native channel turns.*?\nfi\n(?=\npytho
 BOOTSTRAP = BOOTSTRAP[BOOTSTRAP.rfind('\nif [', 0, BOOTSTRAP.index('# Native channel turns')) + 1:]
 
 class NativeToolsTests(unittest.TestCase):
+    def test_filesystem_scope_refusal_returns_a_definitive_tool_result(self):
+        patch = (ROOT / 'patches/agentteams.patch').read_text()
+        for write in ('false', 'true'):
+            with self.subTest(write=write):
+                scope = re.search(r'file_scope\(&scoped, path, ' + write + r'\) \{(?P<arms>.+?)\n\+\s+\};', patch, re.S)
+                self.assertIsNotNone(scope, 'a scope rejection must not propagate as an uncertain tool exception')
+                self.assertIn('Err(error) => return Ok(ToolResult::error(error.to_string()))', scope.group('arms'))
+
     def test_controller_roles_have_real_tools_and_their_own_identity(self):
         for role in ['manager', 'standalone', 'team_leader']:
             with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
