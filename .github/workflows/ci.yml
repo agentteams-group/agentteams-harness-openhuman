@@ -45,7 +45,7 @@ jobs:
           extras='''COPY --from=agentteams /plugins/teamharness/ /opt/core-fixture/plugins/teamharness/
           COPY --from=agentteams /shared/lib/ /opt/core-fixture/shared/lib/
           RUN mkdir -p /opt/agentteams/scripts/lib && cp /opt/core-fixture/shared/lib/*.py /opt/agentteams/scripts/lib/
-          COPY tests/task-protocol/ /binding-fixture/
+          COPY --from=binding-fixture / /binding-fixture/
           COPY patches/task_protocol.rs /patches/task_protocol.rs
           COPY patches/task_telemetry.rs /patches/task_telemetry.rs
           COPY patches/session_receipts.rs /patches/session_receipts.rs
@@ -74,7 +74,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p artifact
-          docker buildx build --load --platform linux/arm64 --target builder --build-context agentteams=./at --metadata-file artifact/build-metadata.json -f harness/.native-v057-artifact.Dockerfile -t openhuman-v057-native:local ./harness 2>&1 | tee artifact/build.log
+          docker buildx build --load --platform linux/arm64 --target builder --build-context agentteams=./at --build-context binding-fixture=./harness/tests/task-protocol --metadata-file artifact/build-metadata.json -f harness/.native-v057-artifact.Dockerfile -t openhuman-v057-native:local ./harness 2>&1 | tee artifact/build.log
       - name: Export new native executable and exact provenance
         run: |
           container=$(docker create openhuman-v057-native:local)
