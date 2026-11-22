@@ -21,7 +21,7 @@ jobs:
           test "$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)" -ge 10485760
       - uses: actions/checkout@v4
         with:
-          ref: 103e2f103ae4c4bb99d6a92da209a71fbd2c7f61
+          ref: e421d6b1b276bd150423ea9838a50190cdb196ce
           path: harness
       - uses: actions/checkout@v4
         with:
@@ -57,10 +57,10 @@ jobs:
           assert source.count(old)==1
           replacement='''    GGML_NATIVE=OFF CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 bash -euo pipefail -c '\\
               mkdir -p /tmp/agentteams-evidence; \\
-              CARGO_TARGET_DIR=/build/openhuman-src/target/binding-fixture cargo test --locked --manifest-path /binding-fixture/Cargo.toml > /tmp/agentteams-evidence/binding.log 2>&1 || { cat /tmp/agentteams-evidence/binding.log; exit 1; }; \\
-              AGENTTEAMS_NATIVE_TRACE_EVIDENCE=/tmp/agentteams-evidence/native-otlp.bin cargo test --locked --release --lib --no-default-features --features channel-matrix agentteams_native_task_protocol_ -- --test-threads=1 --nocapture > /tmp/agentteams-evidence/native-joint.log 2>&1 || { cat /tmp/agentteams-evidence/native-joint.log; exit 1; }; \\
-              for filter in agentteams_native_steer_ channels::matrix_direct::tests approval::matrix::tests channels::task_recovery::tests channels::session_receipts::tests; do cargo test --locked --release --lib --no-default-features --features channel-matrix "$filter" -- --test-threads=1 >> /tmp/agentteams-evidence/native-regressions.log 2>&1 || { cat /tmp/agentteams-evidence/native-regressions.log; exit 1; }; done; \\
-              cargo test --locked --release --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery > /tmp/agentteams-evidence/native-cleanup.log 2>&1 || { cat /tmp/agentteams-evidence/native-cleanup.log; exit 1; }; \\
+              CARGO_TARGET_DIR=/build/openhuman-src/target/binding-fixture cargo test --locked --manifest-path /binding-fixture/Cargo.toml 2>&1 | tee /tmp/agentteams-evidence/binding.log || exit 1; \\
+              AGENTTEAMS_NATIVE_TRACE_EVIDENCE=/tmp/agentteams-evidence/native-otlp.bin cargo test --locked --release --lib --no-default-features --features channel-matrix agentteams_native_task_protocol_ -- --test-threads=1 --nocapture 2>&1 | tee /tmp/agentteams-evidence/native-joint.log || exit 1; \\
+              for filter in agentteams_native_steer_ channels::matrix_direct::tests approval::matrix::tests channels::task_recovery::tests channels::session_receipts::tests; do cargo test --locked --release --lib --no-default-features --features channel-matrix "$filter" -- --test-threads=1 2>&1 | tee -a /tmp/agentteams-evidence/native-regressions.log || exit 1; done; \\
+              cargo test --locked --release --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery 2>&1 | tee /tmp/agentteams-evidence/native-cleanup.log || exit 1; \\
               grep -q "test result: ok. 1 passed" /tmp/agentteams-evidence/native-joint.log; \
               if grep -q "^running 0 tests" /tmp/agentteams-evidence/native-regressions.log; then cat /tmp/agentteams-evidence/native-regressions.log; exit 1; fi; \
               cargo build --locked --release --bin openhuman-core --features channel-matrix; \\
