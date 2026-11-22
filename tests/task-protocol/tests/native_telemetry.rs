@@ -17,6 +17,9 @@ mod openhuman {
             pub fn trace_fields() -> Vec<opentelemetry::KeyValue> {
                 vec![
                     opentelemetry::KeyValue::new("agentteams.event.id", "$synthetic-native"),
+                    opentelemetry::KeyValue::new("agentteams.team.id", "trace-team"),
+                    opentelemetry::KeyValue::new("agentteams.turn.id", "trace-turn"),
+                    opentelemetry::KeyValue::new("agentteams.worker.name", "trace-owner"),
                     opentelemetry::KeyValue::new("agentteams.telemetry.capture_content", false),
                 ]
             }
@@ -93,6 +96,12 @@ async fn native_exporter_exports_real_boundary_usage_without_contents() {
         "gen_ai.usage.output_tokens",
         "$synthetic-native",
         "native_operation_failed",
+        "langfuse.trace.tags",
+        "langfuse.trace.metadata.agentteams.event.id",
+        "langfuse.observation.metadata.agentteams.worker.name",
+        "langfuse.user.id",
+        "team:trace-team",
+        "worker-turn",
     ] {
         assert!(
             body.windows(marker.len())

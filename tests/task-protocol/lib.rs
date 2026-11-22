@@ -136,8 +136,8 @@ def call(arguments):
   return {{'task':{{'id':identity,'status':'in_progress','mainTaskId':'main','projectId':'','assignedTo':'one','assignmentId':'dispatch'}},'taskDirectory':str(task_root),'outputDirectory':str(task_root/'workspace'),'scratchDirectory':str(task_root/'workspace/.scratch')}}
  return {{'task':{{'id':identity,'status':'submitted','submissionId':'candidate'}},'notification':{{'eventId':'notice','status':'queued','recipient':'leader'}}}}
 async def notify(event,native,action):
- assert native in ['$source-1','$source-2'], 'NativePhase HTTP accepts raw Matrix event IDs only'
- return {{'active':True}}
+ assert native == '$handoff', 'Execution assignments must go directly to Task begin'
+ return {{'active':True,'pending_task_ids':['main']}}
 def get(_): return {{'deliveries':[{{'eventId':'delivered-own','status':'completed','roomId':'!room:test','taskId':'completed-main','reportMessageId':'$report','report':'Own delivered result 9e27','artifacts':[]}}]}}
 try: print(json.dumps(module.invoke(request,call=call,get_json=get,notify=notify)))
 except Exception as error:
@@ -200,6 +200,22 @@ except Exception as error:
             .unwrap();
         }
         tokio::join!(run(1, root.path()), run(2, root.path()));
+        std::env::set_var("AGENTTEAMS_AGENT_ROLE", "team_leader");
+        native::register(
+            "$handoff",
+            json!({"teamharness_coordination":{"id":"00000000000000000000000000000003","kind":"handoff"}}),
+        );
+        let handoff = ChannelMessage {
+            id: "$handoff".into(),
+            reply_target: "!room:test".into(),
+            sender: "@manager:test".into(),
+        };
+        native::scope(&handoff, "leader-session", async {
+            assert!(!native::allowed_tool("shell"));
+        })
+        .await
+        .unwrap();
+
         std::env::set_var("AGENTTEAMS_AGENT_ROLE", "manager");
         let msg = ChannelMessage {
             id: "$first".into(),

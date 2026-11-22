@@ -112,7 +112,13 @@ pub(crate) async fn scope<F: Future>(
         .unwrap_or_default();
     if let Some(meta) = meta.filter(|meta| meta.get("teamharness_coordination").is_some()) {
         let mut event = meta["teamharness_coordination"].clone();
-        if let Some(id) = event["id"].as_str() {
+        if matches!(
+            event["kind"].as_str(),
+            Some("handoff" | "task_submitted" | "main_task_ready")
+        ) {
+            let id = event["id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Verified Task coordination identity required"))?;
             let admitted = bridge(json!({"operation":"admit_event","eventId":id,
                 "nativeEventId":msg.id,"action":"begin"}))
             .await?;
@@ -442,16 +448,21 @@ pub(crate) fn trace_fields() -> Vec<opentelemetry::KeyValue> {
             let context = turn.context.lock().unwrap();
             let mut fields = vec![
                 KeyValue::new("agentteams.runtime", "openhuman"),
-                KeyValue::new("agentteams.telemetry.schema", "at.worker.v1"),
+                KeyValue::new("agentteams.telemetry.schema", "1"),
                 KeyValue::new("agentteams.telemetry.capture_content", false),
                 KeyValue::new("agentteams.room.id", turn.room.clone()),
-                KeyValue::new("session.id", turn.session.clone()),
-                KeyValue::new("turn.id", turn.turn_id.clone()),
+                KeyValue::new("agentteams.session.id", turn.session.clone()),
+                KeyValue::new("agentteams.turn.id", turn.turn_id.clone()),
                 KeyValue::new(
                     "agentteams.worker.name",
                     std::env::var("AGENTTEAMS_WORKER_NAME").unwrap_or_else(|_| "unknown".into()),
                 ),
             ];
+            if let Ok(team) = std::env::var("AGENTTEAMS_TEAM_NAME") {
+                if !team.is_empty() {
+                    fields.push(KeyValue::new("agentteams.team.id", team));
+                }
+            }
             if let Some(event) = context["sourceEvent"]
                 .as_str()
                 .filter(|id| id.starts_with('$'))

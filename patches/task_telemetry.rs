@@ -65,12 +65,54 @@ impl Boundary {
     }
 }
 
+fn correlation(observation_type: &str) -> Vec<KeyValue> {
+    let fields = crate::openhuman::channels::task_protocol::trace_fields();
+    let mut tags = vec!["agentteams".to_owned(), "openhuman".to_owned()];
+    let mut attributes = vec![KeyValue::new(
+        "langfuse.observation.type",
+        observation_type.to_owned(),
+    )];
+    for field in &fields {
+        let key = field.key.as_str();
+        let value = field.value.clone();
+        attributes.push(KeyValue::new(
+            format!("langfuse.observation.metadata.{key}"),
+            value.clone(),
+        ));
+        attributes.push(KeyValue::new(
+            format!("langfuse.trace.metadata.{key}"),
+            value.clone(),
+        ));
+        match key {
+            "agentteams.turn.id" => tags.push("worker-turn".to_owned()),
+            "agentteams.worker.name" => attributes.push(KeyValue::new("langfuse.user.id", value)),
+            "agentteams.session.id" => attributes.push(KeyValue::new("langfuse.session.id", value)),
+            "agentteams.task.id" => tags.push(format!("task:{value}")),
+            "agentteams.team.id" => tags.push(format!("team:{value}")),
+            "agentteams.room.id" => tags.push(format!("room:{value}")),
+            _ => {}
+        }
+    }
+    attributes.push(KeyValue::new(
+        "langfuse.trace.tags",
+        opentelemetry::Value::Array(opentelemetry::Array::String(
+            tags.into_iter().map(Into::into).collect(),
+        )),
+    ));
+    attributes.extend(fields);
+    attributes
+}
+
 pub(crate) fn boundary(name: &str, attributes: Vec<KeyValue>) -> Boundary {
     let Some(provider) = PROVIDER.as_ref() else {
         return Boundary(None);
     };
     let mut attributes = attributes;
-    attributes.extend(crate::openhuman::channels::task_protocol::trace_fields());
+    attributes.extend(correlation(match name {
+        "gen_ai.chat" => "generation",
+        "tool.execute" => "tool",
+        _ => "span",
+    }));
     let parent = PARENT.try_with(Clone::clone).unwrap_or_default();
     let span = provider
         .tracer("agentteams.openhuman.native")
@@ -88,7 +130,7 @@ pub(crate) async fn turn<F: Future>(future: F) -> F::Output {
     let span = provider
         .tracer("agentteams.openhuman.native")
         .span_builder("agent.turn")
-        .with_attributes(crate::openhuman::channels::task_protocol::trace_fields())
+        .with_attributes(correlation("agent"))
         .start_with_context(
             &provider.tracer("agentteams.openhuman.native"),
             &crate::openhuman::channels::task_protocol::trace_parent(),
