@@ -64,6 +64,7 @@ jobs:
           trap 'docker rm "$container" >/dev/null' EXIT
           docker cp "$container:/usr/local/bin/openhuman-core" artifact/openhuman-core
           git rev-parse HEAD > artifact/harness.sha
+          printf '%s\n' afc50da7b1ac0f34be68c292e448d384156a8b44 > artifact/runtime.sha
           git -C agentteams rev-parse HEAD > artifact/core.sha
           cp versions.env artifact/
           docker run --rm --entrypoint sh openhuman-native-artifact:local -c 'git -C /build/openhuman-src rev-parse HEAD; rustc -Vv; dpkg-query -W; ldd /usr/local/bin/openhuman-core' > artifact/build-dependencies.txt
