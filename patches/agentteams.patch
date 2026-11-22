@@ -3285,3 +3285,14 @@ index b597f86..e5453cb 100644
 +    config.local_ai.api_key = Some("  ".into());
 +    assert!(!caller_owned_local_openai_is_configured(&config, "local-openai:fixture"));
 +}
+diff --git a/src/openhuman/inference/schemas.rs b/src/openhuman/inference/schemas.rs
+--- a/src/openhuman/inference/schemas.rs
++++ b/src/openhuman/inference/schemas.rs
+@@ -701,6 +701,7 @@
+             Some(_) => return Err("invalid params: base_url must be a string or null".to_string()),
+         };
+         let patch = config_rpc::LocalAiSettingsPatch {
++            api_key: None,
+             runtime_enabled: update.runtime_enabled,
+             opt_in_confirmed: update.opt_in_confirmed,
+             provider: update.provider,
