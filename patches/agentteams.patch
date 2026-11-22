@@ -3128,3 +3128,160 @@ index 0000000..caa5072
 +    .unwrap();
 +    assert!(provider.supports_native_tools());
 +}
+diff --git a/src/openhuman/config/ops.rs b/src/openhuman/config/ops.rs
+index 71be7b9..469f1a2 100644
+--- a/src/openhuman/config/ops.rs
++++ b/src/openhuman/config/ops.rs
+@@ -458,6 +458,7 @@ pub struct LocalAiSettingsPatch {
+     /// behaviour without needing to apply a preset first.
+     pub opt_in_confirmed: Option<bool>,
+     pub provider: Option<String>,
++    pub api_key: Option<String>,
+     pub base_url: Option<Option<String>>,
+     pub model_id: Option<String>,
+     pub chat_model_id: Option<String>,
+@@ -1653,6 +1654,10 @@ pub async fn apply_local_ai_settings(
+     if let Some(v) = update.opt_in_confirmed {
+         config.local_ai.opt_in_confirmed = v;
+     }
++    if let Some(key) = update.api_key {
++        let key = key.trim();
++        config.local_ai.api_key = (!key.is_empty()).then(|| key.to_owned());
++    }
+     if let Some(provider) = update.provider {
+         config.local_ai.provider =
+             crate::openhuman::inference::local::provider::normalize_provider(&provider);
+diff --git a/src/openhuman/config/ops_tests.rs b/src/openhuman/config/ops_tests.rs
+index 03f1496..222aaa2 100644
+--- a/src/openhuman/config/ops_tests.rs
++++ b/src/openhuman/config/ops_tests.rs
+@@ -857,6 +857,7 @@ async fn apply_local_ai_settings_updates_lm_studio_provider_fields() {
+     cfg.local_ai.chat_model_id = "old-chat".into();
+ 
+     let patch = LocalAiSettingsPatch {
++        api_key: None,
+         runtime_enabled: Some(true),
+         opt_in_confirmed: Some(true),
+         provider: Some("lm-studio".into()),
+@@ -1782,3 +1783,19 @@ async fn apply_agent_paths_env_set_reports_source_env() {
+         std::env::remove_var("OPENHUMAN_ACTION_DIR");
+     }
+ }
++
++#[tokio::test]
++async fn local_ai_caller_owned_key_is_saved_preserved_and_cleared() {
++    let tmp = tempdir().unwrap();
++    let mut cfg = tmp_config(&tmp);
++    for key in [Some(" synthetic-local-key "), None, Some(" ")] {
++        apply_local_ai_settings(&mut cfg, LocalAiSettingsPatch {
++            api_key: key.map(str::to_owned),
++            ..LocalAiSettingsPatch::default()
++        }).await.expect("save local endpoint authentication");
++        let saved: toml::Value = toml::from_str(&std::fs::read_to_string(&cfg.config_path).unwrap()).unwrap();
++        let expected = if key == Some(" ") { None } else { Some("synthetic-local-key") };
++        assert_eq!(cfg.local_ai.api_key.as_deref(), expected);
++        assert_eq!(saved["local_ai"].get("api_key").and_then(toml::Value::as_str), expected);
++    }
++}
+diff --git a/src/openhuman/config/schemas.rs b/src/openhuman/config/schemas.rs
+index 908cbee..167d591 100644
+--- a/src/openhuman/config/schemas.rs
++++ b/src/openhuman/config/schemas.rs
+@@ -142,6 +142,7 @@ struct LocalAiSettingsUpdate {
+     /// having to also apply a tier preset.
+     opt_in_confirmed: Option<bool>,
+     provider: Option<String>,
++    api_key: Option<String>,
+     #[serde(default, deserialize_with = "deserialize_present_json")]
+     base_url: Option<Value>,
+     model_id: Option<String>,
+@@ -727,6 +728,7 @@ pub fn schemas(function: &str) -> ControllerSchema {
+             description:
+                 "Update the local AI runtime master switch and per-feature usage flags.",
+             inputs: vec![
++                optional_string("api_key", "Bearer key for your caller-owned local OpenAI-compatible endpoint; empty clears it."),
+                 optional_bool(
+                     "runtime_enabled",
+                     "Master switch — when false, no subsystem uses the selected local AI runtime.",
+@@ -1515,6 +1517,7 @@ fn handle_update_local_ai_settings(params: Map<String, Value>) -> ControllerFutu
+             runtime_enabled: update.runtime_enabled,
+             opt_in_confirmed: update.opt_in_confirmed,
+             provider: update.provider,
++            api_key: update.api_key,
+             base_url,
+             model_id: update.model_id,
+             chat_model_id: update.chat_model_id,
+diff --git a/src/openhuman/inference/provider/factory.rs b/src/openhuman/inference/provider/factory.rs
+index c6eb256..46f43ab 100644
+--- a/src/openhuman/inference/provider/factory.rs
++++ b/src/openhuman/inference/provider/factory.rs
+@@ -441,10 +441,11 @@ pub fn create_chat_provider_from_string(
+     // Gate is skipped under #[cfg(test)] so existing unit tests that
+     // create custom providers against a default Config continue to
+     // pass.  The verify_session_active function itself is tested
+-    // explicitly with tempdir-backed auth profiles.
++    // explicitly with tempdir-backed auth profiles. Configured caller-owned
++    // local-openai endpoints use their independent endpoint authentication.
+     #[cfg(not(test))]
+     {
+-        verify_session_active(config)?;
++        verify_provider_session(config, p)?;
+     }
+ 
+     if let Some(model_with_temp) =
+@@ -732,6 +733,26 @@ fn make_openhuman_backend(config: &Config) -> anyhow::Result<(Box<dyn Provider>,
+     Ok((p, model))
+ }
+ 
++/// Backport of upstream #6249's caller-owned runtime authentication distinction.
++/// Limit this hosted integration to explicitly configured local-openai gateways.
++fn caller_owned_local_openai_is_configured(config: &Config, provider: &str) -> bool {
++    provider.trim().starts_with(LOCAL_OPENAI_PROVIDER_PREFIX)
++        && config.local_ai.runtime_enabled
++        && config.local_ai.opt_in_confirmed
++        && config
++            .local_ai
++            .api_key
++            .as_deref()
++            .is_some_and(|key| !key.trim().is_empty())
++}
++
++fn verify_provider_session(config: &Config, provider: &str) -> anyhow::Result<()> {
++    if caller_owned_local_openai_is_configured(config, provider) {
++        return Ok(());
++    }
++    verify_session_active(config)
++}
++
+ /// Verify the user has an active OpenHuman backend session.
+ ///
+ /// Without this check, an unregistered user can configure every workload
+diff --git a/src/openhuman/inference/provider/factory_tests.rs b/src/openhuman/inference/provider/factory_tests.rs
+index b597f86..e5453cb 100644
+--- a/src/openhuman/inference/provider/factory_tests.rs
++++ b/src/openhuman/inference/provider/factory_tests.rs
+@@ -1836,3 +1836,24 @@ fn resolve_model_for_hint_handles_unknown_hint_passthrough() {
+     let result = resolve_model_for_hint("hint:unknown_tier", &config);
+     assert_eq!(result, "hint:unknown_tier");
+ }
++
++#[test]
++fn hosted_local_openai_requires_explicit_consent_and_own_authentication() {
++    let mut config = Config::default();
++    assert!(!caller_owned_local_openai_is_configured(&config, "local-openai:fixture"));
++    config.local_ai.runtime_enabled = true;
++    config.local_ai.opt_in_confirmed = true;
++    config.local_ai.api_key = Some("synthetic-local-key".into());
++    assert!(caller_owned_local_openai_is_configured(&config, "local-openai:fixture"));
++    for provider in ["openai:fixture", "openhuman", "ollama:fixture", "local-openai-spoof:fixture"] {
++        assert!(!caller_owned_local_openai_is_configured(&config, provider));
++    }
++    config.local_ai.runtime_enabled = false;
++    assert!(!caller_owned_local_openai_is_configured(&config, "local-openai:fixture"));
++    config.local_ai.runtime_enabled = true;
++    config.local_ai.opt_in_confirmed = false;
++    assert!(!caller_owned_local_openai_is_configured(&config, "local-openai:fixture"));
++    config.local_ai.opt_in_confirmed = true;
++    config.local_ai.api_key = Some("  ".into());
++    assert!(!caller_owned_local_openai_is_configured(&config, "local-openai:fixture"));
++}
