@@ -25,14 +25,19 @@ static WAKE: Notify = Notify::const_new();
 
 tokio::task_local! { pub(crate) static TASK_RUN: Arc<Run>; }
 
-pub(crate) async fn check_authority(for_tool: bool) -> anyhow::Result<()> {
+pub(crate) async fn check_authority(for_tool: bool) -> anyhow::Result<Value> {
     if let Ok(run) = TASK_RUN.try_with(Arc::clone) {
-        let current = run.current().await.map_err(anyhow::Error::msg)?;
+        let current = if run.message() {
+            run.current().await
+        } else {
+            rpc(json!({"action":"admit_tools","identity":run.identity})).await
+        }.map_err(anyhow::Error::msg)?;
         if for_tool && current["task"]["execution"]["state"] == "released" {
             anyhow::bail!("Task execution was released; only saved-result delivery is permitted");
         }
+        return Ok(current);
     }
-    Ok(())
+    Ok(Value::Null)
 }
 
 pub(crate) fn unexecuted_tool_frame(text: &str) -> bool {
@@ -781,15 +786,20 @@ pub(crate) async fn admit_message(
     Ok(())
 }
 
-pub(crate) async fn begin_message_tools(calls: Value) -> anyhow::Result<Option<String>> {
+pub(crate) async fn begin_message_tools(calls: Value, registration: Option<Value>) -> anyhow::Result<Option<String>> {
+    if let Some(registration) = registration {
+        let policy = rpc(json!({"action":"tool_policy","registration":registration})).await.map_err(anyhow::Error::msg)?;
+        if policy["mode"] == "delegate" {
+            check_authority(true).await?;
+            return Ok(None);
+        }
+    }
     let Ok(run) = TASK_RUN.try_with(Arc::clone) else {
         return Ok(None);
     };
-    if !run.message() {
-        return Ok(None);
-    }
+    let action = if run.message() { "matrix.message.begin_tools" } else { "begin_tools" };
     let op =
-        rpc(json!({"action":"matrix.message.begin_tools","identity":run.identity,"calls":calls}))
+        rpc(json!({"action":action,"identity":run.identity,"calls":calls}))
             .await
             .map_err(anyhow::Error::msg)?;
     Ok(Some(
@@ -808,7 +818,7 @@ pub(crate) fn abort_unconfirmed() {
 pub(crate) async fn finish_message_tools(op: Option<String>, results: Value) -> anyhow::Result<()> {
     if let Some(op) = op {
         let run = TASK_RUN.try_with(Arc::clone)?;
-        rpc(json!({"action":"matrix.message.finish_tools","identity":run.identity,"operation_id":op,"results":results})).await.map_err(anyhow::Error::msg)?;
+        rpc(json!({"action":if run.message() {"matrix.message.finish_tools"} else {"finish_tools"},"identity":run.identity,"operation_id":op,"results":results})).await.map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }
@@ -913,6 +923,12 @@ async fn scan(
             .and_then(|ids| ids.first())
             .cloned()
             .unwrap_or_else(|| format!("recovery:{}", uuid::Uuid::new_v4()));
+        if task.get("task_plan_id").and_then(Value::as_str).is_some() {
+            super::task_protocol::register(&id, json!({"teamharness_coordination": {
+                "kind":"task_assigned", "task_id":task["task_id"], "main_task_id":task["main_task_id"],
+                "project_id":task.get("project_id").cloned().unwrap_or(json!("")), "delivery_id":task["notifyTxn"]
+            }}));
+        }
         RUNS.lock().unwrap().insert(id.clone(), run.clone());
         let input = ChannelMessage {
             id: id.clone(),

@@ -91,6 +91,8 @@ COPY patches/session_receipts.rs /build/openhuman-src/src/openhuman/channels/ses
 COPY patches/task_coordination.rs /build/openhuman-src/src/openhuman/channels/task_coordination.rs
 COPY patches/task_recovery.rs /build/openhuman-src/src/openhuman/channels/task_recovery.rs
 COPY patches/worker_matrix.rs /build/openhuman-src/src/openhuman/channels/providers/matrix/worker_sync.rs
+COPY patches/task_protocol.rs /build/openhuman-src/src/openhuman/channels/task_protocol.rs
+COPY patches/task_telemetry.rs /build/openhuman-src/src/openhuman/channels/task_telemetry.rs
 COPY patches/agentteams.patch /tmp/agentteams.patch
 RUN git -C /build/openhuman-src apply /tmp/agentteams.patch
 

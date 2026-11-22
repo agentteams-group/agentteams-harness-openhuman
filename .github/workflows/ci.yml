@@ -23,6 +23,7 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      AT_SOURCE: ${{ github.workspace }}/agentteams
     steps:
       - uses: actions/checkout@v4
       - name: Read shared Core dependency
@@ -53,6 +54,7 @@ jobs:
           python3 -m pip install 'pytest>=8,<9' 'PyYAML>=6,<7'
           AT_SOURCE="$GITHUB_WORKSPACE/agentteams" python3 -m pytest -q tests
           cargo test --locked --manifest-path tests/session-receipts/Cargo.toml
+          cargo test --locked --manifest-path tests/task-protocol/Cargo.toml
           bash -n scripts/openhuman-worker-entrypoint.sh scripts/agt
       - name: Apply the packaged patches
         run: |
@@ -61,12 +63,19 @@ jobs:
           cp patches/task_recovery.rs native/src/openhuman/channels/task_recovery.rs
           mkdir -p native/src/openhuman/channels/providers/matrix
           cp patches/worker_matrix.rs native/src/openhuman/channels/providers/matrix/worker_sync.rs
+          cp patches/task_protocol.rs native/src/openhuman/channels/task_protocol.rs
+          cp patches/task_telemetry.rs native/src/openhuman/channels/task_telemetry.rs
+          sudo mkdir -p /opt/agentteams/scripts/lib
+          sudo cp agentteams/shared/lib/*.py /opt/agentteams/scripts/lib/
           git -C native apply "$GITHUB_WORKSPACE/patches/agentteams.patch"
       - name: Verify native Matrix controls and tool cleanup
         working-directory: native
         run: |
           cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery
-          cargo test --locked --lib --no-default-features --features channel-matrix agentteams_native_
+          cargo test --locked --lib --no-default-features --features channel-matrix agentteams_native_task_protocol_ -- --test-threads=1
+          cargo test --locked --lib --no-default-features --features channel-matrix agentteams_native_steer_
+          cargo test --locked --lib --no-default-features --features channel-matrix channels::task_recovery::tests
+          cargo test --locked --lib --no-default-features --features channel-matrix channels::session_receipts::tests
           cargo test --locked --lib --no-default-features --features channel-matrix channels::matrix_direct::tests
           cargo test --locked --lib --no-default-features --features channel-matrix approval::matrix::tests
 

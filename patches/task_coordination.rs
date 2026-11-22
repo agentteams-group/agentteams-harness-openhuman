@@ -9,7 +9,7 @@ use std::collections::HashSet;
 static ROOMS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 pub fn is_control_room(room: &str) -> bool { ROOMS.lock().unwrap().contains(room) }
 
-pub struct Notification { pub text: String, pub task_id: Option<String> }
+pub struct Notification { pub text: String, pub task_id: Option<String>, pub meta: Value }
 
 pub async fn prepare(content: &Value, room: &str, sender: &str, own: &str) -> Option<Notification> {
     let mut child = tokio::process::Command::new("python3")
@@ -29,5 +29,5 @@ pub async fn prepare(content: &Value, room: &str, sender: &str, own: &str) -> Op
     let task_id = if event["kind"] == "task_assigned" {
         Some(event["task_id"].as_str()?.to_owned())
     } else { None };
-    Some(Notification { text, task_id })
+    Some(Notification { text, task_id, meta: packet["meta"].clone() })
 }

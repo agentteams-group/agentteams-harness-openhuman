@@ -11,7 +11,7 @@ index e24e116..634b932 100644
   "objc2 0.6.4",
   "objc2-contacts",
 diff --git a/Cargo.toml b/Cargo.toml
-index f98c8df..83fa806 100644
+index f98c8df..3d9d286 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -86,6 +86,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -22,6 +22,15 @@ index f98c8df..83fa806 100644
  # tokio-tungstenite is declared per-target below so the TLS backend
  # (native-tls on Windows, rustls on macOS / Linux) matches the reqwest
  # backend selected at each TLS call site.
+@@ -147,7 +148,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
+ tower = { version = "0.5", default-features = false }
+ opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client", "reqwest-rustls-webpki-roots"] }
++opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"] }
+ sentry = { version = "0.47.0", default-features = false, features = ["backtrace", "contexts", "panic", "tracing", "debug-images", "reqwest", "rustls"] }
+ tokio-stream = { version = "0.1.18", features = ["full"] }
+ url = "2"
 diff --git a/src/lib.rs b/src/lib.rs
 index 166b5c4..4ea3dac 100644
 --- a/src/lib.rs
@@ -35,6 +44,283 @@ index 166b5c4..4ea3dac 100644
  pub mod api;
  pub mod core;
  pub mod openhuman;
+diff --git a/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs b/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs
+new file mode 100644
+index 0000000..8d6fbcc
+--- /dev/null
++++ b/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs
+@@ -0,0 +1,271 @@
++//! Actual v0.57 engine, public Task bridge and native RunQueue. Synthetic API/provider only.
++use super::*;
++use crate::openhuman::agent::harness::run_queue::{QueueMode, QueuedMessage, RunQueue};
++use crate::openhuman::channels::{task_protocol as native, task_telemetry, traits::ChannelMessage};
++use crate::openhuman::inference::provider::{ChatRequest, ChatResponse, Provider, UsageInfo};
++use crate::openhuman::tools::implementations::{FileReadTool, FileWriteTool, ShellTool};
++use crate::openhuman::tools::{Tool, ToolResult};
++use async_trait::async_trait;
++use serde_json::json;
++use std::io::{Read, Write};
++use std::sync::{
++    atomic::{AtomicBool, AtomicUsize, Ordering},
++    Arc, Mutex,
++};
++use tokio::sync::Notify;
++
++const PRIVATE: &str = "OWN_PRIVATE_TASK_INPUT_a487";
++struct Model(AtomicUsize);
++#[async_trait]
++impl Provider for Model {
++    async fn chat_with_system(
++        &self,
++        _: Option<&str>,
++        _: &str,
++        _: &str,
++        _: f64,
++    ) -> anyhow::Result<String> {
++        unreachable!()
++    }
++    async fn chat(
++        &self,
++        request: ChatRequest<'_>,
++        _: &str,
++        _: f64,
++    ) -> anyhow::Result<ChatResponse> {
++        let text = match self.0.fetch_add(1, Ordering::SeqCst) {
++            0 => {
++                assert!(request
++                    .messages
++                    .iter()
++                    .any(|row| row.content.contains(PRIVATE)));
++                "<tool_call>{\"name\":\"wait_for_supplements\",\"arguments\":{}}</tool_call>"
++            }
++            1 => {
++                let contents = request
++                    .messages
++                    .iter()
++                    .map(|row| row.content.as_str())
++                    .collect::<Vec<_>>()
++                    .join("\n");
++                assert!(contents.contains("native tool finished"));
++                assert!(
++                    contents.find("first supplement").unwrap()
++                        < contents.find("second supplement").unwrap()
++                );
++                "<tool_call>{\"name\":\"task\",\"arguments\":{\"action\":\"submit\",\"taskId\":\"native-exec\",\"summary\":\"OWN_PRIVATE_TASK_INPUT_a487\"}}</tool_call>"
++            }
++            _ => panic!(
++                "Public terminal receipt must end the native phase without another model request"
++            ),
++        };
++        Ok(ChatResponse {
++            text: Some(text.into()),
++            usage: Some(UsageInfo {
++                input_tokens: 11,
++                output_tokens: 3,
++                cached_input_tokens: 2,
++                ..UsageInfo::default()
++            }),
++            ..ChatResponse::default()
++        })
++    }
++}
++struct WaitTool {
++    started: Arc<Notify>,
++    release: Arc<Notify>,
++}
++#[async_trait]
++impl Tool for WaitTool {
++    fn name(&self) -> &str {
++        "wait_for_supplements"
++    }
++    fn description(&self) -> &str {
++        "Wait inside the actual native executor"
++    }
++    fn parameters_schema(&self) -> serde_json::Value {
++        json!({"type":"object"})
++    }
++    async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
++        self.started.notify_one();
++        self.release.notified().await;
++        Ok(ToolResult::success("native tool finished"))
++    }
++}
++
++#[tokio::test]
++async fn agentteams_native_task_protocol_and_steering_keep_receipts_io_budget_and_traces() {
++    let root = tempfile::tempdir().unwrap();
++    let plugin = root.path().join("plugin/mcp/common");
++    std::fs::create_dir_all(&plugin).unwrap();
++    let script = r#"import importlib.util,json,os,sys
++from pathlib import Path
++base=Path(os.environ['AT_SOURCE'])/'plugins/teamharness/mcp/common'
++sys.path.insert(0,str(base))
++spec=importlib.util.spec_from_file_location('actual_public_native',base/'task_native.py')
++module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
++request=json.load(sys.stdin)
++def call(arguments):
++ root=Path(os.environ['AGENTTEAMS_WORKER_HOME'])/'tasks/native-exec'
++ if arguments['action']=='begin':
++  (root/'workspace/.scratch').mkdir(parents=True,exist_ok=True)
++  return {'task':{'id':'native-exec','status':'in_progress','mainTaskId':'main','assignedTo':'one','assignmentId':'dispatch'},'taskDirectory':str(root),'outputDirectory':str(root/'workspace'),'scratchDirectory':str(root/'workspace/.scratch')}
++ assert arguments['action']=='submit' and arguments['taskId']=='native-exec'
++ return {'task':{'id':'native-exec','status':'submitted','submissionId':'candidate'},'notification':{'eventId':'notice','status':'queued','recipient':'leader'}}
++async def notify(event,native,action):
++ assert native=='$native-source', 'NativePhase requires the raw Matrix event ID'
++ return {'active':True}
++print(json.dumps(module.invoke(request,call=call,notify=notify)))
++"#;
++    std::fs::write(plugin.join("task_native.py"), script).unwrap();
++    std::env::set_var("AGENTTEAMS_PLUGIN_DIR", root.path().join("plugin"));
++    std::env::set_var("AGENTTEAMS_WORKER_HOME", root.path());
++    std::env::set_var("AGENTTEAMS_AGENT_ROLE", "worker");
++    std::env::remove_var("AGENTTEAMS_CONTROLLER_URL");
++    let metadata = root.path().join(".agentteams");
++    std::fs::create_dir_all(&metadata).unwrap();
++    let mut schema = std::process::Command::new("python3")
++        .arg(plugin.join("task_native.py"))
++        .stdin(std::process::Stdio::piped())
++        .stdout(std::process::Stdio::piped())
++        .spawn()
++        .unwrap();
++    schema
++        .stdin
++        .take()
++        .unwrap()
++        .write_all(br#"{"operation":"schema","role":"worker"}"#)
++        .unwrap();
++    let result = schema.wait_with_output().unwrap();
++    assert!(result.status.success());
++    std::fs::write(metadata.join("native-task-schema.json"), result.stdout).unwrap();
++    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++    listener.set_nonblocking(true).unwrap();
++    std::env::set_var(
++        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
++        format!("http://{}/v1/traces", listener.local_addr().unwrap()),
++    );
++    std::env::set_var("AGENTTEAMS_OTEL_ENABLED", "true");
++    let stopped = Arc::new(AtomicBool::new(false));
++    let stop = stopped.clone();
++    let bodies = Arc::new(Mutex::new(Vec::new()));
++    let collected = bodies.clone();
++    let collector = std::thread::spawn(move || {
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
++        while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
++            let (mut stream, _) = match listener.accept() {
++                Ok(v) => v,
++                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
++                    std::thread::sleep(std::time::Duration::from_millis(10));
++                    continue;
++                }
++                Err(e) => panic!("{e}"),
++            };
++            stream
++                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
++                .unwrap();
++            let mut data = vec![];
++            loop {
++                let mut buffer = [0; 4096];
++                let count = stream.read(&mut buffer).unwrap();
++                assert!(count > 0);
++                data.extend_from_slice(&buffer[..count]);
++                if let Some(offset) = data.windows(4).position(|v| v == b"\r\n\r\n") {
++                    let headers = String::from_utf8_lossy(&data[..offset]);
++                    let length: usize = headers
++                        .lines()
++                        .find_map(|line| {
++                            line.to_lowercase()
++                                .strip_prefix("content-length:")
++                                .map(|v| v.trim().parse().unwrap())
++                        })
++                        .unwrap();
++                    if data.len() >= offset + 4 + length {
++                        collected
++                            .lock()
++                            .unwrap()
++                            .extend_from_slice(&data[offset + 4..offset + 4 + length]);
++                        break;
++                    }
++                }
++            }
++            stream
++                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
++                .unwrap();
++        }
++    });
++    native::register(
++        "$native-source",
++        json!({"teamharness_coordination":{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"task_assigned","task_id":"native-exec","main_task_id":"main","project_id":"","delivery_id":"dispatch"},"otel_carrier":{"traceparent":"00-123456789012345678901234567890ab-12345678901234ab-01"}}),
++    );
++    let message = ChannelMessage {
++        id: "$native-source".into(),
++        reply_target: "!native:test".into(),
++        sender: "@leader:test".into(),
++        content: PRIVATE.into(),
++        channel: "matrix".into(),
++        timestamp: 1,
++        thread_ts: None,
++    };
++    let model = Model(AtomicUsize::new(0));
++    let finished=native::scope(&message,"opaque-native-session",async {
++        let policy=Arc::new(crate::openhuman::security::SecurityPolicy{autonomy:crate::openhuman::security::AutonomyLevel::Full,workspace_dir:root.path().join("private"),action_dir:root.path().join("native-actions"),max_actions_per_hour:3,..Default::default()});
++        std::fs::create_dir_all(&policy.workspace_dir).unwrap();std::fs::create_dir_all(&policy.action_dir).unwrap();
++        let output=native::output_directory().unwrap();
++        let write=FileWriteTool::new(policy.clone());let read=FileReadTool::new(policy.clone());
++        assert!(!write.execute(json!({"path":"answer.txt","content":PRIVATE})).await.unwrap().is_error);
++        assert_eq!(std::fs::read_to_string(output.join("answer.txt")).unwrap(),PRIVATE);
++        assert!(!read.execute(json!({"path":"answer.txt"})).await.unwrap().is_error);
++        assert!(write.execute(json!({"path":"../outside.txt","content":"bad"})).await.map(|r|r.is_error).unwrap_or(true));
++        let shell=ShellTool::new(policy.clone(),Arc::new(crate::openhuman::agent::host_runtime::NativeRuntime::new()),crate::openhuman::security::AuditLogger::disabled());
++        let pwd=shell.execute(json!({"command":"pwd"})).await.unwrap();assert!(!pwd.is_error);assert_eq!(pwd.output().trim(),output.to_str().unwrap());
++        assert!(shell.execute(json!({"command":"pwd"})).await.unwrap().is_error);
++        assert_eq!(policy.tracker.count(),3,"Task-scoped validators must never reset the native budget");
++        assert_eq!(policy.workspace_dir,root.path().join("private"));assert_eq!(policy.action_dir,root.path().join("native-actions"));
++        let queue=RunQueue::new();let started=Arc::new(Notify::new());let release=Arc::new(Notify::new());
++        let tools:Vec<Box<dyn Tool>>=vec![Box::new(WaitTool{started:started.clone(),release:release.clone()}),Box::new(native::TaskTool)];
++        let mut source=RegistryToolSource::new(&tools,&[],None,&crate::openhuman::tools::policy::DefaultToolPolicy,None);
++        let mut history=vec![crate::openhuman::inference::provider::ChatMessage::user(PRIVATE)];
++        let progress=TurnProgress::new(None);let mut observer=NullObserver;
++        let multimodal=crate::openhuman::config::MultimodalConfig::default();let files=crate::openhuman::config::MultimodalFileConfig::default();
++        let run=run_turn_engine(&model,&mut history,&mut source,&progress,&mut observer,&ErrorCheckpoint,&DefaultParser,"fixture","fixture-model",0.0,true,&multimodal,&files,4,None,&[],Some(queue.clone()));
++        tokio::pin!(run);
++        tokio::select!{_ = started.notified()=>{},_ = &mut run=>panic!("Native wait tool did not start")}
++        for text in ["first supplement","second supplement"]{
++            queue.push(QueuedMessage{text:text.into(),mode:QueueMode::Steer,client_id:text.into(),thread_id:"native-direct".into(),queued_at_ms:0,model_override:None,temperature:None,profile_id:None,locale:None}).await;
++        }
++        release.notify_one();let result=run.await.unwrap();assert!(result.text.contains("Task system receipt"));assert!(native::completed().is_some());assert_eq!(queue.status().await.total,0);
++        result.text
++    }).await.unwrap();
++    assert!(finished.contains("Task system receipt"));
++    assert_eq!(model.0.load(Ordering::SeqCst), 2);
++    tokio::task::spawn_blocking(task_telemetry::flush)
++        .await
++        .unwrap();
++    stopped.store(true, Ordering::SeqCst);
++    collector.join().unwrap();
++    let body = bodies.lock().unwrap();
++    let count = |needle: &[u8]| body.windows(needle.len()).filter(|v| *v == needle).count();
++    assert_eq!(count(b"gen_ai.chat"), 2);
++    assert_eq!(count(b"tool.execute"), 2);
++    assert_eq!(count(PRIVATE.as_bytes()), 0);
++    for marker in [
++        "agentteams.task.id",
++        "native-exec",
++        "gen_ai.usage.input_tokens",
++        "gen_ai.usage.output_tokens",
++        "$native-source",
++        "agentteams.coordination.id",
++    ] {
++        assert!(count(marker.as_bytes()) > 0, "missing {marker}");
++    }
++    let trace = [
++        0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90,
++        0xab,
++    ];
++    assert!(count(&trace) >= 5);
++    if let Ok(path) = std::env::var("AGENTTEAMS_NATIVE_TRACE_EVIDENCE") {
++        std::fs::write(path, &*body).unwrap();
++    }
++    println!("actual SDK engine: public Task + native steering + scoped IO + original budget + terminal receipt; 2 model calls, 2 tool calls, trusted OTLP carrier, no content; synthetic provider/API, not certification");
++}
 diff --git a/src/openhuman/agent/harness/engine/agentteams_steering_tests.rs b/src/openhuman/agent/harness/engine/agentteams_steering_tests.rs
 new file mode 100644
 index 0000000..5384b49
@@ -186,22 +472,44 @@ index 0000000..5384b49
 +    assert_eq!(queue.status().await.total, 0);
 +}
 diff --git a/src/openhuman/agent/harness/engine/core.rs b/src/openhuman/agent/harness/engine/core.rs
-index f130ce3..4bc596f 100644
+index f130ce3..9f24084 100644
 --- a/src/openhuman/agent/harness/engine/core.rs
 +++ b/src/openhuman/agent/harness/engine/core.rs
-@@ -117,6 +117,11 @@ pub(crate) async fn run_turn_engine(
+@@ -92,6 +92,9 @@ pub(crate) async fn run_turn_engine(
+     early_exit_tool_names: &[&str],
+     run_queue: Option<Arc<RunQueue>>,
+ ) -> Result<TurnEngineOutcome> {
++    #[cfg(feature = "channel-matrix")]
++    crate::openhuman::channels::task_protocol::prepare(history).await?;
++
+     let mut context_guard = context_window_for_model(model)
+         .map(ContextGuard::with_context_window)
+         .unwrap_or_else(ContextGuard::new);
+@@ -117,6 +120,23 @@ pub(crate) async fn run_turn_engine(
      let mut repeat_guard = RepeatOutputGuard::new();
      let mut halt_reason: Option<String> = None;
      for iteration in 0..max_iterations {
 +        #[cfg(feature = "channel-matrix")]
 +        {
-+            crate::openhuman::channels::task_recovery::check_authority(false).await?;
++            crate::openhuman::channels::task_protocol::attach_pending(history).await?;
++            if let Some(result) = crate::openhuman::channels::task_protocol::completed() {
++                history.push(ChatMessage::assistant(result.clone()));
++                crate::openhuman::channels::task_recovery::checkpoint(history).await?;
++                progress.turn_completed(iteration as u32).await;
++                return Ok(TurnEngineOutcome {
++                    text: result,
++                    iterations: iteration as u32,
++                    cost: turn_cost,
++                    hit_cap: false,
++                    early_exit_tool: None,
++                });
++            }
 +            crate::openhuman::channels::task_recovery::attach_pending(history).await?;
 +        }
          progress
              .iteration_started((iteration + 1) as u32, max_iterations as u32)
              .await;
-@@ -218,6 +223,13 @@ pub(crate) async fn run_turn_engine(
+@@ -218,6 +238,13 @@ pub(crate) async fn run_turn_engine(
                      );
                      let steer_content = format!("[User steering message]: {}", s.text);
                      history.push(ChatMessage::user(steer_content));
@@ -215,7 +523,56 @@ index f130ce3..4bc596f 100644
                      crate::core::event_bus::publish_global(
                          crate::core::event_bus::DomainEvent::RunQueueMessageDelivered {
                              thread_id: s.thread_id.clone(),
-@@ -429,6 +441,12 @@ pub(crate) async fn run_turn_engine(
+@@ -246,6 +273,11 @@ pub(crate) async fn run_turn_engine(
+             }
+         }
+ 
++        #[cfg(feature = "channel-matrix")]
++        {
++            let owned = crate::openhuman::channels::task_recovery::check_authority(false).await?;
++            crate::openhuman::channels::task_protocol::admit(history, &owned).await?;
++        }
+         tracing::debug!(iteration, "[agent_loop] sending LLM request");
+         let image_marker_count = multimodal::count_image_markers(history);
+         if image_marker_count > 0 && !provider.supports_vision() {
+@@ -313,6 +345,14 @@ pub(crate) async fn run_turn_engine(
+         // forwarder exits cleanly.
+         let (delta_tx_opt, delta_forwarder) = progress.make_stream_sink((iteration + 1) as u32);
+ 
++        #[cfg(feature = "channel-matrix")]
++        let native_model = crate::openhuman::channels::task_telemetry::boundary(
++            "gen_ai.chat",
++            vec![
++                opentelemetry::KeyValue::new("gen_ai.request.model", model.to_owned()),
++                opentelemetry::KeyValue::new("langfuse.observation.type", "generation"),
++            ],
++        );
+         let chat_result = provider
+             .chat(
+                 ChatRequest {
+@@ -325,6 +365,21 @@ pub(crate) async fn run_turn_engine(
+             )
+             .await;
+ 
++        #[cfg(feature = "channel-matrix")]
++        native_model.finish(
++            chat_result.is_ok(),
++            chat_result
++                .as_ref()
++                .ok()
++                .and_then(|response| response.usage.as_ref())
++                .map(|usage| {
++                    (
++                        usage.input_tokens,
++                        usage.output_tokens,
++                        usage.cached_input_tokens,
++                    )
++                }),
++        );
+         drop(delta_tx_opt);
+         if let Some(handle) = delta_forwarder {
+             let _ = handle.await;
+@@ -429,6 +484,12 @@ pub(crate) async fn run_turn_engine(
          };
  
          if tool_calls.is_empty() {
@@ -228,7 +585,7 @@ index f130ce3..4bc596f 100644
              tracing::debug!(
                  iteration,
                  "[agent_loop] no tool calls — returning final response"
-@@ -474,6 +492,8 @@ pub(crate) async fn run_turn_engine(
+@@ -474,6 +535,8 @@ pub(crate) async fn run_turn_engine(
                  }
              }
              history.push(ChatMessage::assistant(response_text.clone()));
@@ -237,16 +594,21 @@ index f130ce3..4bc596f 100644
              observer
                  .on_assistant(
                      &final_out,
-@@ -572,6 +592,8 @@ pub(crate) async fn run_turn_engine(
+@@ -572,6 +635,13 @@ pub(crate) async fn run_turn_engine(
                  .unwrap_or_else(|| format!("loop-{iteration}-{call_idx}-{}", call.name));
  
              // Full per-call lifecycle is owned by the ToolSource.
 +            #[cfg(feature = "channel-matrix")]
-+            crate::openhuman::channels::task_recovery::check_authority(true).await?;
++            {
++                crate::openhuman::channels::task_protocol::attach_pending(history).await?;
++                let owned =
++                    crate::openhuman::channels::task_recovery::check_authority(true).await?;
++                crate::openhuman::channels::task_protocol::admit(history, &owned).await?;
++            }
              let outcome = tools
                  .execute_call(call, iteration, progress, &progress_call_id)
                  .await;
-@@ -661,6 +683,8 @@ pub(crate) async fn run_turn_engine(
+@@ -661,6 +731,8 @@ pub(crate) async fn run_turn_engine(
          }
  
          observer.after_iteration(history, iteration);
@@ -256,29 +618,62 @@ index f130ce3..4bc596f 100644
          // Early-exit for ask_user_clarification: history already has the
          // tool call + result appended, observer persisted the transcript.
 diff --git a/src/openhuman/agent/harness/engine/mod.rs b/src/openhuman/agent/harness/engine/mod.rs
-index df22ec0..b6f88aa 100644
+index df22ec0..6f3f2e9 100644
 --- a/src/openhuman/agent/harness/engine/mod.rs
 +++ b/src/openhuman/agent/harness/engine/mod.rs
-@@ -14,6 +14,8 @@
+@@ -14,6 +14,10 @@
  //! timeout → scrub/tokenjuice/cap/summarize → audit), which was previously
  //! duplicated verbatim across all three loops.
  
 +#[cfg(test)]
 +mod agentteams_steering_tests;
++#[cfg(all(test, feature = "channel-matrix"))]
++mod agentteams_protocol_tests;
  pub(crate) mod checkpoint;
  pub(crate) mod core;
  pub(crate) mod parser;
+diff --git a/src/openhuman/agent/harness/engine/tool_source.rs b/src/openhuman/agent/harness/engine/tool_source.rs
+index 328ae36..57181ab 100644
+--- a/src/openhuman/agent/harness/engine/tool_source.rs
++++ b/src/openhuman/agent/harness/engine/tool_source.rs
+@@ -94,7 +94,13 @@ impl<'a> RegistryToolSource<'a> {
+         let filtered: Vec<ToolSpec> = registry
+             .iter()
+             .chain(extra.iter())
+-            .filter(|tool| visible.map(|s| s.contains(tool.name())).unwrap_or(true))
++            .filter(|tool| {
++                #[cfg(feature = "channel-matrix")]
++                if !crate::openhuman::channels::task_protocol::allowed_tool(tool.name()) {
++                    return false;
++                }
++                visible.map(|s| s.contains(tool.name())).unwrap_or(true)
++            })
+             .map(|tool| tool.spec())
+             .collect();
+         let specs = crate::openhuman::agent::harness::session::dedup_visible_tool_specs(filtered);
+@@ -109,6 +115,10 @@ impl<'a> RegistryToolSource<'a> {
+     }
+ 
+     fn is_visible(&self, name: &str) -> bool {
++        #[cfg(feature = "channel-matrix")]
++        if !crate::openhuman::channels::task_protocol::allowed_tool(name) {
++            return false;
++        }
+         self.visible.map(|s| s.contains(name)).unwrap_or(true)
+     }
+ }
 diff --git a/src/openhuman/agent/harness/engine/tools.rs b/src/openhuman/agent/harness/engine/tools.rs
-index 07297ec..8ccc657 100644
+index 07297ec..15e7d3d 100644
 --- a/src/openhuman/agent/harness/engine/tools.rs
 +++ b/src/openhuman/agent/harness/engine/tools.rs
-@@ -189,6 +189,21 @@ pub(crate) async fn run_one_tool(
+@@ -189,10 +189,38 @@ pub(crate) async fn run_one_tool(
          }
      }
  
 +    #[cfg(feature = "channel-matrix")]
 +    let operation = match crate::openhuman::channels::task_recovery::begin_message_tools(
 +        serde_json::json!([{"id":progress_call_id,"name":call.name,"arguments":call.arguments}]),
++        tool.native_operation_registration(),
 +    )
 +    .await
 +    {
@@ -294,13 +689,29 @@ index 07297ec..8ccc657 100644
      let tool_deadline = crate::openhuman::tool_timeout::tool_execution_timeout_duration();
      let timeout_secs = crate::openhuman::tool_timeout::tool_execution_timeout_secs();
      let tool_started = std::time::Instant::now();
-@@ -352,6 +367,23 @@ pub(crate) async fn run_one_tool(
++    #[cfg(feature = "channel-matrix")]
++    let native_tool = crate::openhuman::channels::task_telemetry::boundary(
++        "tool.execute",
++        vec![
++            opentelemetry::KeyValue::new("tool.name", call.name.clone()),
++            opentelemetry::KeyValue::new("tool.call_id", progress_call_id.to_owned()),
++            opentelemetry::KeyValue::new("langfuse.observation.type", "tool"),
++        ],
++    );
+     let outcome = tokio::time::timeout(tool_deadline, tool.execute(call.arguments.clone())).await;
++    #[cfg(feature = "channel-matrix")]
++    native_tool.finish(matches!(&outcome, Ok(Ok(result)) if !result.is_error), None);
++    let definitive_response = matches!(&outcome, Ok(Ok(_)));
+     let elapsed_ms = tool_started.elapsed().as_millis() as u64;
+     let (result_text, success) = match outcome {
+         Ok(Ok(r)) => {
+@@ -352,6 +380,23 @@ pub(crate) async fn run_one_tool(
              iteration_u32,
          )
          .await;
 +    #[cfg(feature = "channel-matrix")]
 +    if operation.is_some() {
-+        if !success {
++        if !definitive_response {
 +            crate::openhuman::channels::task_recovery::abort_unconfirmed();
 +        } else if let Err(error) = crate::openhuman::channels::task_recovery::finish_message_tools(
 +            operation,
@@ -1048,7 +1459,7 @@ index 0000000..cbe3ce1
 +    assert_eq!(statuses, ["running", "stopped", "running", "completed"]);
 +}
 diff --git a/src/openhuman/channels/mod.rs b/src/openhuman/channels/mod.rs
-index 6a2c2f1..d03833c 100644
+index 6a2c2f1..5aa0025 100644
 --- a/src/openhuman/channels/mod.rs
 +++ b/src/openhuman/channels/mod.rs
 @@ -3,6 +3,8 @@
@@ -1068,7 +1479,7 @@ index 6a2c2f1..d03833c 100644
  
  #[cfg(test)]
  mod tests;
-@@ -68,3 +71,8 @@ pub use controllers::{ChannelAuthMode, ChannelDefinition};
+@@ -68,3 +71,13 @@ pub use controllers::{ChannelAuthMode, ChannelDefinition};
  // old `channels::build_system_prompt` path.
  pub use crate::openhuman::context::channels_prompt::build_system_prompt;
  pub use runtime::start_channels;
@@ -1077,8 +1488,13 @@ index 6a2c2f1..d03833c 100644
 +mod task_coordination;
 +#[cfg(feature = "channel-matrix")]
 +pub(crate) mod task_recovery;
++
++#[cfg(feature = "channel-matrix")]
++pub(crate) mod task_protocol;
++#[cfg(feature = "channel-matrix")]
++pub(crate) mod task_telemetry;
 diff --git a/src/openhuman/channels/providers/matrix.rs b/src/openhuman/channels/providers/matrix.rs
-index 1e343d5..1948fa7 100644
+index 1e343d5..d126994 100644
 --- a/src/openhuman/channels/providers/matrix.rs
 +++ b/src/openhuman/channels/providers/matrix.rs
 @@ -1,9 +1,12 @@
@@ -1370,7 +1786,7 @@ index 1e343d5..1948fa7 100644
  
          tracing::info!(
              "Matrix channel listening on room {} (configured as {})...",
-@@ -540,39 +771,131 @@ impl Channel for MatrixChannel {
+@@ -540,39 +771,139 @@ impl Channel for MatrixChannel {
              std::collections::HashSet::new(),
          )));
  
@@ -1434,6 +1850,9 @@ index 1e343d5..1948fa7 100644
 +                        .as_ref()
 +                        .and_then(|packet| packet.task_id.as_deref())
 +                    {
++                        let mut metadata = coordination_body.as_ref().unwrap().meta.clone();
++                        metadata["otel_carrier"] = raw["content"]["com.agentteams.trace"].clone();
++                        crate::openhuman::channels::task_protocol::register(event.event_id.as_str(), metadata);
 +                        crate::openhuman::channels::task_recovery::source(
 +                            room.room_id().as_str(),
 +                            task_id,
@@ -1465,13 +1884,9 @@ index 1e343d5..1948fa7 100644
 +                        room.room_id().as_str() == target_room.as_str(),
 +                    )
 +                {
-                     return;
-                 }
- 
--                let body = match &event.content.msgtype {
--                    MessageType::Text(content) => content.body.clone(),
--                    MessageType::Notice(content) => content.body.clone(),
--                    _ => return,
++                    return;
++                }
++
 +                if manager
 +                    && room.room_id().as_str() != target_room.as_str()
 +                    && !event
@@ -1480,13 +1895,22 @@ index 1e343d5..1948fa7 100644
 +                        .as_ref()
 +                        .is_some_and(|mentions| mentions.user_ids.contains(&my_user_id))
 +                {
-+                    return;
-+                }
-+
+                     return;
+                 }
+ 
+-                let body = match &event.content.msgtype {
+-                    MessageType::Text(content) => content.body.clone(),
+-                    MessageType::Notice(content) => content.body.clone(),
+-                    _ => return,
 +                // Use the real Matrix notification event as a native conversation thread.
 +                let coordination_session = coordination_body
 +                    .as_ref()
 +                    .map(|_| event.event_id.to_string());
++                if let Some(packet) = coordination_body.as_ref() {
++                    let mut metadata = packet.meta.clone();
++                    metadata["otel_carrier"] = raw["content"]["com.agentteams.trace"].clone();
++                    crate::openhuman::channels::task_protocol::register(event.event_id.as_str(), metadata);
++                }
 +                let body = match coordination_body {
 +                    Some(packet) => packet.text,
 +                    None => match &event.content.msgtype {
@@ -1511,7 +1935,7 @@ index 1e343d5..1948fa7 100644
                  if !MatrixChannel::has_non_empty_body(&body) {
                      return;
                  }
-@@ -581,27 +904,113 @@ impl Channel for MatrixChannel {
+@@ -581,27 +912,117 @@ impl Channel for MatrixChannel {
                  {
                      let mut guard = dedupe.lock().await;
                      let (recent_order, recent_lookup) = &mut *guard;
@@ -1519,10 +1943,10 @@ index 1e343d5..1948fa7 100644
 +                    if !managed
 +                        && MatrixChannel::cache_event_id(&event_id, recent_order, recent_lookup)
 +                    {
-                         return;
-                     }
-                 }
- 
++                        return;
++                    }
++                }
++
 +                let inputs = vec![body.clone()];
 +                let source_event_ids = vec![event_id.clone()];
 +                let direct = channel
@@ -1559,8 +1983,12 @@ index 1e343d5..1948fa7 100644
 +                        if managed {
 +                            worker_sync::retire_control(&key).await;
 +                        }
-+                        return;
-+                    }
+                         return;
+                     }
+                 }
++                if coordination_session.is_none() {
++                    crate::openhuman::channels::task_protocol::register(&event_id,
++                        serde_json::json!({"otel_carrier":raw["content"]["com.agentteams.trace"]}));
 +                }
 +                if managed {
 +                    if let Err(error) = worker_sync::admit(
@@ -1592,7 +2020,7 @@ index 1e343d5..1948fa7 100644
 +                        run.set_transport(tx.clone());
 +                    }
 +                }
-+
+ 
                  let msg = ChannelMessage {
                      id: event_id,
                      sender: sender.clone(),
@@ -1699,7 +2127,7 @@ index aec8edd..0a98ca7 100644
      MatrixChannel::new(
          "https://matrix.org".to_string(),
 diff --git a/src/openhuman/channels/runtime/dispatch.rs b/src/openhuman/channels/runtime/dispatch.rs
-index 23a5fe9..222dc58 100644
+index 23a5fe9..482f829 100644
 --- a/src/openhuman/channels/runtime/dispatch.rs
 +++ b/src/openhuman/channels/runtime/dispatch.rs
 @@ -792,7 +792,20 @@ pub(crate) async fn process_channel_message(
@@ -1790,7 +2218,7 @@ index 23a5fe9..222dc58 100644
          request_native_global::<AgentTurnRequest, AgentTurnResponse>(
              AGENT_RUN_TURN_METHOD,
              turn_request,
-@@ -1096,8 +1154,19 @@ pub(crate) async fn process_channel_message(
+@@ -1096,8 +1154,23 @@ pub(crate) async fn process_channel_message(
      // tool call, voiding the `supervised` autonomy tier on the channel.
      // Discord / Slack / iMessage / Mattermost stay in the legacy bypass
      // until each gets its own approval surface in a follow-up PR.
@@ -1807,12 +2235,16 @@ index 23a5fe9..222dc58 100644
 +                room: msg.reply_target.clone(),
 +                sender: msg.sender.clone(),
 +            });
-+            matrix::scope(context, history_key.clone(), agent_call).await
++            matrix::scope(context, history_key.clone(), async {
++                if std::env::var_os("AGENTTEAMS_CONTROLLER_URL").is_some() {
++                    crate::openhuman::channels::task_protocol::scope(&msg, &history_key, agent_call).await?
++                } else {agent_call.await}
++            }).await
 +        } else if channel_has_approval_surface(&msg.channel) {
              let approval_ctx = crate::openhuman::approval::ApprovalChatContext {
                  thread_id: history_key.clone(),
                  client_id: msg.channel.clone(),
-@@ -1108,8 +1177,34 @@ pub(crate) async fn process_channel_message(
+@@ -1108,8 +1181,34 @@ pub(crate) async fn process_channel_message(
          } else {
              agent_call.await
          }
@@ -1849,7 +2281,7 @@ index 23a5fe9..222dc58 100644
  
      // Wait for draft updater to finish
      if let Some(handle) = draft_updater {
-@@ -1123,6 +1218,41 @@ pub(crate) async fn process_channel_message(
+@@ -1123,6 +1222,41 @@ pub(crate) async fn process_channel_message(
          log_worker_join_result(handle.await);
      }
  
@@ -1891,7 +2323,7 @@ index 23a5fe9..222dc58 100644
      let (success, response_text) = match llm_result {
          Ok(Ok(response)) => {
              // Save user + assistant turn to per-sender history
-@@ -1133,6 +1263,10 @@ pub(crate) async fn process_channel_message(
+@@ -1133,6 +1267,10 @@ pub(crate) async fn process_channel_message(
                      .unwrap_or_else(|e| e.into_inner());
                  let turns = histories.entry(history_key).or_default();
                  turns.push(ChatMessage::user(&enriched_message));
@@ -1902,7 +2334,7 @@ index 23a5fe9..222dc58 100644
                  turns.push(ChatMessage::assistant(&response));
                  // Trim to MAX_CHANNEL_HISTORY (keep recent turns)
                  while turns.len() > MAX_CHANNEL_HISTORY {
-@@ -1368,7 +1502,41 @@ pub(crate) async fn run_message_dispatch_loop(
+@@ -1368,7 +1506,41 @@ pub(crate) async fn run_message_dispatch_loop(
          let worker_ctx = Arc::clone(&ctx);
          workers.spawn(async move {
              let _permit = permit;
@@ -2208,8 +2640,108 @@ index 481d4c0..057fcc5 100644
          let clamped = clamp_text_middle(&text, 300);
          // Should produce output with the marker
          assert!(clamped.contains("... omitted ..."));
+diff --git a/src/openhuman/tools/impl/filesystem/file_read.rs b/src/openhuman/tools/impl/filesystem/file_read.rs
+index 3e07a9f..ddf9821 100644
+--- a/src/openhuman/tools/impl/filesystem/file_read.rs
++++ b/src/openhuman/tools/impl/filesystem/file_read.rs
+@@ -67,12 +67,36 @@ impl Tool for FileReadTool {
+             ));
+         }
+ 
++        let mut scoped = self.security.as_ref().clone();
++        #[cfg(feature = "channel-matrix")]
++        let task_scoped = crate::openhuman::channels::task_protocol::output_directory().is_some();
++        #[cfg(not(feature = "channel-matrix"))]
++        let task_scoped = false;
++        let mut native_path = path.to_owned();
++        #[cfg(feature = "channel-matrix")]
++        if task_scoped {
++            let (root, relative) =
++                crate::openhuman::channels::task_protocol::file_scope(&scoped, path, false)?;
++            scoped.action_dir = root.clone();
++            scoped
++                .trusted_roots
++                .push(crate::openhuman::security::TrustedRoot {
++                    path: root.to_string_lossy().into_owned(),
++                    access: crate::openhuman::security::TrustedAccess::Read,
++                });
++            native_path = relative;
++        }
++
+         // Security check: validate path string, resolve symlinks, confirm workspace containment.
+-        let resolved_path = match self.security.validate_path(path).await {
++        let resolved_path = match scoped.validate_path(&native_path).await {
+             Ok(p) => p,
+             Err(msg) => return Ok(ToolResult::error(msg)),
+         };
+ 
++        if task_scoped && !resolved_path.starts_with(scoped.action_dir.canonicalize()?) {
++            return Ok(ToolResult::error("File is outside the current Task scope"));
++        }
++
+         // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
+         match tokio::fs::metadata(&resolved_path).await {
+             Ok(meta) => {
+diff --git a/src/openhuman/tools/impl/filesystem/file_write.rs b/src/openhuman/tools/impl/filesystem/file_write.rs
+index 169f4e1..837286b 100644
+--- a/src/openhuman/tools/impl/filesystem/file_write.rs
++++ b/src/openhuman/tools/impl/filesystem/file_write.rs
+@@ -70,7 +70,12 @@ impl Tool for FileWriteTool {
+         let target = if std::path::Path::new(path).is_absolute() {
+             std::path::PathBuf::from(path)
+         } else {
+-            self.security.action_dir.join(path)
++            #[cfg(feature = "channel-matrix")]
++            let root = crate::openhuman::channels::task_protocol::output_directory()
++                .unwrap_or_else(|| self.security.action_dir.clone());
++            #[cfg(not(feature = "channel-matrix"))]
++            let root = self.security.action_dir.clone();
++            root.join(path)
+         };
+         // Sync `stat` — intentionally blocking, since the `Tool` trait makes
+         // this method sync. Fast for local paths; would only need
+@@ -101,14 +106,38 @@ impl Tool for FileWriteTool {
+             ));
+         }
+ 
++        let mut scoped = self.security.as_ref().clone();
++        #[cfg(feature = "channel-matrix")]
++        let task_scoped = crate::openhuman::channels::task_protocol::output_directory().is_some();
++        #[cfg(not(feature = "channel-matrix"))]
++        let task_scoped = false;
++        let mut native_path = path.to_owned();
++        #[cfg(feature = "channel-matrix")]
++        if task_scoped {
++            let (root, relative) =
++                crate::openhuman::channels::task_protocol::file_scope(&scoped, path, true)?;
++            scoped.action_dir = root.clone();
++            scoped
++                .trusted_roots
++                .push(crate::openhuman::security::TrustedRoot {
++                    path: root.to_string_lossy().into_owned(),
++                    access: crate::openhuman::security::TrustedAccess::ReadWrite,
++                });
++            native_path = relative;
++        }
++
+         // Security check first: validate path string, resolve symlinks, confirm workspace
+         // containment. validate_parent_path walks up to the deepest existing ancestor so
+         // it does not require the parent directory to exist yet.
+-        let resolved_target = match self.security.validate_parent_path(path).await {
++        let resolved_target = match scoped.validate_parent_path(&native_path).await {
+             Ok(p) => p,
+             Err(msg) => return Ok(ToolResult::error(msg)),
+         };
+ 
++        if task_scoped && !resolved_target.starts_with(scoped.action_dir.canonicalize()?) {
++            return Ok(ToolResult::error("File is outside the current Task scope"));
++        }
++
+         // Create parent directory only at the validated, resolved location.
+         if let Some(resolved_parent) = resolved_target.parent() {
+             tokio::fs::create_dir_all(resolved_parent).await?;
 diff --git a/src/openhuman/tools/impl/system/shell.rs b/src/openhuman/tools/impl/system/shell.rs
-index a883b46..7bf5ce4 100644
+index a883b46..026db5e 100644
 --- a/src/openhuman/tools/impl/system/shell.rs
 +++ b/src/openhuman/tools/impl/system/shell.rs
 @@ -11,6 +11,18 @@ use std::time::{Duration, Instant};
@@ -2231,10 +2763,51 @@ index a883b46..7bf5ce4 100644
  /// Environment variables safe to pass to shell commands.
  /// Only functional variables are included — never API keys or secrets.
  const SAFE_ENV_VARS: &[&str] = &[
-@@ -264,6 +276,31 @@ impl ShellTool {
+@@ -208,12 +220,22 @@ impl ShellTool {
+     /// same gated execution path as the `shell` tool — all security
+     /// checks (rate limits, path guards, approval gate routing) apply
+     /// identically to workflow-triggered commands.
++    fn task_policy(&self) -> SecurityPolicy {
++        let mut policy = self.security.as_ref().clone();
++        #[cfg(feature = "channel-matrix")]
++        if let Some(root) = crate::openhuman::channels::task_protocol::output_directory() {
++            policy.action_dir = root;
++        }
++        policy
++    }
++
+     pub(crate) async fn run_with_security(&self, command: &str) -> (bool, ToolResult) {
++        let security = self.task_policy();
+         // Read-only `Block` + the Option-2 structural guard. Approval for
+         // Write / Network / Destructive already happened at the harness
+         // `ApprovalGate` (see `external_effect_with_args`) before `execute()`
+         // ran; this enforces what must still hold afterwards.
+-        if let Err(reason) = self.security.check_gated_command(command) {
++        if let Err(reason) = security.check_gated_command(command) {
+             return (false, ToolResult::error(reason));
+         }
+ 
+@@ -244,9 +266,10 @@ impl ShellTool {
+         // Execute with timeout to prevent hanging commands.
+         // Clear the environment to prevent leaking API keys and other secrets
+         // (CWE-200), then re-add only safe, functional variables.
++        let working_directory = security.action_dir.clone();
+         let mut cmd = match self
+             .runtime
+-            .build_shell_command(command, &self.security.action_dir)
++            .build_shell_command(command, &working_directory)
+         {
+             Ok(cmd) => cmd,
+             Err(e) => {
+@@ -264,6 +287,36 @@ impl ShellTool {
              }
          }
  
++        #[cfg(feature = "channel-matrix")]
++        if let Some(scratch) = crate::openhuman::channels::task_protocol::scratch_directory() {
++            cmd.env("TMPDIR", scratch);
++        }
++
 +        // Task tools use this process's identity and projected credential file.
 +        // Do not forward raw API keys or recover a prior startup identity.
 +        #[cfg(feature = "channel-matrix")]
@@ -2263,7 +2836,7 @@ index a883b46..7bf5ce4 100644
          // If a managed Node.js install has already been resolved, transparently
          // prepend its bin dir to PATH so this shell sees the managed toolchain.
          // `try_cached()` never blocks and never triggers a download — unrelated
-@@ -286,8 +323,24 @@ impl ShellTool {
+@@ -286,8 +339,24 @@ impl ShellTool {
              }
          }
  
@@ -2290,6 +2863,62 @@ index a883b46..7bf5ce4 100644
  
          let tool_result = match result {
              Ok(Ok(output)) => {
+@@ -334,11 +403,12 @@ impl ShellTool {
+     /// agent's `SandboxMode` is `Sandboxed`.
+     async fn run_sandboxed(&self, command: &str) -> (bool, ToolResult) {
+         use crate::openhuman::sandbox;
++        let security = self.task_policy();
+ 
+         let config = crate::openhuman::config::RuntimeConfig::default();
+         let policy = sandbox::resolve_sandbox_policy(
+             crate::openhuman::agent::harness::definition::SandboxMode::Sandboxed,
+-            &self.security.action_dir,
++            &security.action_dir,
+             &config,
+             false,
+         );
+@@ -366,7 +436,7 @@ impl ShellTool {
+         match sandbox::execute_in_sandbox(
+             &policy,
+             command,
+-            &self.security.action_dir,
++            &security.action_dir,
+             extra_env,
+             Duration::from_secs(SHELL_TIMEOUT_SECS),
+         )
+diff --git a/src/openhuman/tools/ops.rs b/src/openhuman/tools/ops.rs
+index 2521ae9..7db2e1e 100644
+--- a/src/openhuman/tools/ops.rs
++++ b/src/openhuman/tools/ops.rs
+@@ -547,6 +547,11 @@ pub fn all_tools_with_runtime(
+         tracing::debug!("[gitbooks] registered gitbooks_search + gitbooks_get_page");
+     }
+ 
++    #[cfg(feature = "channel-matrix")]
++    if std::env::var_os("AGENTTEAMS_CONTROLLER_URL").is_some() {
++        tools.push(Box::new(crate::openhuman::channels::task_protocol::TaskTool));
++    }
++
+     // MCP setup-agent tool surface (search/get/request_secret/test/install).
+     // Registered unconditionally — the `mcp_setup` sub-agent filters to just
+     // these via its `[tools] named = [...]` allowlist, and the host agent's
+diff --git a/src/openhuman/tools/traits.rs b/src/openhuman/tools/traits.rs
+index bc57570..ec218b4 100644
+--- a/src/openhuman/tools/traits.rs
++++ b/src/openhuman/tools/traits.rs
+@@ -172,6 +172,12 @@ pub trait Tool: Send + Sync {
+     /// Channels with a lower maximum permission level will reject this tool
+     /// before any per-call check runs.
+     /// Default: `ReadOnly`. Override for write/execute/dangerous tools.
++    /// Fixed native factory identity, never derived from model arguments.
++    #[cfg(feature = "channel-matrix")]
++    fn native_operation_registration(&self) -> Option<serde_json::Value> {
++        None
++    }
++
+     fn permission_level(&self) -> PermissionLevel {
+         PermissionLevel::ReadOnly
+     }
 diff --git a/tests/agentteams_direct_control.rs b/tests/agentteams_direct_control.rs
 new file mode 100644
 index 0000000..6ebd727
@@ -2382,17 +3011,12 @@ index 0000000..6ebd727
 +}
 diff --git a/tests/agentteams_task_recovery.rs b/tests/agentteams_task_recovery.rs
 new file mode 100644
-index 0000000..4df0767
+index 0000000..caa5072
 --- /dev/null
 +++ b/tests/agentteams_task_recovery.rs
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,107 @@
 +//! Native API/adapter tests; these do not replace real Controller/Matrix/model E2E.
 +use openhuman_core::openhuman;
-+use openhuman_core::openhuman::channels::traits;
-+#[path = "../src/openhuman/channels/session_receipts.rs"]
-+mod session_receipts;
-+#[path = "../src/openhuman/channels/task_recovery.rs"]
-+mod task_recovery;
 +
 +#[cfg(unix)]
 +#[tokio::test]
