@@ -61,7 +61,7 @@ def run(env, *args, check=True):
 
 
 def configure(root, endpoint):
-    private, actions = root / "private-memory", root / "actions"
+    private, actions = root / "workspace", root / "actions"
     private.mkdir(); actions.mkdir()
     runtime = root / "runtime/runtime.yaml"
     runtime.parent.mkdir()
@@ -71,21 +71,24 @@ def configure(root, endpoint):
         "matrix": {"transport": {"homeserver": "http://matrix.invalid", "dm": {"policy": "open"}}},
         "desired": {"model": {"model": "fixture-model", "gatewayUrl": endpoint}},
         "credentials": {"matrixTokenEnv": "SMOKE_MATRIX_BINDING", "gatewayKeyEnv": "SMOKE_MODEL_BINDING"}}))
-    env = {**os.environ, "WORKSPACE": str(root), "HOME": str(root), "OPENHUMAN_WORKSPACE": str(private),
+    env = {**os.environ, "WORKSPACE": str(root), "HOME": str(root), "OPENHUMAN_WORKSPACE": str(root),
         "OPENHUMAN_ACTION_DIR": str(actions), "OPENHUMAN_CONFIG": str(root / "config.toml"),
-        "AGENTTEAMS_WORKER_NAME": "worker", "SMOKE_MATRIX_BINDING": "synthetic-matrix", "SMOKE_MODEL_BINDING": KEY,
+        "AGENTTEAMS_WORKER_NAME": "worker", "WORKER_NAME": "worker", "WORKER_CR_NAME": "worker", "SMOKE_MATRIX_BINDING": "synthetic-matrix", "SMOKE_MODEL_BINDING": KEY,
         "LOCAL_OPENAI_URL": endpoint + "/v1", "RUST_LOG": "error", "AGENTTEAMS_OTEL_ENABLED": "false"}
     for key in ("AGENTTEAMS_CONTROLLER_URL", "AGENTTEAMS_AUTH_TOKEN", "AGENTTEAMS_AUTH_TOKEN_FILE"):
         env.pop(key, None)
+    (root / "skills").mkdir()
+    (root / "AGENTS.md").write_text("You execute the requested task using your native tools.")
+    (root / "SOUL.md").write_text("Be accurate.")
     source = Path("/usr/local/bin/openhuman-worker-entrypoint.sh").read_text()
-    projection = source[source.index("OPENCLAW_JSON="):source.index('\nif [ -n "${WORKER_NAME}" ]; then\n    # Native channel turns')]
+    projection = source[source.index("OPENCLAW_JSON="):source.index('\npython3 /opt/agentteams/scripts/configure-teamharness.py')]
     start = source.index('if [ -n "${BRIDGE_LLM_BASE_URL}" ] &&')
     model = source[start:source.index("\n# Preserve CLI context", start)]
     result = subprocess.run(["bash", "-e", "-c", "umask 077\nlog() { :; }\n" + projection + "\n" + model],
         env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, (result.stdout[-1000:], result.stderr[-1000:])
-    with (root / "config.toml").open("a") as config:
-        config.write('\n[autonomy]\nallowed_commands=["pwd"]\nrequire_approval_for_medium_risk=false\n\n[agent]\nmax_tool_iterations=6\n')
+    run(env, "config", "update_autonomy_settings", "--level", "supervised",
+        "--allowed_commands", '["pwd"]', "--auto_approve", '["file_write","file_read","shell"]')
     return env, private, actions
 
 
