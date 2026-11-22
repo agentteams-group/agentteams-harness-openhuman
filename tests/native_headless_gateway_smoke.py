@@ -61,7 +61,8 @@ def run(env, *args, check=True):
 
 
 def configure(root, endpoint):
-    private, actions = root / "workspace", root / "actions"
+    private = root / "workspace"
+    actions = private / "actions"
     private.mkdir(); actions.mkdir()
     runtime = root / "runtime/runtime.yaml"
     runtime.parent.mkdir()
