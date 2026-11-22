@@ -135,8 +135,11 @@ def call(arguments):
   task_root=Path({base:?})/'tasks'/identity
   return {{'task':{{'id':identity,'status':'in_progress','mainTaskId':'main','projectId':'','assignedTo':'one','assignmentId':'dispatch'}},'taskDirectory':str(task_root),'outputDirectory':str(task_root/'workspace'),'scratchDirectory':str(task_root/'workspace/.scratch')}}
  return {{'task':{{'id':identity,'status':'submitted','submissionId':'candidate'}},'notification':{{'eventId':'notice','status':'queued','recipient':'leader'}}}}
+async def notify(event,native,action):
+ assert native in ['$source-1','$source-2'], 'NativePhase HTTP accepts raw Matrix event IDs only'
+ return {{'active':True}}
 def get(_): return {{'deliveries':[{{'eventId':'delivered-own','status':'completed','roomId':'!room:test','taskId':'completed-main','reportMessageId':'$report','report':'Own delivered result 9e27','artifacts':[]}}]}}
-try: print(json.dumps(module.invoke(request,call=call,get_json=get)))
+try: print(json.dumps(module.invoke(request,call=call,get_json=get,notify=notify)))
 except Exception as error:
  print(json.dumps({{'ok':False,'message':str(error),'effect':getattr(error,'effect','unknown')}}));sys.exit(1)
 "#,
@@ -152,7 +155,7 @@ except Exception as error:
             let event = format!("$source-{index}");
             native::register(
                 &event,
-                json!({"teamharness_coordination":{"kind":"task_assigned","task_id":id,"main_task_id":"main","project_id":"","delivery_id":"dispatch"}}),
+                json!({"teamharness_coordination":{"id":format!("{:032x}",index),"kind":"task_assigned","task_id":id,"main_task_id":"main","project_id":"","delivery_id":"dispatch"}}),
             );
             let msg = ChannelMessage {
                 id: event,

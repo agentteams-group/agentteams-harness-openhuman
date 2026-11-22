@@ -98,7 +98,7 @@ pub(crate) async fn scope<F: Future>(
         let mut event = meta["teamharness_coordination"].clone();
         if let Some(id) = event["id"].as_str() {
             let admitted = bridge(json!({"operation":"admit_event","eventId":id,
-                "nativeEventId":format!("matrix:{}",msg.id),"action":"begin"}))
+                "nativeEventId":msg.id,"action":"begin"}))
             .await?;
             anyhow::ensure!(admitted["active"] == true, "Task phase is no longer active");
             if event["kind"] == "handoff" {
