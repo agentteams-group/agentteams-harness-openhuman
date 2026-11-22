@@ -195,6 +195,8 @@ USER root
 # Default environment
 ENV OPENHUMAN_CORE_HOST=0.0.0.0
 ENV OPENHUMAN_CORE_PORT=7788
+# AgentTeams upgrades this managed runtime by replacing the image.
+ENV OPENHUMAN_AUTO_UPDATE_ENABLED=false
 ENV RUST_LOG=info
 
 EXPOSE 7788
