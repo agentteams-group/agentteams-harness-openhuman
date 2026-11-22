@@ -1,5 +1,5 @@
 diff --git a/src/openhuman/agent/harness/tool_loop.rs b/src/openhuman/agent/harness/tool_loop.rs
-index 400a3c3..5b7f3e4 100644
+index 400a3c3..4a9de16 100644
 --- a/src/openhuman/agent/harness/tool_loop.rs
 +++ b/src/openhuman/agent/harness/tool_loop.rs
 @@ -122,9 +122,14 @@ pub(crate) async fn run_tool_call_loop(
@@ -17,11 +17,11 @@ index 400a3c3..5b7f3e4 100644
          match visible_tool_names {
              Some(set) => set.contains(name),
              None => true,
-@@ -170,6 +175,15 @@ pub(crate) async fn run_tool_call_loop(
- 
+@@ -171,7 +176,17 @@ pub(crate) async fn run_tool_call_loop(
      let stop_hooks = current_stop_hooks();
      for iteration in 0..max_iterations {
-+        #[cfg(feature = "channel-matrix")]
+         #[cfg(feature = "channel-matrix")]
+-        { crate::openhuman::channels::task_recovery::check_authority(false).await?;
 +        {
 +            crate::openhuman::channels::task_protocol::attach_pending(history).await?;
 +            if let Some(result) = crate::openhuman::channels::task_protocol::completed() {
@@ -30,10 +30,13 @@ index 400a3c3..5b7f3e4 100644
 +                return Ok(result);
 +            }
 +        }
-         #[cfg(feature = "channel-matrix")]
-         { crate::openhuman::channels::task_recovery::check_authority(false).await?;
++        #[cfg(feature = "channel-matrix")]
++        { let owned = crate::openhuman::channels::task_recovery::check_authority(false).await?;
++          crate::openhuman::channels::task_protocol::admit(history, &owned).await?;
            crate::openhuman::channels::task_recovery::attach_pending(history).await?; }
-@@ -322,6 +336,10 @@ pub(crate) async fn run_tool_call_loop(
+         if let Some(ref sink) = on_progress {
+             if let Err(e) = sink
+@@ -322,6 +337,10 @@ pub(crate) async fn run_tool_call_loop(
              (None, None)
          };
  
@@ -44,7 +47,7 @@ index 400a3c3..5b7f3e4 100644
          let chat_result = provider
              .chat(
                  ChatRequest {
-@@ -334,6 +352,9 @@ pub(crate) async fn run_tool_call_loop(
+@@ -334,6 +353,9 @@ pub(crate) async fn run_tool_call_loop(
              )
              .await;
  
@@ -54,7 +57,25 @@ index 400a3c3..5b7f3e4 100644
          drop(delta_tx_opt);
          if let Some(handle) = delta_forwarder {
              let _ = handle.await;
-@@ -684,8 +705,15 @@ pub(crate) async fn run_tool_call_loop(
+@@ -532,7 +554,10 @@ pub(crate) async fn run_tool_call_loop(
+         let mut individual_results: Vec<String> = Vec::new();
+         for (call_idx, call) in tool_calls.iter().enumerate() {
+             #[cfg(feature = "channel-matrix")]
+-            crate::openhuman::channels::task_recovery::check_authority(true).await?;
++            {
++                let owned = crate::openhuman::channels::task_recovery::check_authority(true).await?;
++                crate::openhuman::channels::task_protocol::admit(history, &owned).await?;
++            }
+             // Stable id threaded through the start/complete pair (and
+             // any preceding args-delta events) so consumers can
+             // reconcile tool rows by id. The fallback includes
+@@ -679,13 +704,21 @@ pub(crate) async fn run_tool_call_loop(
+             let result = if let Some(tool) = tool_opt {
+                 #[cfg(feature = "channel-matrix")]
+                 let operation = crate::openhuman::channels::task_recovery::begin_message_tools(
+-                    serde_json::json!([{"id":progress_call_id,"name":call.name,"arguments":call.arguments}])).await?;
++                    serde_json::json!([{"id":progress_call_id,"name":call.name,"arguments":call.arguments}]), tool.native_operation_registration()).await?;
+                 let tool_deadline =
                      crate::openhuman::tool_timeout::tool_execution_timeout_duration();
                  let timeout_secs = crate::openhuman::tool_timeout::tool_execution_timeout_secs();
                  let tool_started = std::time::Instant::now();
@@ -67,15 +88,16 @@ index 400a3c3..5b7f3e4 100644
                      tokio::time::timeout(tool_deadline, tool.execute(call.arguments.clone())).await;
 +                #[cfg(feature = "channel-matrix")]
 +                native_tool.finish(matches!(&outcome, Ok(Ok(result)) if !result.is_error), None);
++                let definitive_response = matches!(&outcome, Ok(Ok(_)));
                  let elapsed_ms = tool_started.elapsed().as_millis() as u64;
                  let (result_text, success) = match outcome {
                      Ok(Ok(r)) => {
-@@ -854,7 +882,7 @@ pub(crate) async fn run_tool_call_loop(
+@@ -854,7 +887,7 @@ pub(crate) async fn run_tool_call_loop(
                  }
                  #[cfg(feature = "channel-matrix")]
                  if operation.is_some() {
 -                    if !success {
-+                    if !success && !(call.name == "task" && crate::openhuman::channels::task_protocol::take_verified_no_effect()) {
++                    if !definitive_response {
                          anyhow::bail!("Matrix tool outcome needs verification before another attempt");
                      }
                      crate::openhuman::channels::task_recovery::finish_message_tools(operation,
@@ -167,10 +189,68 @@ index f250810..357a201 100644
 +    Some(Notification { text, task_id, meta: packet["meta"].clone() })
  }
 diff --git a/src/openhuman/channels/task_recovery.rs b/src/openhuman/channels/task_recovery.rs
-index d746aad..fbe6f64 100644
+index d746aad..2c72667 100644
 --- a/src/openhuman/channels/task_recovery.rs
 +++ b/src/openhuman/channels/task_recovery.rs
-@@ -877,6 +877,12 @@ async fn scan(
+@@ -25,14 +25,19 @@ static WAKE: Notify = Notify::const_new();
+ 
+ tokio::task_local! { pub(crate) static TASK_RUN: Arc<Run>; }
+ 
+-pub(crate) async fn check_authority(for_tool: bool) -> anyhow::Result<()> {
++pub(crate) async fn check_authority(for_tool: bool) -> anyhow::Result<Value> {
+     if let Ok(run) = TASK_RUN.try_with(Arc::clone) {
+-        let current = run.current().await.map_err(anyhow::Error::msg)?;
++        let current = if run.message() {
++            run.current().await
++        } else {
++            rpc(json!({"action":"admit_tools","identity":run.identity})).await
++        }.map_err(anyhow::Error::msg)?;
+         if for_tool && current["task"]["execution"]["state"] == "released" {
+             anyhow::bail!("Task execution was released; only saved-result delivery is permitted");
+         }
++        return Ok(current);
+     }
+-    Ok(())
++    Ok(Value::Null)
+ }
+ 
+ pub(crate) fn unexecuted_tool_frame(text: &str) -> bool {
+@@ -751,15 +756,20 @@ pub(crate) async fn admit_message(
+     Ok(())
+ }
+ 
+-pub(crate) async fn begin_message_tools(calls: Value) -> anyhow::Result<Option<String>> {
++pub(crate) async fn begin_message_tools(calls: Value, registration: Option<Value>) -> anyhow::Result<Option<String>> {
++    if let Some(registration) = registration {
++        let policy = rpc(json!({"action":"tool_policy","registration":registration})).await.map_err(anyhow::Error::msg)?;
++        if policy["mode"] == "delegate" {
++            check_authority(true).await?;
++            return Ok(None);
++        }
++    }
+     let Ok(run) = TASK_RUN.try_with(Arc::clone) else {
+         return Ok(None);
+     };
+-    if !run.message() {
+-        return Ok(None);
+-    }
++    let action = if run.message() { "matrix.message.begin_tools" } else { "begin_tools" };
+     let op =
+-        rpc(json!({"action":"matrix.message.begin_tools","identity":run.identity,"calls":calls}))
++        rpc(json!({"action":action,"identity":run.identity,"calls":calls}))
+             .await
+             .map_err(anyhow::Error::msg)?;
+     Ok(Some(
+@@ -772,7 +782,7 @@ pub(crate) async fn begin_message_tools(calls: Value) -> anyhow::Result<Option<S
+ pub(crate) async fn finish_message_tools(op: Option<String>, results: Value) -> anyhow::Result<()> {
+     if let Some(op) = op {
+         let run = TASK_RUN.try_with(Arc::clone)?;
+-        rpc(json!({"action":"matrix.message.finish_tools","identity":run.identity,"operation_id":op,"results":results})).await.map_err(anyhow::Error::msg)?;
++        rpc(json!({"action":if run.message() {"matrix.message.finish_tools"} else {"finish_tools"},"identity":run.identity,"operation_id":op,"results":results})).await.map_err(anyhow::Error::msg)?;
+     }
+     Ok(())
+ }
+@@ -877,6 +887,12 @@ async fn scan(
              .and_then(|ids| ids.first())
              .cloned()
              .unwrap_or_else(|| format!("recovery:{}", uuid::Uuid::new_v4()));
@@ -302,6 +382,21 @@ index 5912cdb..0fbc529 100644
      // Generic remote MCP bridge tools. These let the agent enumerate
      // named MCP servers and forward `tools/call` through the core
      // instead of hardcoding one bespoke MCP integration per server.
+diff --git a/src/openhuman/tools/traits.rs b/src/openhuman/tools/traits.rs
+index 620eeec..041bc9e 100644
+--- a/src/openhuman/tools/traits.rs
++++ b/src/openhuman/tools/traits.rs
+@@ -151,6 +151,10 @@ pub trait Tool: Send + Sync {
+         false
+     }
+ 
++    /// Trusted SDK registration metadata; model/tool arguments cannot supply this.
++    #[cfg(feature = "channel-matrix")]
++    fn native_operation_registration(&self) -> Option<serde_json::Value> { None }
++
+     /// Permission level required to execute this tool.
+     /// Channels with a lower maximum permission level will reject this tool.
+     /// Default: `ReadOnly`. Override for write/execute/dangerous tools.
 diff --git a/Cargo.toml b/Cargo.toml
 --- a/Cargo.toml
 +++ b/Cargo.toml

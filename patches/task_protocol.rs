@@ -250,6 +250,53 @@ pub(crate) async fn attach_pending(history: &mut Vec<ChatMessage>) -> anyhow::Re
     Ok(())
 }
 
+/// Called at the actual inference/tool boundary with the owned recovery result.
+pub(crate) async fn admit(history: &mut Vec<ChatMessage>, owned: &Value) -> anyhow::Result<()> {
+    let Ok(turn) = CURRENT.try_with(Arc::clone) else {
+        return Ok(());
+    };
+    let result = if owned.get("receipts").is_some() {
+        owned.clone()
+    } else {
+        let context = turn.context.lock().unwrap().clone();
+        let result = bridge(json!({"operation":"canonical_admit","context":context})).await?;
+        anyhow::ensure!(
+            result["ok"] == true,
+            "Canonical Task outcome requires authoritative verification"
+        );
+        result
+    };
+    let mut changed = false;
+    for receipt in result["receipts"].as_array().into_iter().flatten() {
+        let fact = receipt["fact"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid canonical receipt"))?;
+        if !history
+            .iter()
+            .any(|message| message.role == "system" && message.content == fact)
+        {
+            history.push(ChatMessage::system(fact));
+            changed = true;
+        }
+    }
+    if changed {
+        let context = turn.context.lock().unwrap().clone();
+        let source = context["sourceEvent"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Native source missing"))?;
+        super::session_receipts::checkpoint(
+            &home(),
+            &turn.room,
+            source,
+            &turn.session,
+            history,
+            &[source.to_owned()],
+        )?;
+        super::task_recovery::checkpoint(history).await?;
+    }
+    Ok(())
+}
+
 pub(crate) fn completed() -> Option<String> {
     CURRENT
         .try_with(|turn| {
@@ -259,21 +306,6 @@ pub(crate) fn completed() -> Option<String> {
         })
         .ok()
         .flatten()
-}
-
-pub(crate) fn take_verified_no_effect() -> bool {
-    CURRENT
-        .try_with(|turn| {
-            turn.context
-                .lock()
-                .unwrap()
-                .as_object_mut()
-                .unwrap()
-                .remove("toolEffectNone")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
 }
 
 pub(crate) fn output_directory() -> Option<PathBuf> {
@@ -348,19 +380,18 @@ impl Tool for TaskTool {
     fn permission_level(&self) -> PermissionLevel {
         PermissionLevel::None
     }
+    fn native_operation_registration(&self) -> Option<Value> {
+        Some(
+            json!({"origin":"agentteams.common.task_native", "entrypoint":"/opt/agentteams/plugins/teamharness/mcp/common/task_native.py"}),
+        )
+    }
     async fn execute(&self, arguments: Value) -> anyhow::Result<ToolResult> {
         let turn = CURRENT.try_with(Arc::clone)?;
-        let context = {
-            let mut context = turn.context.lock().unwrap();
-            context.as_object_mut().unwrap().remove("toolEffectNone");
-            context.clone()
-        };
+        let context = turn.context.lock().unwrap().clone();
         let outcome =
             bridge(json!({"operation":"task","arguments":arguments,"context":context})).await?;
         {
             let mut current = turn.context.lock().unwrap();
-            current["toolEffectNone"] =
-                json!(outcome["effect"] == "none" || outcome["result"]["effect"] == "none");
             if let Some(update) = outcome["contextUpdate"].as_object() {
                 current.as_object_mut().unwrap().extend(update.clone());
             }
@@ -378,12 +409,9 @@ impl Tool for TaskTool {
         if outcome["effect"] == "none" && outcome["ok"] == false {
             return Ok(ToolResult::error(outcome.to_string()));
         }
-        let text = format!(
-            "{}\n{}",
-            outcome["result"],
-            outcome["fact"].as_str().unwrap_or("")
-        );
-        Ok(if outcome["result"]["ok"] == false {
+        let result = outcome.get("result").unwrap_or(&outcome);
+        let text = format!("{}\n{}", result, outcome["fact"].as_str().unwrap_or(""));
+        Ok(if result["ok"] == false {
             ToolResult::error(text)
         } else {
             ToolResult::success(text)

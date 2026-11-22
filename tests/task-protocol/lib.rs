@@ -68,6 +68,9 @@ mod openhuman {
                 fn description(&self) -> &str;
                 fn parameters_schema(&self) -> serde_json::Value;
                 fn permission_level(&self) -> PermissionLevel;
+                fn native_operation_registration(&self) -> Option<serde_json::Value> {
+                    None
+                }
                 async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
             }
         }
@@ -176,8 +179,7 @@ except Exception as error:
                     .await
                     .unwrap();
                 assert!(rejected.is_error);
-                assert!(native::take_verified_no_effect());
-                assert!(!native::take_verified_no_effect());
+                assert!(rejected.text.contains("none"));
                 let result = native::TaskTool
                     .execute(json!({"action":"submit","taskId":id,"summary":"Finished"}))
                     .await
@@ -205,7 +207,7 @@ except Exception as error:
             let update=native::TaskTool.execute(json!({"action":"create","leader":"leader","title":"Own original request"})).await.unwrap();
             assert!(!update.is_error);
             let blocked=native::TaskTool.execute(json!({"action":"create","leader":"leader","title":"Before native checkpoint"})).await.unwrap();
-            assert!(blocked.is_error);assert!(native::take_verified_no_effect());
+            assert!(blocked.is_error);
             native::attach_pending(&mut history).await.unwrap();
             assert!(history.iter().any(|message|message.role=="user" && message.content.contains("Own later Human amendment 3f21")));
             let done=native::TaskTool.execute(json!({"action":"create","leader":"leader","title":"Updated request","inputId":input_id})).await.unwrap();
