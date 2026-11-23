@@ -1133,7 +1133,7 @@ new file mode 100644
 index 0000000..bd28722
 --- /dev/null
 +++ b/src/openhuman/channels/matrix_direct.rs
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,202 @@
 +//! Run-scoped controls for verified human/agent Matrix direct conversations.
 +#[cfg(test)]
 +#[path = "matrix_direct_tests.rs"]
@@ -1154,6 +1154,7 @@ index 0000000..bd28722
 +    pub inputs: Vec<String>,
 +    pub source_event_ids: Vec<String>,
 +    pub room: Room,
++    assistant: bool,
 +    pub cancel: CancellationToken,
 +    pub done: CancellationToken,
 +    pub queue: Arc<RunQueue>,
@@ -1176,6 +1177,7 @@ index 0000000..bd28722
 +    source_event_ids: Vec<String>,
 +) {
 +    let run = Arc::new(DirectRun {
++        assistant: super::task_protocol::assistant_notification(&id),
 +        id: id.clone(),
 +        sender,
 +        inputs,
@@ -1252,6 +1254,9 @@ index 0000000..bd28722
 +        true
 +    }
 +    pub async fn status(&self, status: &str) {
++        if self.assistant {
++            return;
++        }
 +        let body = match status {
 +            "running" => "正在执行",
 +            "stopping" => "正在停止",
@@ -1336,7 +1341,7 @@ new file mode 100644
 index 0000000..cbe3ce1
 --- /dev/null
 +++ b/src/openhuman/channels/matrix_direct_tests.rs
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,139 @@
 +use serde_json::json;
 +
 +#[tokio::test]
@@ -1450,6 +1455,18 @@ index 0000000..cbe3ce1
 +    assert_eq!(replacement.inputs, ["原任务", "补充杭州"]);
 +    assert_eq!(replacement.source_event_ids, ["$original", "$supplement"]);
 +    replacement.finish().await;
++    super::super::task_protocol::register("$assistant", json!({
++        "teamharness_coordination": {"kind": "assistant_digest"}
++    }));
++    super::register(replacement.room.clone(), "$assistant".into(),
++        "@agent:test".into(), vec![], vec![]);
++    let assistant = super::get("$assistant").unwrap();
++    // The native Task scope consumes the packet before completion.
++    super::super::task_protocol::register("$assistant", json!({}));
++    assistant.start().await;
++    assistant.finish().await;
++    assert!(assistant.done.is_cancelled());
++
 +    let statuses: Vec<_> = server
 +        .received_requests()
 +        .await
