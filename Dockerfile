@@ -109,6 +109,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ==========================================================================
 # Stage 3: Minimal runtime image with AgentTeams integration
 # ==========================================================================
+# Build the public CLI from the same pinned Core as the protocol assets.
+FROM higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/golang:1.26-alpine AS public-cli
+WORKDIR /build
+COPY --from=agentteams /agentteams-controller/ ./
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o /out/agt ./cmd/agt && /out/agt assistant --help > /dev/null
+
 FROM debian:bookworm-slim AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -180,7 +187,7 @@ RUN chmod +x /usr/local/bin/openhuman-worker-entrypoint.sh
 COPY --from=agentteams manager/agent/openhuman-worker-agent/ /opt/agentteams/agent/openhuman-worker-agent/
 
 # AgentTeams CLI — for worker lifecycle management via controller REST API
-COPY --from=agentteams-controller /usr/local/bin/agt /usr/local/bin/agt.bin
+COPY --from=public-cli /out/agt /usr/local/bin/agt.bin
 COPY --chmod=755 scripts/agt /usr/local/bin/agt
 
 # Copy the built binary and upstream license (GPL-3.0 compliance: recipients
