@@ -1809,7 +1809,7 @@ index 1e343d5..d126994 100644
  
          tracing::info!(
              "Matrix channel listening on room {} (configured as {})...",
-@@ -540,39 +771,139 @@ impl Channel for MatrixChannel {
+@@ -540,39 +771,140 @@ impl Channel for MatrixChannel {
              std::collections::HashSet::new(),
          )));
  
@@ -1929,6 +1929,7 @@ index 1e343d5..d126994 100644
 +                let coordination_session = coordination_body
 +                    .as_ref()
 +                    .map(|_| event.event_id.to_string());
++                let assistant_control = coordination_body.as_ref().is_some_and(|packet| packet.assistant);
 +                if let Some(packet) = coordination_body.as_ref() {
 +                    let mut metadata = packet.meta.clone();
 +                    metadata["otel_carrier"] = raw["content"]["com.agentteams.trace"].clone();
@@ -1958,7 +1959,7 @@ index 1e343d5..d126994 100644
                  if !MatrixChannel::has_non_empty_body(&body) {
                      return;
                  }
-@@ -581,27 +912,119 @@ impl Channel for MatrixChannel {
+@@ -581,27 +913,118 @@ impl Channel for MatrixChannel {
                  {
                      let mut guard = dedupe.lock().await;
                      let (recent_order, recent_lookup) = &mut *guard;
@@ -2013,7 +2014,6 @@ index 1e343d5..d126994 100644
 +                    crate::openhuman::channels::task_protocol::register(&event_id,
 +                        serde_json::json!({"otel_carrier":raw["content"]["com.agentteams.trace"]}));
 +                }
-+                let assistant_control = crate::openhuman::channels::task_protocol::assistant_notification(&event_id);
 +                // AT owns this control's recovery and sole visible delivery.
 +                if managed && !assistant_control {
 +                    if let Err(error) = worker_sync::admit(
