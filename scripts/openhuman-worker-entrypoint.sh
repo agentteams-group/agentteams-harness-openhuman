@@ -45,7 +45,10 @@ source /opt/agentteams/scripts/lib/agentteams-env.sh 2>/dev/null || true
 
 WORKER_NAME="${AGENTTEAMS_WORKER_NAME:?AGENTTEAMS_WORKER_NAME is required}"
 WORKER_CR_NAME="${AGENTTEAMS_WORKER_CR_NAME:-${WORKER_NAME}}"
-WORKSPACE="${AGENTTEAMS_WORKER_HOME:-/root/agentteams-fs/agents/${WORKER_NAME}}"
+# Keep managed Task files within the native filesystem policy.
+WORKSPACE="${AGENTTEAMS_WORKER_HOME:-/home/openhuman/agents/${WORKER_NAME}}"
+export AGENTTEAMS_WORKER_HOME="${WORKSPACE}"
+export TEAMHARNESS_SHARED_DIR="${WORKSPACE}/shared"
 export HOME="${WORKSPACE}"
 export OPENHUMAN_WORKSPACE="${WORKSPACE}"
 export OPENHUMAN_ACTION_DIR="${WORKSPACE}"
@@ -166,9 +169,8 @@ if [ -f "${OPENCLAW_JSON}" ] && command -v jq >/dev/null 2>&1; then
     fi
 
     # --- LLM provider config (AgentTeams AI gateway via Higress) ---
-    # Maps openclaw.json's models.providers["agentteams-gateway"] +
-    # agents.defaults.model.primary into OpenHuman's [[cloud_providers]]
-    # and [model_routes] sections so that the worker routes LLM traffic
+    # Maps your platform gateway and model into OpenHuman's independently
+    # authenticated local-openai workload routes so your worker routes LLM traffic
     # through Higress instead of falling back to api.openhuman.ai.
     BRIDGE_LLM_BASE_URL=$(jq -r '.models.providers["agentteams-gateway"].baseUrl // empty' "${OPENCLAW_JSON}")
     BRIDGE_LLM_API_KEY=$(jq -r '.models.providers["agentteams-gateway"].apiKey // empty' "${OPENCLAW_JSON}")
@@ -257,7 +259,7 @@ omit_memory_md = false
 inline = "You are the AgentTeams ${NATIVE_ROLE} named ${WORKER_NAME}. Follow your assigned role and credentials, and use your available tools to complete tasks."
 
 [tools]
-named = ["shell", "file_read", "file_write", "query_memory", "memory_store", "memory_forget", "mcp_list_tools", "mcp_call_tool"]
+named = ["task", "shell", "file_read", "file_write", "query_memory", "memory_store", "memory_forget", "mcp_list_tools", "mcp_call_tool"]
 EOF
     cat >> "${WORKSPACE}/config.toml" <<'EOF'
 
@@ -272,17 +274,24 @@ fi
 python3 /opt/agentteams/scripts/configure-teamharness.py "${WORKSPACE}" /opt/agentteams/plugins/teamharness
 
 # --- LLM routing through AgentTeams AI gateway (Higress) ---
-# Use openhuman-core's CLI to register the AgentTeams gateway as an
-# OpenAI-compatible inference endpoint. This is REQUIRED for AgentTeams-managed
+# Use the supported headless local-openai route with your own endpoint key.
+# Explicit consent applies to this configured platform gateway only. This is REQUIRED for AgentTeams-managed
 # workers; if not configured, the entrypoint aborts (fail-closed) to
 # prevent silent routing of workloads to external services.
 export OPENHUMAN_CONFIG="${WORKSPACE}/config.toml"
 if [ -n "${BRIDGE_LLM_BASE_URL}" ] && [ -n "${BRIDGE_LLM_API_KEY}" ]; then
     log "Configuring LLM: endpoint=${BRIDGE_LLM_BASE_URL} model=${BRIDGE_LLM_PRIMARY}"
-    if ! openhuman-core config update_model_settings \
-        --inference_url "${BRIDGE_LLM_BASE_URL}" \
+    export LOCAL_OPENAI_URL="${BRIDGE_LLM_BASE_URL}"
+    if ! openhuman-core config update_local_ai_settings \
+        --runtime_enabled true --opt_in_confirmed true \
         --api_key "${BRIDGE_LLM_API_KEY}" \
+        >/dev/null 2>&1 || ! openhuman-core config update_model_settings \
         --default_model "${BRIDGE_LLM_PRIMARY}" \
+        --chat_provider "local-openai:${BRIDGE_LLM_PRIMARY}" \
+        --reasoning_provider "local-openai:${BRIDGE_LLM_PRIMARY}" \
+        --agentic_provider "local-openai:${BRIDGE_LLM_PRIMARY}" \
+        --coding_provider "local-openai:${BRIDGE_LLM_PRIMARY}" \
+        --memory_provider "local-openai:${BRIDGE_LLM_PRIMARY}" \
         >/dev/null 2>&1; then
         log "FATAL: your native model configuration could not be applied; refusing to start"
         exit 1
@@ -317,7 +326,7 @@ export OPENHUMAN_CORE_TOKEN="${OPENHUMAN_CORE_TOKEN:-$(openssl rand -hex 32 2>/d
 # ============================================================
 
 TASK_SYNC_EXCLUDES=()
-if [ -n "${TEAMHARNESS_COORDINATION_URL:-}" ]; then
+if [ -n "${AGENTTEAMS_CONTROLLER_URL:-}" ]; then
     TASK_SYNC_EXCLUDES=(--exclude "tasks/**" --exclude "projects/**")
 fi
 

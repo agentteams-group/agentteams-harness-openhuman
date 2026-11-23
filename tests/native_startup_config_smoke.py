@@ -44,8 +44,11 @@ def main():
         # The CLI response wraps the persisted configuration in config.
         cfg = native['result']['config']
         assert cfg['default_model'] == 'worker-standard-model'
-        assert cfg['inference_url'] == 'http://gateway.invalid/v1'
-        assert cfg['api_key'] == 'synthetic-model-key'
+        assert cfg['local_ai']['runtime_enabled'] is True
+        assert cfg['local_ai']['opt_in_confirmed'] is True
+        assert cfg['local_ai']['api_key'] == 'synthetic-model-key'
+        for workload in ('chat', 'reasoning', 'agentic', 'coding', 'memory'):
+            assert cfg[f'{workload}_provider'] == 'local-openai:worker-standard-model'
         matrix = cfg['channels_config']['matrix']
         assert matrix['user_id'] == '@worker:test'
         assert matrix['room_id'] == '!home:test'
