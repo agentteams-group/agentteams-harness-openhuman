@@ -51,7 +51,7 @@ export AGENTTEAMS_WORKER_HOME="${WORKSPACE}"
 export TEAMHARNESS_SHARED_DIR="${WORKSPACE}/shared"
 export HOME="${WORKSPACE}"
 export OPENHUMAN_WORKSPACE="${WORKSPACE}"
-export OPENHUMAN_ACTION_DIR="${WORKSPACE}"
+export OPENHUMAN_ACTION_DIR="${WORKSPACE}/workspace"
 
 log() {
     echo "[agentteams-openhuman-worker $(date '+%Y-%m-%d %H:%M:%S')] $1"

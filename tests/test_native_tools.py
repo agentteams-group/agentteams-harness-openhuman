@@ -14,6 +14,14 @@ BOOTSTRAP = re.search(r'if \[ .*?\n    # Native channel turns.*?\nfi\n(?=\npytho
 BOOTSTRAP = BOOTSTRAP[BOOTSTRAP.rfind('\nif [', 0, BOOTSTRAP.index('# Native channel turns')) + 1:]
 
 class NativeToolsTests(unittest.TestCase):
+    def test_default_file_action_directory_matches_native_workspace(self):
+        prelude = SOURCE[SOURCE.index('WORKER_NAME='):SOURCE.index('\nlog()')]
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(['bash', '-e', '-c', prelude + '\nprintf "%s" "$OPENHUMAN_ACTION_DIR"'],
+                env={**os.environ, 'AGENTTEAMS_WORKER_NAME': 'demo', 'AGENTTEAMS_WORKER_HOME': directory},
+                capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout, str(Path(directory) / 'workspace'))
+
     def test_filesystem_scope_refusal_returns_a_definitive_tool_result(self):
         patch = (ROOT / 'patches/agentteams.patch').read_text()
         for write in ('false', 'true'):

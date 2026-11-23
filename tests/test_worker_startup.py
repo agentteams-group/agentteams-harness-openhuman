@@ -11,7 +11,7 @@ source = (Path(__file__).parents[1] / 'scripts/openhuman-worker-entrypoint.sh').
 
 
 @pytest.mark.parametrize('role', ['worker', 'manager', 'team_leader'])
-def test_workspace_belongs_to_worker_not_native_private_directory(tmp_path, role):
+def test_member_home_and_native_file_action_directory_are_distinct(tmp_path, role):
     start = source.index('WORKER_NAME=')
     end = source.index('\nlog()', start)
     result = subprocess.run(['bash', '-e', '-c', source[start:end] + '\nprintf "%s\\n" "$WORKSPACE" "$HOME" "$OPENHUMAN_WORKSPACE" "$OPENHUMAN_ACTION_DIR"'],
@@ -20,7 +20,7 @@ def test_workspace_belongs_to_worker_not_native_private_directory(tmp_path, role
                             'AGENTTEAMS_WORKER_HOME': str(tmp_path), 'OPENHUMAN_WORKSPACE': '/old/private/native-home',
                             'OPENHUMAN_ACTION_DIR': '/old/project-directory'})
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [str(tmp_path)] * 4
+    assert result.stdout.splitlines() == [str(tmp_path)] * 3 + [str(tmp_path / 'workspace')]
 
 
 def test_standard_projection_works_without_compatibility_or_private_directory(tmp_path):
