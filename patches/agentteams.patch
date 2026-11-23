@@ -1959,7 +1959,7 @@ index 1e343d5..d126994 100644
                  if !MatrixChannel::has_non_empty_body(&body) {
                      return;
                  }
-@@ -581,27 +913,118 @@ impl Channel for MatrixChannel {
+@@ -581,27 +913,121 @@ impl Channel for MatrixChannel {
                  {
                      let mut guard = dedupe.lock().await;
                      let (recent_order, recent_lookup) = &mut *guard;
@@ -2061,7 +2061,11 @@ index 1e343d5..d126994 100644
 +                    thread_ts: coordination_session,
                  };
  
-                 let _ = tx.send(msg).await;
+-                let _ = tx.send(msg).await;
++                if tx.send(msg).await.is_ok() && managed && assistant_control {
++                    // The AT outbox owns this control; do not replay it as ordinary input.
++                    worker_sync::retire_control(&key).await;
++                }
              }
 -        });
 +        };
