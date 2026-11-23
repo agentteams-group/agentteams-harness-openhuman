@@ -241,6 +241,7 @@ if [ -n "${WORKER_NAME}" ]; then
             printf '\nYour shared storage prefix: %s\n' "${AGENTTEAMS_STORAGE_PREFIX}"
         fi
         printf '\nUse file_write to create files. Your shell policy blocks environment-variable expansion and output redirection; use literal paths with mc for uploads.\n'
+        printf '\nYour file_read and file_write workspace is %s. Create relative files there, and pass their absolute paths under %s to CLI tools.\n' "${NATIVE_WORKSPACE}" "${NATIVE_WORKSPACE}"
     }
     # Channel turns load SOUL.md directly; the definition supplies tool scope.
     write_member_prompt > "${NATIVE_WORKSPACE}/SOUL.md"
