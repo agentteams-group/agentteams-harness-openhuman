@@ -40,6 +40,11 @@ pub(crate) fn register(event: &str, mut meta: Value) {
     notifications.insert(event.to_owned(), meta);
 }
 
+pub(crate) fn assistant_notification(event: &str) -> bool {
+    NOTIFICATIONS.lock().unwrap().get(event)
+        .is_some_and(|meta| meta["teamharness_coordination"]["kind"] == "assistant_digest")
+}
+
 /// A scan may recover the same source after its verified Matrix packet arrived.
 /// Fill absent metadata only; never replace the authoritative source packet.
 pub(crate) fn register_recovered(event: &str, meta: Value) {

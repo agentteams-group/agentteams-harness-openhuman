@@ -2157,7 +2157,7 @@ index 23a5fe9..482f829 100644
      let route = get_route_selection(ctx.as_ref(), &history_key);
      let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
          Ok(provider) => provider,
-@@ -863,11 +876,50 @@ pub(crate) async fn process_channel_message(
+@@ -863,11 +876,52 @@ pub(crate) async fn process_channel_message(
      let mut history = vec![ChatMessage::system(ctx.system_prompt.as_str())];
      history.append(&mut prior_turns);
      history.push(ChatMessage::user(&enriched_message));
@@ -2201,7 +2201,9 @@ index 23a5fe9..482f829 100644
 -        .as_ref()
 -        .is_some_and(|ch| ch.supports_draft_updates());
 +    #[cfg(feature = "channel-matrix")]
-+    let task_streaming_allowed = task_run.is_none();
++    let assistant_turn = crate::openhuman::channels::task_protocol::assistant_notification(&msg.id);
++    #[cfg(feature = "channel-matrix")]
++    let task_streaming_allowed = task_run.is_none() && !assistant_turn;
 +    #[cfg(not(feature = "channel-matrix"))]
 +    let task_streaming_allowed = true;
 +    let use_streaming = task_streaming_allowed
@@ -2287,7 +2289,7 @@ index 23a5fe9..482f829 100644
  
      // Wait for draft updater to finish
      if let Some(handle) = draft_updater {
-@@ -1123,6 +1222,41 @@ pub(crate) async fn process_channel_message(
+@@ -1123,6 +1222,46 @@ pub(crate) async fn process_channel_message(
          log_worker_join_result(handle.await);
      }
  
@@ -2323,6 +2325,11 @@ index 23a5fe9..482f829 100644
 +                tracing::warn!("Task native execution timed out; side effects require verification")
 +            }
 +        }
++        return;
++    }
++
++    #[cfg(feature = "channel-matrix")]
++    if assistant_turn {
 +        return;
 +    }
 +
