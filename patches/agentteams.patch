@@ -1958,7 +1958,7 @@ index 1e343d5..d126994 100644
                  if !MatrixChannel::has_non_empty_body(&body) {
                      return;
                  }
-@@ -581,27 +912,117 @@ impl Channel for MatrixChannel {
+@@ -581,27 +912,119 @@ impl Channel for MatrixChannel {
                  {
                      let mut guard = dedupe.lock().await;
                      let (recent_order, recent_lookup) = &mut *guard;
@@ -2013,7 +2013,9 @@ index 1e343d5..d126994 100644
 +                    crate::openhuman::channels::task_protocol::register(&event_id,
 +                        serde_json::json!({"otel_carrier":raw["content"]["com.agentteams.trace"]}));
 +                }
-+                if managed {
++                let assistant_control = crate::openhuman::channels::task_protocol::assistant_notification(&event_id);
++                // AT owns this control's recovery and sole visible delivery.
++                if managed && !assistant_control {
 +                    if let Err(error) = worker_sync::admit(
 +                        &client,
 +                        &tx,
@@ -2031,7 +2033,7 @@ index 1e343d5..d126994 100644
 +                    }
 +                    return;
 +                }
-+                if direct {
++                if direct && !assistant_control {
 +                    crate::openhuman::channels::matrix_direct::register(
 +                        room.clone(),
 +                        event_id.clone(),
