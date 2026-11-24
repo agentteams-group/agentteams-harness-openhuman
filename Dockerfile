@@ -95,6 +95,9 @@ COPY patches/task_protocol.rs /build/openhuman-src/src/openhuman/channels/task_p
 COPY patches/task_telemetry.rs /build/openhuman-src/src/openhuman/channels/task_telemetry.rs
 COPY patches/agentteams.patch /tmp/agentteams.patch
 RUN git -C /build/openhuman-src apply /tmp/agentteams.patch
+COPY patches/hitl.rs /build/openhuman-src/src/openhuman/approval/hitl.rs
+COPY patches/unified-hitl.patch /tmp/unified-hitl.patch
+RUN git -C /build/openhuman-src apply /tmp/unified-hitl.patch
 
 WORKDIR /build/openhuman-src
 
