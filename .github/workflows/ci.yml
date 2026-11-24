@@ -65,9 +65,11 @@ jobs:
           cp patches/worker_matrix.rs native/src/openhuman/channels/providers/matrix/worker_sync.rs
           cp patches/task_protocol.rs native/src/openhuman/channels/task_protocol.rs
           cp patches/task_telemetry.rs native/src/openhuman/channels/task_telemetry.rs
+          cp patches/hitl.rs native/src/openhuman/channels/hitl.rs
           sudo mkdir -p /opt/agentteams/scripts/lib
           sudo cp agentteams/shared/lib/*.py /opt/agentteams/scripts/lib/
           git -C native apply "$GITHUB_WORKSPACE/patches/agentteams.patch"
+          git -C native apply "$GITHUB_WORKSPACE/patches/unified-hitl.patch"
       - name: Verify native Matrix controls and tool cleanup
         working-directory: native
         run: |
@@ -78,6 +80,7 @@ jobs:
           cargo test --locked --lib --no-default-features --features channel-matrix channels::session_receipts::tests
           cargo test --locked --lib --no-default-features --features channel-matrix channels::matrix_direct::tests
           cargo test --locked --lib --no-default-features --features channel-matrix approval::matrix::tests
+          cargo test --locked --lib --no-default-features --features channel-matrix channels::hitl::tests
 
   image:
     runs-on: ubuntu-24.04
