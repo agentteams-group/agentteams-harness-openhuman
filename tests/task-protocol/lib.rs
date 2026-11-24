@@ -1,6 +1,8 @@
 //! Compile and exercise the real Rust binding with SDK interface stubs.
 //! This proves context/bridge IO, not a compiled full SDK or model certification.
 #![allow(dead_code)]
+#[path = "../../patches/hitl.rs"]
+pub(crate) mod hitl;
 #[path = "../../patches/session_receipts.rs"]
 pub(crate) mod session_receipts;
 #[path = "../../patches/task_protocol.rs"]

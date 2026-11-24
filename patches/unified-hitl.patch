@@ -1,0 +1,18 @@
+--- a/src/openhuman/approval/mod.rs
++++ b/src/openhuman/approval/mod.rs
+@@ -16,2 +16,3 @@
+ pub mod gate;
++pub(crate) mod hitl;
+ pub mod matrix;
+--- a/src/openhuman/approval/matrix.rs
++++ b/src/openhuman/approval/matrix.rs
+@@ -194,2 +194,3 @@
+         "version": 1, "runtime": "openhuman", "request_id": waiter.id,
++        "reply_format": "com.agentteams.answer",
+         "context_id": waiter.context, "status": status,
+--- a/src/openhuman/channels/providers/matrix.rs
++++ b/src/openhuman/channels/providers/matrix.rs
+@@ -887,2 +887,3 @@
+                 let key = worker_sync::event_key(room.room_id().as_str(), event.event_id.as_str());
++                let body = crate::openhuman::approval::hitl::approval_body(&raw["content"], my_user_id.as_str()).unwrap_or(body);
+                 if crate::openhuman::approval::matrix::answer(
