@@ -1133,7 +1133,7 @@ new file mode 100644
 index 0000000..bd28722
 --- /dev/null
 +++ b/src/openhuman/channels/matrix_direct.rs
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,202 @@
 +//! Run-scoped controls for verified human/agent Matrix direct conversations.
 +#[cfg(test)]
 +#[path = "matrix_direct_tests.rs"]
@@ -1154,6 +1154,7 @@ index 0000000..bd28722
 +    pub inputs: Vec<String>,
 +    pub source_event_ids: Vec<String>,
 +    pub room: Room,
++    assistant: bool,
 +    pub cancel: CancellationToken,
 +    pub done: CancellationToken,
 +    pub queue: Arc<RunQueue>,
@@ -1176,6 +1177,7 @@ index 0000000..bd28722
 +    source_event_ids: Vec<String>,
 +) {
 +    let run = Arc::new(DirectRun {
++        assistant: super::task_protocol::assistant_notification(&id),
 +        id: id.clone(),
 +        sender,
 +        inputs,
@@ -1252,6 +1254,9 @@ index 0000000..bd28722
 +        true
 +    }
 +    pub async fn status(&self, status: &str) {
++        if self.assistant {
++            return;
++        }
 +        let body = match status {
 +            "running" => "正在执行",
 +            "stopping" => "正在停止",
@@ -1336,7 +1341,7 @@ new file mode 100644
 index 0000000..cbe3ce1
 --- /dev/null
 +++ b/src/openhuman/channels/matrix_direct_tests.rs
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,139 @@
 +use serde_json::json;
 +
 +#[tokio::test]
@@ -1450,6 +1455,18 @@ index 0000000..cbe3ce1
 +    assert_eq!(replacement.inputs, ["原任务", "补充杭州"]);
 +    assert_eq!(replacement.source_event_ids, ["$original", "$supplement"]);
 +    replacement.finish().await;
++    super::super::task_protocol::register("$assistant", json!({
++        "teamharness_coordination": {"kind": "assistant_digest"}
++    }));
++    super::register(replacement.room.clone(), "$assistant".into(),
++        "@agent:test".into(), vec![], vec![]);
++    let assistant = super::get("$assistant").unwrap();
++    // The native Task scope consumes the packet before completion.
++    super::super::task_protocol::register("$assistant", json!({}));
++    assistant.start().await;
++    assistant.finish().await;
++    assert!(assistant.done.is_cancelled());
++
 +    let statuses: Vec<_> = server
 +        .received_requests()
 +        .await
@@ -1792,7 +1809,7 @@ index 1e343d5..d126994 100644
  
          tracing::info!(
              "Matrix channel listening on room {} (configured as {})...",
-@@ -540,39 +771,139 @@ impl Channel for MatrixChannel {
+@@ -540,39 +771,140 @@ impl Channel for MatrixChannel {
              std::collections::HashSet::new(),
          )));
  
@@ -1912,6 +1929,7 @@ index 1e343d5..d126994 100644
 +                let coordination_session = coordination_body
 +                    .as_ref()
 +                    .map(|_| event.event_id.to_string());
++                let assistant_control = coordination_body.as_ref().is_some_and(|packet| packet.assistant);
 +                if let Some(packet) = coordination_body.as_ref() {
 +                    let mut metadata = packet.meta.clone();
 +                    metadata["otel_carrier"] = raw["content"]["com.agentteams.trace"].clone();
@@ -1941,7 +1959,7 @@ index 1e343d5..d126994 100644
                  if !MatrixChannel::has_non_empty_body(&body) {
                      return;
                  }
-@@ -581,27 +912,117 @@ impl Channel for MatrixChannel {
+@@ -581,27 +913,121 @@ impl Channel for MatrixChannel {
                  {
                      let mut guard = dedupe.lock().await;
                      let (recent_order, recent_lookup) = &mut *guard;
@@ -1996,7 +2014,8 @@ index 1e343d5..d126994 100644
 +                    crate::openhuman::channels::task_protocol::register(&event_id,
 +                        serde_json::json!({"otel_carrier":raw["content"]["com.agentteams.trace"]}));
 +                }
-+                if managed {
++                // AT owns this control's recovery and sole visible delivery.
++                if managed && !assistant_control {
 +                    if let Err(error) = worker_sync::admit(
 +                        &client,
 +                        &tx,
@@ -2014,7 +2033,7 @@ index 1e343d5..d126994 100644
 +                    }
 +                    return;
 +                }
-+                if direct {
++                if direct && !assistant_control {
 +                    crate::openhuman::channels::matrix_direct::register(
 +                        room.clone(),
 +                        event_id.clone(),
@@ -2042,7 +2061,11 @@ index 1e343d5..d126994 100644
 +                    thread_ts: coordination_session,
                  };
  
-                 let _ = tx.send(msg).await;
+-                let _ = tx.send(msg).await;
++                if tx.send(msg).await.is_ok() && managed && assistant_control {
++                    // The AT outbox owns this control; do not replay it as ordinary input.
++                    worker_sync::retire_control(&key).await;
++                }
              }
 -        });
 +        };
@@ -2157,7 +2180,7 @@ index 23a5fe9..482f829 100644
      let route = get_route_selection(ctx.as_ref(), &history_key);
      let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
          Ok(provider) => provider,
-@@ -863,11 +876,50 @@ pub(crate) async fn process_channel_message(
+@@ -863,11 +876,52 @@ pub(crate) async fn process_channel_message(
      let mut history = vec![ChatMessage::system(ctx.system_prompt.as_str())];
      history.append(&mut prior_turns);
      history.push(ChatMessage::user(&enriched_message));
@@ -2201,7 +2224,9 @@ index 23a5fe9..482f829 100644
 -        .as_ref()
 -        .is_some_and(|ch| ch.supports_draft_updates());
 +    #[cfg(feature = "channel-matrix")]
-+    let task_streaming_allowed = task_run.is_none();
++    let assistant_turn = crate::openhuman::channels::task_protocol::assistant_notification(&msg.id);
++    #[cfg(feature = "channel-matrix")]
++    let task_streaming_allowed = task_run.is_none() && !assistant_turn;
 +    #[cfg(not(feature = "channel-matrix"))]
 +    let task_streaming_allowed = true;
 +    let use_streaming = task_streaming_allowed
@@ -2287,7 +2312,7 @@ index 23a5fe9..482f829 100644
  
      // Wait for draft updater to finish
      if let Some(handle) = draft_updater {
-@@ -1123,6 +1222,41 @@ pub(crate) async fn process_channel_message(
+@@ -1123,6 +1222,46 @@ pub(crate) async fn process_channel_message(
          log_worker_join_result(handle.await);
      }
  
@@ -2323,6 +2348,11 @@ index 23a5fe9..482f829 100644
 +                tracing::warn!("Task native execution timed out; side effects require verification")
 +            }
 +        }
++        return;
++    }
++
++    #[cfg(feature = "channel-matrix")]
++    if assistant_turn {
 +        return;
 +    }
 +
