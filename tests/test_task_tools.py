@@ -35,7 +35,7 @@ def test_native_stdio_mapping_uses_the_projected_identity_and_role_skills(tmp_pa
     assert 'mcp_call_tool' in (tmp_path / 'workspace/SOUL.md').read_text()
     public_schema = __import__('json').loads((tmp_path / '.agentteams/native-task-schema.json').read_text())
     actions = public_schema['inputSchema']['properties']['action']['enum']
-    assert ('create' in actions) == (role == 'manager')
+    assert ('create' in actions) == (role in {'manager', 'team_leader'})
     assert ('plan' in actions) == (role == 'team_leader')
     assert ('submit' in actions) == (role in {'worker', 'standalone'})
     prompt = (tmp_path / 'workspace/SOUL.md').read_text()

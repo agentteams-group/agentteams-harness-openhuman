@@ -292,10 +292,10 @@ index 0000000..ecf9fcf
 +        for text in ["first supplement","second supplement"]{
 +            queue.push(QueuedMessage{text:text.into(),mode:QueueMode::Steer,client_id:text.into(),thread_id:"native-direct".into(),queued_at_ms:0,model_override:None,temperature:None,profile_id:None,locale:None}).await;
 +        }
-+        release.notify_one();let result=run.await.unwrap();assert!(result.text.contains("Task system receipt"));assert!(native::completed().is_some());assert_eq!(queue.status().await.total,0);
++        release.notify_one();let result=run.await.unwrap();assert!(result.text.is_empty());assert!(native::completed().is_some());assert_eq!(queue.status().await.total,0);
 +        result.text
 +    }).await.unwrap();
-+    assert!(finished.contains("Task system receipt"));
++    assert!(finished.is_empty());
 +    assert_eq!(model.0.load(Ordering::SeqCst), 2);
 +    tokio::task::spawn_blocking(task_telemetry::flush)
 +        .await

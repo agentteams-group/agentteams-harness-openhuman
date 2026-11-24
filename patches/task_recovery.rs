@@ -934,6 +934,7 @@ async fn scan(
             .cloned()
             .unwrap_or_else(|| format!("recovery:{}", uuid::Uuid::new_v4()));
         bind_protocol_source(&id, &task);
+        super::task_protocol::register_recovered(&id, json!({"agent_matrix_user_id":own}));
         RUNS.lock().unwrap().insert(id.clone(), run.clone());
         let input = ChannelMessage {
             id: id.clone(),
