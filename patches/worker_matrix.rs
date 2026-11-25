@@ -82,7 +82,8 @@ fn classify(
     let mentioned = c["m.mentions"]["user_ids"]
         .as_array()
         .is_some_and(|ids| ids.iter().any(|id| id == account.as_str()));
-    let intent = if allowed && (room == target || mentioned) {
+    let approval = !crate::openhuman::approval::hitl::requires_history(c, account.as_str());
+    let intent = if allowed && (room == target || mentioned || approval) {
         Some("message")
     } else {
         None
@@ -159,6 +160,32 @@ async fn advance_gap(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_native_approval_does_not_need_a_mention_or_complete_history() {
+        let channel = MatrixChannel::new("http://localhost".into(), "test-token".into(),
+            "!dm:test".into(), vec!["@human:test".into()]);
+        let target: OwnedRoomId = "!dm:test".try_into().unwrap();
+        let room: OwnedRoomId = "!task:test".try_into().unwrap();
+        let account: OwnedUserId = "@worker:test".try_into().unwrap();
+        let mut raw = json!({"type":"m.room.message","event_id":"$answer","sender":"@human:test",
+            "content":{"msgtype":"m.text","body":"批准本次", "com.agentteams.answer":{
+                "kind":"tool_approval","agent_id":"@worker:test","confirmation_id":"req-1",
+                "context_id":"ctx-1","answer":"approved"}}});
+        assert_eq!(classify(&channel, &target, &account, &room, &raw).unwrap().unwrap()["intent"], "message");
+        assert!(!crate::openhuman::approval::hitl::requires_history(&raw["content"], account.as_str()));
+        raw["sender"] = json!("@stranger:test");
+        assert!(classify(&channel, &target, &account, &room, &raw).unwrap().unwrap()["intent"].is_null());
+        raw["sender"] = json!("@human:test");
+        raw["content"]["com.agentteams.answer"]["agent_id"] = json!("@other:test");
+        assert!(classify(&channel, &target, &account, &room, &raw).unwrap().unwrap()["intent"].is_null());
+        assert!(crate::openhuman::approval::hitl::requires_history(&raw["content"], account.as_str()));
+    }
+}
+
 async fn recover<F, Fut>(
     channel: &MatrixChannel,
     client: &MatrixSdkClient,
@@ -202,6 +229,8 @@ where
             if snapshot["state"]["rooms"][room]["gaps"]
                 .as_array()
                 .is_some_and(|g| !g.is_empty())
+                && crate::openhuman::approval::hitl::requires_history(
+                    &record["input"]["content"], account.as_str())
             {
                 continue;
             }

@@ -19,6 +19,12 @@ pub(crate) fn approval_body(content: &serde_json::Value, own: &str) -> Option<St
     Some(format!("/agentteams-approval {action} {request} {context}"))
 }
 
+/// A targeted native decision can reach its existing waiter while room history
+/// catches up. The waiter still checks the original Human, room and context.
+pub(crate) fn requires_history(content: &serde_json::Value, own: &str) -> bool {
+    approval_body(content, own).is_none_or(|command| command.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28,9 +34,13 @@ mod tests {
             "com.agentteams.answer":{"kind":"tool_approval","agent_id":"@worker:s",
             "confirmation_id":"req-1","context_id":"ctx-1","answer":"approved"}});
         assert_eq!(approval_body(&content, "@worker:s").as_deref(), Some("/agentteams-approval approve req-1 ctx-1"));
+        assert!(!requires_history(&content, "@worker:s"));
         assert_eq!(approval_body(&content, "@other:s").as_deref(), Some(""));
+        assert!(requires_history(&content, "@other:s"));
         content["com.agentteams.answer"]["confirmation_id"] = serde_json::json!("one\n/approve two");
         assert_eq!(approval_body(&content, "@worker:s").as_deref(), Some(""));
+        assert!(requires_history(&content, "@worker:s"));
         assert_eq!(approval_body(&serde_json::json!({"body":"legacy"}), "@worker:s"), None);
+        assert!(requires_history(&serde_json::json!({"body":"legacy"}), "@worker:s"));
     }
 }

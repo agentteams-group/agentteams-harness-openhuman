@@ -55,6 +55,7 @@ jobs:
           AT_SOURCE="$GITHUB_WORKSPACE/agentteams" python3 -m pytest -q tests
           cargo test --locked --manifest-path tests/session-receipts/Cargo.toml
           cargo test --locked --manifest-path tests/task-protocol/Cargo.toml
+          cargo test --locked --manifest-path tests/task-progress/Cargo.toml
           bash -n scripts/openhuman-worker-entrypoint.sh scripts/agt
       - name: Apply the packaged patches
         run: |
@@ -70,12 +71,16 @@ jobs:
           sudo cp agentteams/shared/lib/*.py /opt/agentteams/scripts/lib/
           git -C native apply "$GITHUB_WORKSPACE/patches/agentteams.patch"
           git -C native apply "$GITHUB_WORKSPACE/patches/unified-hitl.patch"
+          cp patches/task_progress.rs native/src/openhuman/channels/task_progress.rs
+          git -C native apply "$GITHUB_WORKSPACE/patches/matrix-progress.patch"
       - name: Verify native Matrix controls and tool cleanup
         working-directory: native
         run: |
           cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery
           cargo test --locked --lib --no-default-features --features channel-matrix agentteams_native_task_protocol_ -- --test-threads=1
           cargo test --locked --lib --no-default-features --features channel-matrix agentteams_native_steer_
+          cargo test --locked --lib --no-default-features --features channel-matrix channels::task_progress::tests
+          cargo test --locked --lib --no-default-features --features channel-matrix worker_sync::tests
           cargo test --locked --lib --no-default-features --features channel-matrix channels::task_recovery::tests
           cargo test --locked --lib --no-default-features --features channel-matrix channels::session_receipts::tests
           cargo test --locked --lib --no-default-features --features channel-matrix channels::matrix_direct::tests

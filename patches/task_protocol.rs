@@ -181,6 +181,10 @@ pub(crate) async fn scope<F: Future>(
         .await)
 }
 
+pub(crate) fn suppress_progress() -> bool {
+    CURRENT.try_with(|turn| turn.coordination["kind"] == "assistant_digest").unwrap_or(false)
+}
+
 pub(crate) fn allowed_tool(name: &str) -> bool {
     CURRENT
         .try_with(|turn| {
