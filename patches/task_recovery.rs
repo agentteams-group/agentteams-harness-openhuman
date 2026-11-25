@@ -125,6 +125,11 @@ pub(crate) fn enabled() -> bool {
 pub(crate) fn get(id: &str) -> Option<Arc<Run>> {
     RUNS.lock().unwrap().get(id).cloned()
 }
+pub(crate) fn handoff_target() -> Option<Value> {
+    TASK_RUN.try_with(|run| (!run.message()).then(|| json!({"runtime":"openhuman",
+        "session":run.session,"scope":digest(&run.scope)}))).ok().flatten()
+}
+
 pub(crate) fn progress_run_id() -> Option<String> {
     TASK_RUN.try_with(|run| run.progress_run_id()).ok()
 }
@@ -321,7 +326,10 @@ pub(crate) async fn route_task_message(input: &Value) -> Result<bool, &'static s
             run.work["task_id"].as_str().ok_or("missing Task identity")?.to_owned()
         }
         [] => {
-            let snapshot = rpc(json!({"action":"discover"})).await?;
+            if let Err(error) = retain_handoffs().await {
+        tracing::warn!("Confirmed Task handoffs remain pending: {error}");
+    }
+    let snapshot = rpc(json!({"action":"discover"})).await?;
             let Some(task) = supplement_task(&snapshot, room) else { return Ok(false); };
             task.to_owned()
         }
@@ -685,28 +693,9 @@ impl Run {
             serde_json::to_value(&history).map_err(|_| "native history serialization failed")?;
         let cache = json!({"format_version":1, "runtime":"openhuman", "authority":authority(), "scope":self.scope,
             "session_id":self.session, "checkpoint_digest":current["checkpoint_digest"],
+            "delivery_event": current["task"]["execution"]["checkpoint"]["reply_event"],
             "native_digest":digest(&serialized), "history":serialized, "expires_at":now()+86400});
-        let directory = self.cache_path.parent().ok_or("missing cache directory")?;
-        std::fs::create_dir_all(directory).map_err(|_| "native cache persistence failed")?;
-        let temporary = directory.join(uuid::Uuid::new_v4().to_string());
-        let result = (|| -> std::io::Result<()> {
-            use std::io::Write;
-            let mut options = std::fs::OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
-            file.write_all(cache.to_string().as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, &self.cache_path)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-            return Err("native cache persistence failed");
-        }
+        write_session(&self.cache_path, &cache)?;
         *self.native_history.lock().unwrap() = history;
         if !terminal {
             rpc(json!({"action":"session.remember","work":work,"snapshot":current,"identity":self.identity,
@@ -918,13 +907,78 @@ pub(crate) async fn finish_message_tools(op: Option<String>, results: Value) -> 
 }
 
 /// The same binding used by scan and the actual native ingress regression.
-pub(crate) fn bind_protocol_source(id: &str, task: &Value) {
+pub(crate) fn bind_protocol_source(id: &str, task: &Value, own: &str) {
     if task.get("task_plan_id").and_then(Value::as_str).is_some() {
-        super::task_protocol::register_recovered(id, json!({"teamharness_coordination": {
+        super::task_protocol::register_recovered(id, json!({"agent_matrix_user_id":own,"teamharness_coordination": {
             "kind":"task_assigned", "task_id":task["task_id"], "main_task_id":task["main_task_id"],
             "project_id":task.get("project_id").cloned().unwrap_or(json!("")), "delivery_id":task["notifyTxn"]
         }}));
     }
+}
+
+fn write_session(path: &std::path::Path, cache: &Value) -> Result<(), &'static str> {
+    let directory = path.parent().ok_or("missing cache directory")?;
+    std::fs::create_dir_all(directory).map_err(|_| "native cache persistence failed")?;
+    let temporary = directory.join(uuid::Uuid::new_v4().to_string());
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(cache.to_string().as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err("native cache persistence failed");
+    }
+    Ok(())
+}
+
+async fn retain_handoffs() -> Result<(), &'static str> {
+    let folder = home().join(".agentteams/native-handoffs");
+    if !folder.is_dir() || std::fs::read_dir(&folder).map_err(|_| "handoff directory unavailable")?.next().is_none() {
+        return Ok(());
+    }
+    let pending = super::task_protocol::bridge(json!({"operation":"confirmed_handoffs","runtime":"openhuman"}))
+        .await.map_err(|_| "handoff lookup unavailable")?;
+    for item in pending["items"].as_array().ok_or("invalid handoff response")? {
+        let target = &item["target"];
+        let scope = target["scope"].as_str().ok_or("missing session scope")?;
+        let key = item["key"].as_str().ok_or("missing handoff key")?;
+        if [scope, key].iter().any(|s| s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Err("invalid native handoff reference");
+        }
+        if RUNS.lock().unwrap().values().any(|run| digest(&run.scope) == scope) {
+            continue;
+        }
+        let path = home().join("runtime/openhuman-task-sessions").join(format!("{scope}.json"));
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let mut saved: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid saved native transcript")?;
+        if saved["session_id"] != target["session"] || saved["authority"] != authority()
+            || digest(&saved["scope"]) != scope || saved["native_digest"] != digest(&saved["history"])
+            || saved["delivery_event"].as_str().is_none_or(|id| !id.starts_with('$')) {
+            continue;
+        }
+        let history = saved["history"].as_array_mut().ok_or("invalid native history")?;
+        for fact in item["facts"].as_array().ok_or("missing confirmed facts")? {
+            let row = serde_json::to_value(ChatMessage::system(fact.as_str().ok_or("invalid confirmed fact")?))
+                .map_err(|_| "invalid native system message")?;
+            if !history.contains(&row) {
+                history.push(row);
+            }
+        }
+        saved["native_digest"] = json!(digest(&saved["history"]));
+        write_session(&path, &saved)?;
+        std::fs::remove_file(folder.join(format!("{key}.json"))).map_err(|_| "handoff acknowledgement failed")?;
+    }
+    Ok(())
 }
 
 async fn scan(
@@ -932,6 +986,9 @@ async fn scan(
     own: &str,
     tx: &mpsc::Sender<ChannelMessage>,
 ) -> Result<(), &'static str> {
+    if let Err(error) = retain_handoffs().await {
+        tracing::warn!("Confirmed Task handoffs remain pending: {error}");
+    }
     let snapshot = rpc(json!({"action":"discover"})).await?;
     let mut entries = snapshot["tasks"]
         .as_array()
@@ -1027,7 +1084,7 @@ async fn scan(
             .and_then(|ids| ids.first())
             .cloned()
             .unwrap_or_else(|| format!("recovery:{}", uuid::Uuid::new_v4()));
-        bind_protocol_source(&id, &task);
+        bind_protocol_source(&id, &task, own);
         super::task_protocol::register_recovered(&id, json!({"agent_matrix_user_id":own}));
         RUNS.lock().unwrap().insert(id.clone(), run.clone());
         let input = ChannelMessage {

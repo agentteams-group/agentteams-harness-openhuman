@@ -253,7 +253,7 @@ new file mode 100644
 +        "$native-source",
 +        &json!({
 +            "task_plan_id":"plan", "task_id":"native-exec", "main_task_id":"main", "notifyTxn":"dispatch"
-+        }),
++        }), "@leader:test",
 +    );
 +    let message = ChannelMessage {
 +        id: "$native-source".into(),

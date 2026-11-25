@@ -98,6 +98,7 @@ mod openhuman {
             pub fn phase_completed() {}
         }
         pub mod task_recovery {
+            pub fn handoff_target() -> Option<serde_json::Value> { None }
             pub async fn checkpoint(
                 _: &[super::super::inference::provider::ChatMessage],
             ) -> anyhow::Result<()> {

@@ -67,7 +67,7 @@ fn home() -> PathBuf {
         .expect("Task member home is required")
 }
 
-async fn bridge(request: Value) -> anyhow::Result<Value> {
+pub(super) async fn bridge(request: Value) -> anyhow::Result<Value> {
     let plugin = std::env::var_os("AGENTTEAMS_PLUGIN_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/opt/agentteams/plugins/teamharness"));
@@ -431,6 +431,9 @@ impl Tool for TaskTool {
         let mut context = turn.context.lock().unwrap().clone();
         if let Some(id) = super::task_progress::run_id() {
             context["runId"] = json!(id);
+        }
+        if let Some(target) = super::task_recovery::handoff_target() {
+            context["handoffTarget"] = target;
         }
         let outcome =
             bridge(json!({"operation":"task","arguments":arguments,"context":context})).await?;
