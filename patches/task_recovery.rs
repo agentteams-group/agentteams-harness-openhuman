@@ -295,6 +295,45 @@ fn delivered_event(
     None
 }
 
+fn ordinary_task_input(input: &Value) -> bool {
+    let content = &input["input"]["content"];
+    input["intent"] == "message"
+        && input["work"]["kind"] == "message"
+        && ["org.agentteams.coordination", "com.agentteams.control", "com.agentteams.answer"]
+            .iter().all(|key| content.get(*key).is_none())
+}
+
+/// Retain a room supplement for the owned Task's next native engine boundary.
+/// The shared message lease is retired only after actual Task-history persistence.
+pub(crate) async fn route_task_message(input: &Value) -> Result<bool, &'static str> {
+    if !ordinary_task_input(input) {
+        return Ok(false);
+    }
+    let candidates: Vec<_> = RUNS.lock().unwrap().values()
+        .filter(|run| !run.message() && input["room_id"] == run.room
+            && !run.finished.load(Ordering::Acquire) && !run.cancel.is_cancelled())
+        .cloned().collect();
+    let [run] = candidates.as_slice() else { return Ok(false); };
+    let owned = run.current().await?;
+    if owned["task"]["status"] != "in_progress" {
+        return Ok(false);
+    }
+    if owned["task"]["execution"]["state"] != "active" {
+        return Err("owned Task requires verification before receiving supplements");
+    }
+    let room = input["room_id"].as_str().ok_or("missing supplement room")?;
+    let event = input["event_id"].as_str().ok_or("missing supplement event")?;
+    let claim = rpc(json!({"action":"matrix.message.claim","event_key":digest(&json!([room,event]))})).await?;
+    match claim["recovery"].as_str() {
+        Some("resume") => {
+            source(room, run.work["task_id"].as_str().ok_or("missing Task identity")?, event);
+            Ok(true)
+        }
+        Some("verify") => Err("supplement has an unverified ordinary operation"),
+        _ => Ok(false),
+    }
+}
+
 fn append_assignment(
     history: &mut Vec<ChatMessage>,
     input: &Value,
@@ -302,14 +341,14 @@ fn append_assignment(
     room: &str,
     id: &str,
 ) -> Result<Option<ChatMessage>, &'static str> {
-    if input["work"] != *work
+    let supplement = ordinary_task_input(input);
+    if (!supplement && (input["work"] != *work || input["intent"] != "task_notification"))
         || input["room_id"] != room
         || input["event_id"] != id
-        || input["intent"] != "task_notification"
     {
         return Err("assignment scope changed");
     }
-    if !input["native_commit"].is_null() {
+    if !supplement && !input["native_commit"].is_null() {
         return Ok(None);
     }
     let msg = ChatMessage::user(json!({"room_id":room,"event_id":id,"sender":input["input"]["sender"],"content":input["input"]["content"]}).to_string());
@@ -406,6 +445,13 @@ impl Run {
                 )
                 .map_err(|_| "native assignment persistence failed")?;
                 commit_input(&home(), &self.room, &id, &self.session).await?;
+                if ordinary_task_input(&view["input"]) {
+                    let claim = rpc(json!({"action":"matrix.message.claim","event_key":key})).await?;
+                    if claim["recovery"] != "resume" {
+                        return Err("supplement execution requires verification");
+                    }
+                    rpc(json!({"action":"matrix.message.cancel","identity":claim["identity"]})).await?;
+                }
             }
             if let Some(events) = SOURCES.lock().unwrap().get_mut(&scope) {
                 events.retain(|old| old != &id);
@@ -1058,6 +1104,46 @@ mod tests {
             server.verify().await;
             std::fs::remove_file(&run.cache_path).unwrap();
         }
+        // A plain accepted room supplement joins the existing owned Task.
+        // It must not be dispatched as a second ordinary message execution.
+        let server = MockServer::start().await;
+        unsafe { std::env::set_var("AGENTTEAMS_CONTROLLER_URL", server.uri()); }
+        let identity = json!({"task_id":"T","team_id":"team","process_id":"own-process","instance_id":"container/start","generation":1});
+        let task = json!({"task_id":"T","status":"in_progress","execution":{
+            "process_id":"own-process","instance_id":"container/start","generation":1,"state":"active"}});
+        Mock::given(method("GET")).and(path("/api/v1/tasks/recoverable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"instance_id":"container/start",
+                "tasks":[{"team_id":"team","task":task}]}))).expect(2).mount(&server).await;
+        let event_key = digest(&json!(["!task:test", "$supplement"]));
+        let route = format!("/api/v1/runtime/matrix/events/{event_key}/execution");
+        for verb in ["GET", "POST"] {
+            Mock::given(method(verb)).and(path(route.clone()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"etag":"fixture-etag","instance_id":"container/start","runtime":"openhuman",
+                    "input":{"room_id":"!task:test","event_id":"$supplement"},
+                    "execution":{"generation":1,"instance_id":"container/start","process_id":"own-process"},
+                    "recovery":"resume"}))).expect(2).mount(&server).await;
+        }
+        let client = Client::builder().homeserver_url(server.uri()).build().await.unwrap();
+        let run = Run::new(&client, "!task:test", identity,
+            json!({"kind":"task","team_id":"team","task_id":"T"}), json!(["team","T"]), "new-task", false).await.unwrap();
+        RUNS.lock().unwrap().insert("$owned-task".into(), run.clone());
+        let input = json!({"intent":"message","work":{"kind":"message"},"room_id":"!task:test",
+            "event_id":"$supplement","input":{"sender":"@human:test","content":{"body":"Use the browser"}}});
+        for _ in 0..2 { assert!(route_task_message(&input).await.unwrap()); }
+        let pending_key = digest(&json!(["!task:test","T"]));
+        assert_eq!(SOURCES.lock().unwrap().get(&pending_key).unwrap(), &["$supplement"]);
+        assert_eq!(RUNS.lock().unwrap().len(), 1, "a supplement must not create a message Run");
+        let mut elsewhere = input.clone();
+        elsewhere["room_id"] = json!("!other:test");
+        assert!(!route_task_message(&elsewhere).await.unwrap());
+        let mut approval = input.clone();
+        approval["input"]["content"]["com.agentteams.answer"] = json!({});
+        assert!(!route_task_message(&approval).await.unwrap());
+        run.finished.store(true, Ordering::Release);
+        assert!(!route_task_message(&input).await.unwrap());
+        RUNS.lock().unwrap().remove("$owned-task");
+        SOURCES.lock().unwrap().remove(&pending_key);
+        server.verify().await;
         for (name, value) in names.iter().zip(previous) {
             unsafe { if let Some(value) = value { std::env::set_var(name, value); }
                      else { std::env::remove_var(name); } }
@@ -1090,6 +1176,31 @@ mod tests {
                 .is_none()
         );
         assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn task_room_supplement_preserves_the_actual_input_without_an_extra_message_turn() {
+        let work = json!({"kind":"task","team_id":"team","task_id":"task"});
+        let mut input = json!({"work":{"kind":"message"},"room_id":"!room:d","event_id":"$human",
+            "intent":"message","input":{"sender":"@human:d","content":{"body":"Keep browser testing mandatory"}},
+            "native_commit":{"native_ref":"previous-ordinary-session"}});
+        let mut history = vec![ChatMessage::assistant("existing Task work")];
+        for _ in 0..2 {
+            append_assignment(&mut history, &input, &work, "!room:d", "$human").unwrap();
+        }
+        assert_eq!(history.len(), 2);
+        let persisted: Value = serde_json::from_str(&history[1].content).unwrap();
+        assert_eq!(persisted["event_id"], "$human");
+        assert_eq!(persisted["content"], input["input"]["content"]);
+        assert!(append_assignment(&mut history, &input, &work, "!other:d", "$human").is_err());
+        for key in ["org.agentteams.coordination", "com.agentteams.control", "com.agentteams.answer"] {
+            input["input"]["content"][key] = json!({});
+            assert!(!ordinary_task_input(&input));
+            assert!(append_assignment(&mut history, &input, &work, "!room:d", "$human").is_err());
+            input["input"]["content"].as_object_mut().unwrap().remove(key);
+        }
+        input["work"] = json!({"kind":"task","team_id":"other","task_id":"other"});
+        assert!(append_assignment(&mut history, &input, &work, "!room:d", "$human").is_err());
     }
 
     #[test]
