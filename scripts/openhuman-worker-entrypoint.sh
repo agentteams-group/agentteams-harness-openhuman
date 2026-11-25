@@ -336,6 +336,15 @@ fi
 (
     while true; do
         sleep 30
+        # Native mutable history is separate from Controller-owned runtime projections.
+        for _sessions in runtime/openhuman-task-sessions runtime/openhuman-message-sessions; do
+            if [ -d "${WORKSPACE}/${_sessions}" ]; then
+                ensure_mc_credentials 2>/dev/null || true
+                mc mirror "${WORKSPACE}/${_sessions}/" \
+                    "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/${_sessions}/" \
+                    --overwrite 2>/dev/null || log "WARNING: native session history sync failed"
+            fi
+        done
         CHANGED=$(find "${WORKSPACE}/" -type f -newer "${PULL_MARKER}" \
             -not -path "*/config.toml" \
             -not -path "*/.last-pull" \
