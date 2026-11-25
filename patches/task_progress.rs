@@ -124,16 +124,30 @@ impl Display {
         self.published.store(true, Ordering::Release);
         Ok(event)
     }
-    async fn end(&self) {
+    async fn end(&self, kind: &str) {
         if self.published.load(Ordering::Acquire) {
             if let Err(error) = self
                 .send(
-                    json!({"type":"error","kind":"quiet","title":"已处理"}),
+                    json!({"type":"error","kind":kind,"title":if kind == "quiet" { "已处理" } else { "执行已中断" }}),
                     None,
                 )
                 .await
             {
                 tracing::warn!(%error, "Matrix native progress closure failed");
+            }
+        }
+    }
+}
+struct CloseOnDrop {
+    display: Arc<Display>,
+    finished: bool,
+}
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let display = self.display.clone();
+                runtime.spawn(async move { display.end("cancelled").await });
             }
         }
     }
@@ -150,8 +164,13 @@ pub(crate) async fn scope<F: Future>(run_id: String, future: F) -> F::Output {
         run_id,
         published: AtomicBool::new(false),
     });
+    let mut closing = CloseOnDrop {
+        display: display.clone(),
+        finished: false,
+    };
     let result = DISPLAY.scope(display.clone(), future).await;
-    display.end().await;
+    display.end("quiet").await;
+    closing.finished = true;
     result
 }
 pub(crate) async fn thinking(text: Option<&str>) {
@@ -269,7 +288,7 @@ mod tests {
                 finish(first, "<html>ok</html>", true).await;
             })
             .await;
-        display.end().await;
+        display.end("quiet").await;
         let rows = channel.sent.lock().unwrap();
         assert_eq!(rows.len(), 6);
         let content = |index: usize| rows[index].get("m.new_content").unwrap_or(&rows[index]);
@@ -290,5 +309,34 @@ mod tests {
             .all(|(i, _)| content(i)["org.agentteams.progress_only"] == true
                 && content(i)["org.agentteams.run"]["run_id"] == "own-run"
                 && content(i)["m.mentions"]["user_ids"] == json!([])));
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_scope_closes_the_process_without_claiming_task_success() {
+        let channel = Arc::new(Matrix::default());
+        let context = Arc::new(Context {
+            channel: channel.clone(),
+            room: "!own".into(),
+            sender: "@human".into(),
+        });
+        let turn = crate::openhuman::approval::matrix::CONTEXT.scope(
+            context,
+            scope("cancelled-run".into(), async {
+                start("one", "read", &json!({"path":"calc.py"})).await;
+                std::future::pending::<()>().await;
+            }),
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), turn)
+                .await
+                .is_err()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rows = channel.sent.lock().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1]["org.agentteams.run"]["blocks"][0]["kind"],
+            "cancelled"
+        );
     }
 }

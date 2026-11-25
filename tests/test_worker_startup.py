@@ -81,3 +81,17 @@ def test_native_session_history_is_synced_without_uploading_projected_runtime_or
         assert json.loads(target.read_text())['history'] == ['real tool result', 'actual sent fact']
     assert not (remote / 'agents/worker/runtime/runtime.yaml').exists()
     assert not (remote / 'agents/worker/credentials/token').exists()
+
+
+def test_generated_native_turn_budget_leaves_work_time_after_human_approval(tmp_path):
+    import tomllib
+    start = source.index('cat > "${WORKSPACE}/config.toml" <<EOF')
+    end = source.index('\nEOF', start) + len('\nEOF')
+    result = subprocess.run(['bash', '-e', '-c', source[start:end]], capture_output=True, text=True,
+        env={**os.environ, 'WORKSPACE': str(tmp_path), 'BRIDGE_HOMESERVER': 'http://matrix.test',
+             'BRIDGE_ACCESS_TOKEN': 'fixture', 'BRIDGE_ROOM_ID': '!room:test', 'BRIDGE_USER_ID': '',
+             'ALLOWED_USERS_TOML': '"@human:test"', 'MATRIX_DEVICE_ID': ''})
+    assert result.returncode == 0, result.stderr
+    config = tomllib.loads((tmp_path / 'config.toml').read_text())
+    assert config['channels_config']['message_timeout_secs'] >= 300 + 600
+    assert config['channels_config']['matrix']['room_id'] == '!room:test'

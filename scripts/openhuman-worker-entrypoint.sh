@@ -211,6 +211,8 @@ cat > "${WORKSPACE}/config.toml" <<EOF
 # Do not edit manually — changes will be overwritten on container restart.
 
 [channels_config]
+# A coding turn includes native tool execution and up to five minutes of Human approval.
+message_timeout_secs = 900
 
 [channels_config.matrix]
 homeserver = "${BRIDGE_HOMESERVER}"
