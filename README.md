@@ -43,6 +43,12 @@ MCP stdio tools, stop/supplement controls, approvals and session read receipts.
 This migration does not add an HTTP notification service or enable new roles.
 OpenHuman Manager end-to-end support is not validated here.
 
+Workers load the bodies of their explicitly assigned Skills into the native
+role prompt, once per generated prompt, and refresh it after Skill sync. They
+do not preload the whole Skill catalog or another Agent's workspace. This keeps
+domain rules available in a fresh Task session without widening its file scope
+or requiring extra model calls to discover the role instructions.
+
 ## Licensing
 
 AgentTeams integration sources retain the Core Apache-2.0 license. The upstream

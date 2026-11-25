@@ -245,6 +245,22 @@ if [ -n "${WORKER_NAME}" ]; then
         fi
         printf '\nUse file_write to create files. Your shell policy blocks environment-variable expansion and output redirection; use literal paths with mc for uploads.\n'
         printf '\n普通会话中，你的文件工具以 %s 为默认工作区。准备好的 Task 中，文件工具的相对路径以当前 outputDirectory 为基准；你直接使用文件名或框架给出的完整绝对输出路径，不要把 shared/tasks/ 前缀再次拼到相对路径中。终端命令使用相同文件的完整绝对路径。\n' "${NATIVE_WORKSPACE}"
+        python3 - "${WORKSPACE}" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+
+home = Path(sys.argv[1])
+record = home / "runtime/runtime.yaml"
+if record.is_file():
+    names = (yaml.safe_load(record.read_text()) or {}).get("desired", {}).get("skills", [])
+    root = (home / "skills").resolve()
+    for name in dict.fromkeys(names):
+        skill = (root / name / "SKILL.md").resolve()
+        if skill.is_relative_to(root) and skill.is_file():
+            print("\nYour assigned Skill instructions (already loaded; do not reread): " + name)
+            print(skill.read_text())
+PY
     }
     # Channel turns load SOUL.md directly; the definition supplies tool scope.
     write_member_prompt > "${NATIVE_WORKSPACE}/SOUL.md"
@@ -392,6 +408,9 @@ log "Local->Remote sync started (PID: ${SYNC_LOCAL_PID})"
             "${WORKSPACE}/skills/" --overwrite 2>/dev/null; then
             python3 /opt/agentteams/scripts/lib/agentteams_skill_warnings.py "${WORKSPACE}/skills" || true
             cp -a "${WORKSPACE}/skills/." "${NATIVE_WORKSPACE}/skills/" 2>/dev/null || log "WARNING: native skill copy failed"
+            if [ "${AGENTTEAMS_AGENT_ROLE:-}" != "manager" ]; then
+                write_member_prompt > "${NATIVE_WORKSPACE}/SOUL.md"
+            fi
         else
             log "WARNING: skill sync failed; retaining existing skills"
         fi
