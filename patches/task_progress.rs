@@ -53,6 +53,11 @@ fn safe(value: &Value) -> Value {
         ),
         Value::Array(values) => Value::Array(values.iter().map(safe).collect()),
         Value::String(text) => {
+            if let Ok(parsed @ (Value::Object(_) | Value::Array(_))) =
+                serde_json::from_str::<Value>(text)
+            {
+                return json!(safe(&parsed).to_string());
+            }
             let mut text = text.clone();
             for (key, secret) in std::env::vars() {
                 if key == "AGENTTEAMS_FS_ACCESS_KEY"
@@ -67,6 +72,17 @@ fn safe(value: &Value) -> Value {
                 {
                     text = text.replace(&secret, "[REDACTED]");
                 }
+            }
+            static PATTERNS: std::sync::LazyLock<Vec<(regex::Regex, &str)>> =
+                std::sync::LazyLock::new(|| {
+                    vec![
+                (regex::Regex::new(r#"(?i)(Bearer\s+)[^\s\"',]+"#).unwrap(), "${1}[REDACTED]"),
+                (regex::Regex::new(r#"(?i)((?:access_token|api_key|apiKey|password|secret|authorization)[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,}]+)"#).unwrap(), "${1}\"[REDACTED]\""),
+                (regex::Regex::new(r"(https?://)[^/\s@]+@").unwrap(), "${1}[REDACTED]@"),
+            ]
+                });
+            for (pattern, replacement) in PATTERNS.iter() {
+                text = pattern.replace_all(&text, *replacement).into_owned();
             }
             json!(text)
         }
@@ -219,6 +235,15 @@ mod tests {
     }
     #[tokio::test]
     async fn native_progress_keeps_ids_inputs_outputs_and_failure_independent_of_model_context() {
+        assert_eq!(
+            safe(&json!("Authorization: Bearer unconfigured-private-token")),
+            json!("Authorization: \"[REDACTED]\" [REDACTED]")
+        );
+        assert!(
+            !safe(&json!(r#"{"password":"unconfigured-private-value"}"#))
+                .to_string()
+                .contains("unconfigured-private-value")
+        );
         let channel = Arc::new(Matrix::default());
         let context = Arc::new(Context {
             channel: channel.clone(),
