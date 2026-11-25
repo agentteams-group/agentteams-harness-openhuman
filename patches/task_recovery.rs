@@ -41,7 +41,10 @@ pub(crate) async fn check_authority(for_tool: bool) -> anyhow::Result<Value> {
 }
 
 pub(crate) fn unexecuted_tool_frame(text: &str) -> bool {
-    TASK_RUN.try_with(|_| ()).is_ok() && text.trim_start().starts_with("<tool_call>")
+    TASK_RUN.try_with(|_| ()).is_ok()
+        && ["<tool_call>", "<toolcall>", "<tool-call>"]
+            .iter()
+            .any(|tag| text.contains(tag))
 }
 
 pub(crate) async fn attach_pending(history: &mut Vec<ChatMessage>) -> anyhow::Result<()> {
@@ -1038,6 +1041,11 @@ mod tests {
             assert_eq!(run.progress_run_id(), delivery.progress_run_id());
             TASK_RUN.scope(run.clone(), async {
                 assert_eq!(progress_run_id().as_deref(), Some(run.progress_run_id().as_str()));
+                for frame in ["<tool_call>", "<toolcall>", "<tool-call>"] {
+                    assert!(unexecuted_tool_frame(&format!("我开始检查。\n{frame}invalid")));
+                    assert!(unexecuted_tool_frame(&format!("{frame}invalid")));
+                }
+                assert!(!unexecuted_tool_frame("验证完成，报告已提交。"));
             }).await;
             let history: Vec<ChatMessage> = serde_json::from_value(json!([
                 {"role":"user","content":"Own requirement"},

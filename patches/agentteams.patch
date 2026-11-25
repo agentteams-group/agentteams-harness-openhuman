@@ -585,7 +585,7 @@ index f130ce3..9f24084 100644
 +            #[cfg(feature = "channel-matrix")]
 +            if crate::openhuman::channels::task_recovery::unexecuted_tool_frame(&response_text) {
 +                history.push(ChatMessage::assistant(response_text));
-+                history.push(ChatMessage::user("That tool request was malformed and did not run. Use a registered function to continue."));
++                history.push(ChatMessage::user("That tool request was malformed and did not run. Use a registered function. Tool-call JSON must contain a name key and an arguments object; a bare tool name is not valid JSON. Do not repeat closing tags."));
 +                continue;
 +            }
              tracing::debug!(
