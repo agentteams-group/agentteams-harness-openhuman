@@ -51,7 +51,9 @@ class NativeToolsTests(unittest.TestCase):
                 agent = tomllib.loads(definition.read_text())
                 self.assertTrue({'shell', 'file_read', 'file_write'} <= set(agent['tools']['named']))
                 self.assertIn('member.role: ' + role, (home / 'workspace/SOUL.md').read_text())
-                self.assertIn('Your file_read and file_write workspace is ' + str(home / 'workspace'),
+                self.assertIn('普通会话中，你的文件工具以 ' + str(home / 'workspace'),
+                              (home / 'workspace/SOUL.md').read_text())
+                self.assertIn('Task 中，文件工具的相对路径以当前 outputDirectory 为基准',
                               (home / 'workspace/SOUL.md').read_text())
                 self.assertTrue((home / 'workspace/skills/task.md').exists())
                 policy = tomllib.loads((home / 'config.toml').read_text())['autonomy']
