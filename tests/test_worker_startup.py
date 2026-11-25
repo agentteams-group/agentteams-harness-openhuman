@@ -10,6 +10,22 @@ import yaml
 source = (Path(__file__).parents[1] / 'scripts/openhuman-worker-entrypoint.sh').read_text()
 
 
+def test_member_prompt_distinguishes_ordinary_workspace_from_prepared_task_output(tmp_path):
+    (tmp_path / 'AGENTS.md').write_text('你是测试成员。')
+    (tmp_path / 'SOUL.md').write_text('你使用中文沟通。')
+    start = source.index('    write_member_prompt() {')
+    end = source.index('\n    # Channel turns load', start)
+    result = subprocess.run(['bash', '-e', '-c', source[start:end] + '\nwrite_member_prompt'],
+        text=True, capture_output=True, env={**os.environ, 'WORKSPACE': str(tmp_path),
+        'NATIVE_WORKSPACE': str(tmp_path / 'workspace'), 'WORKER_CR_NAME': 'tester',
+        'NATIVE_ROLE': 'worker', 'BRIDGE_ROOM_ID': '!room:test', 'BRIDGE_USER_ID': '@tester:test'})
+    assert result.returncode == 0, result.stderr
+    assert '普通会话' in result.stdout and str(tmp_path / 'workspace') in result.stdout
+    assert 'Task 中' in result.stdout and 'outputDirectory' in result.stdout
+    assert '不要把 shared/tasks/' in result.stdout
+    assert 'Create relative files there' not in result.stdout
+
+
 @pytest.mark.parametrize('role', ['worker', 'manager', 'team_leader'])
 def test_member_home_and_native_file_action_directory_are_distinct(tmp_path, role):
     start = source.index('WORKER_NAME=')

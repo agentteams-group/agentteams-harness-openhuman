@@ -244,7 +244,7 @@ if [ -n "${WORKER_NAME}" ]; then
             printf '\nYour shared storage prefix: %s\n' "${AGENTTEAMS_STORAGE_PREFIX}"
         fi
         printf '\nUse file_write to create files. Your shell policy blocks environment-variable expansion and output redirection; use literal paths with mc for uploads.\n'
-        printf '\nYour file_read and file_write workspace is %s. Create relative files there, and pass their absolute paths under %s to CLI tools.\n' "${NATIVE_WORKSPACE}" "${NATIVE_WORKSPACE}"
+        printf '\n普通会话中，你的文件工具以 %s 为默认工作区。准备好的 Task 中，文件工具的相对路径以当前 outputDirectory 为基准；你直接使用文件名或框架给出的完整绝对输出路径，不要把 shared/tasks/ 前缀再次拼到相对路径中。终端命令使用相同文件的完整绝对路径。\n' "${NATIVE_WORKSPACE}"
     }
     # Channel turns load SOUL.md directly; the definition supplies tool scope.
     write_member_prompt > "${NATIVE_WORKSPACE}/SOUL.md"
