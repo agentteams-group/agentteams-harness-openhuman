@@ -122,6 +122,9 @@ pub(crate) fn enabled() -> bool {
 pub(crate) fn get(id: &str) -> Option<Arc<Run>> {
     RUNS.lock().unwrap().get(id).cloned()
 }
+pub(crate) fn progress_run_id() -> Option<String> {
+    TASK_RUN.try_with(|run| run.progress_run_id()).ok()
+}
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -317,6 +320,9 @@ fn append_assignment(
 }
 
 impl Run {
+    fn progress_run_id(&self) -> String {
+        format!("openhuman:{}:{}:{}", self.room, digest(&self.scope), self.identity["generation"])
+    }
     async fn new(
         client: &Client,
         room: &str,
@@ -486,9 +492,7 @@ impl Run {
             Some("send") => room
                 .send_raw(
                     "m.room.message",
-                    json!({"msgtype":"m.text", "body":text,
-                    "org.agentteams.reply_txn":transaction, "org.agentteams.progress_only":true,
-                    "m.mentions":{"user_ids":[]}}),
+                    super::task_progress::reply_content(text, transaction, &self.progress_run_id()),
                 )
                 .with_transaction_id(transaction.into())
                 .with_request_config(
@@ -1029,6 +1033,12 @@ mod tests {
             let run = Run::new(&client, "!task:test", identity,
                 json!({"kind":"task","team_id":"team","task_id":"T"}),
                 json!(["team", "T"]), "checkpoint-before-submit", false).await.unwrap();
+            let delivery = Run::new(&client, "!task:test", run.identity.clone(),
+                run.work.clone(), run.scope.clone(), "checkpoint-after-submit", true).await.unwrap();
+            assert_eq!(run.progress_run_id(), delivery.progress_run_id());
+            TASK_RUN.scope(run.clone(), async {
+                assert_eq!(progress_run_id().as_deref(), Some(run.progress_run_id().as_str()));
+            }).await;
             let history: Vec<ChatMessage> = serde_json::from_value(json!([
                 {"role":"user","content":"Own requirement"},
                 {"role":"tool","content":"Actual tool return; downstream sent as matrix:$confirmed"}

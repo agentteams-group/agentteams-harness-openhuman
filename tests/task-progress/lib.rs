@@ -6,6 +6,11 @@ pub(crate) mod progress;
 pub(crate) use openhuman::channels::task_protocol;
 mod openhuman {
     pub mod channels {
+        pub mod task_recovery {
+            pub(crate) fn progress_run_id() -> Option<String> {
+                None
+            }
+        }
         pub mod task_protocol {
             pub(crate) fn suppress_progress() -> bool {
                 false

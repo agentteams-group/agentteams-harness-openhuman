@@ -153,6 +153,7 @@ impl Drop for CloseOnDrop {
     }
 }
 pub(crate) async fn scope<F: Future>(run_id: String, future: F) -> F::Output {
+    let run_id = crate::openhuman::channels::task_recovery::progress_run_id().unwrap_or(run_id);
     let context = crate::openhuman::approval::matrix::CONTEXT
         .try_with(Arc::clone)
         .ok();
@@ -172,6 +173,11 @@ pub(crate) async fn scope<F: Future>(run_id: String, future: F) -> F::Output {
     display.end("quiet").await;
     closing.finished = true;
     result
+}
+pub(crate) fn reply_content(text: &str, transaction: &str, run_id: &str) -> Value {
+    json!({"msgtype":"m.text", "body":text,
+        "org.agentteams.reply_txn":transaction, "org.agentteams.progress_only":true,
+        "org.agentteams.run_id":run_id, "m.mentions":{"user_ids":[]}})
 }
 pub(crate) async fn thinking(text: Option<&str>) {
     if super::task_protocol::suppress_progress() {
@@ -230,6 +236,17 @@ mod tests {
     use super::*;
     use crate::openhuman::channels::traits::{Channel, ChannelMessage, SendMessage};
     use std::sync::Mutex;
+    #[test]
+    fn saved_business_reply_keeps_the_native_process_identity_without_another_receipt() {
+        let content = reply_content("独立验证通过，已交付 calc.py。", "own-transaction", "own-run");
+        assert_eq!(content["org.agentteams.run_id"], "own-run");
+        assert_eq!(content["body"], "独立验证通过，已交付 calc.py。");
+        assert_eq!(content["msgtype"], "m.text");
+        assert_eq!(content["org.agentteams.reply_txn"], "own-transaction");
+        assert_eq!(content["org.agentteams.progress_only"], true);
+        assert_eq!(content["m.mentions"]["user_ids"], json!([]));
+        assert!(content.get("org.agentteams.run").is_none());
+    }
     #[derive(Default)]
     struct Matrix {
         sent: Mutex<Vec<Value>>,
