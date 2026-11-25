@@ -425,6 +425,9 @@ export AGENTTEAMS_WORKER_HOME="${WORKSPACE}"
 export AGENTTEAMS_WORKER_MATRIX_TOKEN="${BRIDGE_ACCESS_TOKEN}"
 python3 /opt/agentteams/scripts/lib/agentteams_receipts.py serve --runtime openhuman --workspace "${WORKSPACE}" &
 cd "${WORKSPACE}"
+if [ -n "${AGENTTEAMS_STORAGE_PREFIX:-}" ]; then
+    python3 /opt/agentteams/scripts/lib/harness_health.py --runtime openhuman --member "${AGENTTEAMS_WORKER_NAME}" --parent "$$" &
+fi
 openhuman-core serve &
 CORE_PID=$!
 
