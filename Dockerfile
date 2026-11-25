@@ -146,6 +146,7 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
     libxtst6 \
     libx11-6 \
     libevdev2 \
+    git \
     curl \
     jq \
     openssl \
