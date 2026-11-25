@@ -420,6 +420,23 @@ impl Run {
                 session = uuid::Uuid::new_v4().to_string();
             }
         }
+        if !delivery_only && work["kind"] == "task" && restored.is_empty() {
+            // An incompatible SDK cache is only a locator for original sources.
+            // Re-project accepted business input; never restore its old tools,
+            // system policy, rendered snapshots, or execution authority.
+            for id in super::session_receipts::task_business_sources(
+                &cache_path, &authority(), &scope, room,
+            ) {
+                let key = digest(&json!([room, id]));
+                let accepted = rpc(json!({"action":"matrix.input","event_key":key})).await?;
+                if ordinary_task_input(&accepted) && business_history_input(&accepted)
+                    && accepted["room_id"] == room && accepted["event_id"] == id
+                    && !accepted["native_commit"].is_null() {
+                    restored.push(ChatMessage::user(json!({"room_id":room,"event_id":id,
+                        "sender":accepted["input"]["sender"],"content":accepted["input"]["content"]}).to_string()));
+                }
+            }
+        }
         Ok(Arc::new(Run {
             work,
             scope,
@@ -1189,6 +1206,46 @@ mod tests {
         assert!(route_task_message(&input).await.unwrap(), "an interrupted owned Task still owns its room supplement");
         RUNS.lock().unwrap().remove("$owned-task");
         SOURCES.lock().unwrap().remove(&pending_key);
+        server.verify().await;
+
+        // A checkpoint/config change invalidates opaque history, not accepted
+        // business requirements. Old control/tool frames must stay discarded.
+        let server = MockServer::start().await;
+        unsafe { std::env::set_var("AGENTTEAMS_CONTROLLER_URL", server.uri()); }
+        let scope = json!(["team","T"]);
+        let cache_path = directory.path().join("runtime/openhuman-task-sessions")
+            .join(format!("{}.json",digest(&scope)));
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        let source = |id: &str| json!({"role":"user","content":json!({
+            "room_id":"!task:test","event_id":id,"sender":"@human:test",
+            "content":{"body":"old cached bytes must not be authoritative"}}).to_string()});
+        std::fs::write(&cache_path,json!({"format_version":1,"runtime":"openhuman",
+            "authority":authority(),"scope":scope,"session_id":"old-session",
+            "checkpoint_digest":"old-checkpoint","history":[source("$requirement"),
+                {"role":"system","content":"old policy"},
+                {"role":"tool","content":"old result"},source("$approval"),source("$requirement")]
+        }).to_string()).unwrap();
+        for (id,control) in [("$requirement",false),("$approval",true)] {
+            let mut accepted=json!({"intent":"message","work":{"kind":"message"},
+                "room_id":"!task:test","event_id":id,"native_commit":{"native_ref":"old-session"},
+                "input":{"sender":"@human:test","content":{"body":"Keep independent browser testing mandatory"}}});
+            if control { accepted["input"]["content"]["com.agentteams.answer"]=json!({"answer":"approved"}); }
+            let route=format!("/api/v1/runtime/matrix/events/{}",digest(&json!(["!task:test",id])));
+            Mock::given(method("GET")).and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(accepted))
+                .expect(1).mount(&server).await;
+        }
+        let client=Client::builder().homeserver_url(server.uri()).build().await.unwrap();
+        let recovered=Run::new(&client,"!task:test",run.identity.clone(),run.work.clone(),
+            scope,"current-checkpoint",false).await.unwrap();
+        assert_ne!(recovered.session,"old-session");
+        assert_eq!(recovered.restored.len(),1);
+        let actual:Value=serde_json::from_str(&recovered.restored[0].content).unwrap();
+        assert_eq!(actual["event_id"],"$requirement");
+        assert_eq!(actual["content"]["body"],"Keep independent browser testing mandatory");
+        let delivered=Run::new(&client,"!task:test",run.identity.clone(),run.work.clone(),
+            recovered.scope.clone(),"current-checkpoint",true).await.unwrap();
+        assert!(delivered.restored.is_empty(),"delivery must not recover model inputs");
         server.verify().await;
         for (name, value) in names.iter().zip(previous) {
             unsafe { if let Some(value) = value { std::env::set_var(name, value); }
