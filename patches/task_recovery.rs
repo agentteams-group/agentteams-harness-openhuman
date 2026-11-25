@@ -56,15 +56,7 @@ pub(crate) async fn attach_pending(history: &mut Vec<ChatMessage>) -> anyhow::Re
 /// Called only after the native tool loop has appended its actual tool results.
 pub(crate) async fn checkpoint(history: &[ChatMessage]) -> anyhow::Result<()> {
     if let Ok(run) = TASK_RUN.try_with(Arc::clone) {
-        if let Err(error) = run.remember(history).await {
-            // Submitted Tasks close session publication before the final-text callback.
-            if run.message()
-                || error != "conflict"
-                || run.current().await.map_err(anyhow::Error::msg)?["task"]["status"] != "submitted"
-            {
-                return Err(anyhow::anyhow!(error));
-            }
-        }
+        run.remember(history).await.map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }
@@ -581,7 +573,14 @@ impl Run {
 
     async fn remember(&self, history: &[ChatMessage]) -> Result<(), &'static str> {
         let work = &self.work;
-        let current = rpc(json!({"action":"session.load","work":work})).await?;
+        let owned = self.current().await?;
+        let terminal = !self.message()
+            && matches!(owned["task"]["status"].as_str(), Some("submitted" | "completed"));
+        // Terminal Tasks close the optional session registry; their actual
+        // native tool returns and sent facts must still be persisted locally.
+        let current = if terminal { owned } else {
+            rpc(json!({"action":"session.load","work":work})).await?
+        };
         // Preserve the actual native tool transcript. New startup system policy
         // is projected separately, never restored from an old Harness session.
         let history: Vec<ChatMessage> = history
@@ -615,9 +614,11 @@ impl Run {
             let _ = std::fs::remove_file(&temporary);
             return Err("native cache persistence failed");
         }
-        rpc(json!({"action":"session.remember","work":work,"snapshot":current,"identity":self.identity,
-            "native_ref":self.session,"native_digest":cache["native_digest"],"expires_at":cache["expires_at"]})).await?;
         *self.native_history.lock().unwrap() = history;
+        if !terminal {
+            rpc(json!({"action":"session.remember","work":work,"snapshot":current,"identity":self.identity,
+                "native_ref":self.session,"native_digest":cache["native_digest"],"expires_at":cache["expires_at"]})).await?;
+        }
         Ok(())
     }
 
@@ -873,7 +874,7 @@ async fn scan(
             .unwrap()
             .get(&source_key)
             .is_some_and(|ids| !ids.is_empty());
-        if !delivery_only && (task["status"] == "submitted" || (admitted && !waiting_source)) {
+        if !delivery_only && ((task["status"] == "submitted" || task["status"] == "completed") || (admitted && !waiting_source)) {
             continue;
         }
         if execution["state"] == "needs_verification" {
@@ -934,6 +935,7 @@ async fn scan(
             .cloned()
             .unwrap_or_else(|| format!("recovery:{}", uuid::Uuid::new_v4()));
         bind_protocol_source(&id, &task);
+        super::task_protocol::register_recovered(&id, json!({"agent_matrix_user_id":own}));
         RUNS.lock().unwrap().insert(id.clone(), run.clone());
         let input = ChannelMessage {
             id: id.clone(),
@@ -997,6 +999,52 @@ pub(crate) fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_native_history_is_persisted_after_session_registry_closes() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::{method, path}};
+        let directory = tempfile::tempdir().unwrap();
+        let token = directory.path().join("token");
+        std::fs::write(&token, "fixture-worker-token").unwrap();
+        let names = ["AGENTTEAMS_CONTROLLER_URL", "AGENTTEAMS_PROCESS_ID", "AGENTTEAMS_AUTH_TOKEN_FILE", "AGENTTEAMS_WORKER_HOME"];
+        let previous: Vec<_> = names.iter().map(std::env::var_os).collect();
+        for status in ["submitted", "completed"] {
+            let server = MockServer::start().await;
+            let identity = json!({"task_id":"T","team_id":"team","process_id":"own-process","instance_id":"container/start","generation":1});
+            let task = json!({"task_id":"T","status":status,"execution":{
+                "process_id":"own-process","instance_id":"container/start","generation":1,
+                "state":"released","checkpoint":{"version":2}}});
+            Mock::given(method("GET")).and(path("/api/v1/tasks/recoverable"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"instance_id":"container/start",
+                    "tasks":[{"team_id":"team","task":task}]}))).expect(1).mount(&server).await;
+            Mock::given(path("/api/v1/runtime/sessions"))
+                .respond_with(ResponseTemplate::new(409)).expect(0).mount(&server).await;
+            // This test runs in the native-recovery test invocation; other
+            // recovery unit tests do not modify process configuration.
+            for (name, value) in names.iter().zip([
+                server.uri(), "own-process".to_owned(), token.to_string_lossy().into_owned(),
+                directory.path().to_string_lossy().into_owned(),
+            ]) { unsafe { std::env::set_var(name, value); } }
+            let client = Client::builder().homeserver_url(server.uri()).build().await.unwrap();
+            let run = Run::new(&client, "!task:test", identity,
+                json!({"kind":"task","team_id":"team","task_id":"T"}),
+                json!(["team", "T"]), "checkpoint-before-submit", false).await.unwrap();
+            let history: Vec<ChatMessage> = serde_json::from_value(json!([
+                {"role":"user","content":"Own requirement"},
+                {"role":"tool","content":"Actual tool return; downstream sent as matrix:$confirmed"}
+            ])).unwrap();
+            run.remember(&history).await.unwrap();
+            let persisted: Value = serde_json::from_slice(&std::fs::read(&run.cache_path).unwrap()).unwrap();
+            assert_eq!(persisted["history"], serde_json::to_value(&history).unwrap());
+            assert!(run.native_history.lock().unwrap()[1].content.contains("$confirmed"));
+            server.verify().await;
+            std::fs::remove_file(&run.cache_path).unwrap();
+        }
+        for (name, value) in names.iter().zip(previous) {
+            unsafe { if let Some(value) = value { std::env::set_var(name, value); }
+                     else { std::env::remove_var(name); } }
+        }
+    }
 
     #[test]
     fn late_assignment_enters_the_original_history_once() {

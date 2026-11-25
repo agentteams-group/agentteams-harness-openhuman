@@ -135,12 +135,15 @@ def call(arguments):
  identity=arguments['taskId']
  if arguments['action']=='begin':
   task_root=Path({base:?})/'tasks'/identity
-  return {{'task':{{'id':identity,'status':'in_progress','mainTaskId':'main','projectId':'','assignedTo':'one','assignmentId':'dispatch'}},'taskDirectory':str(task_root),'outputDirectory':str(task_root/'workspace'),'scratchDirectory':str(task_root/'workspace/.scratch')}}
+  return {{'task':{{'id':identity,'status':'in_progress','mainTaskId':'main','projectId':'','assignedTo':'one','assignmentId':'dispatch'}},'taskDirectory':str(task_root),'outputDirectory':str(task_root/'workspace'),'scratchDirectory':str(task_root/'workspace/.scratch'),'inputs':[{{'files':[{{'path':'/verified/result.json','preview':'Entire upstream body 7d21'}}]}}]}}
  return {{'task':{{'id':identity,'status':'submitted','submissionId':'candidate'}},'notification':{{'eventId':'notice','status':'queued','recipient':'leader'}}}}
 async def notify(event,native,action):
  assert native == '$handoff', 'Execution assignments must go directly to Task begin'
  return {{'active':True,'pending_task_ids':['main']}}
-def get(_): return {{'deliveries':[{{'eventId':'delivered-own','status':'completed','roomId':'!room:test','taskId':'completed-main','reportMessageId':'$report','report':'Own delivered result 9e27','artifacts':[]}}]}}
+def get(route):
+ if route.startswith('coordination/events/'):
+  return {{'event_id':'notice','task_id':request['context']['execution'],'kind':'task_submitted','actor':'@worker:test','recipient':'@leader:test','room_id':'!room:test','native_id':'matrix:$actual-send'}}
+ return {{'deliveries':[{{'eventId':'delivered-own','status':'completed','roomId':'!room:test','taskId':'completed-main','reportMessageId':'$report','report':'Own delivered result 9e27','artifacts':[]}}]}}
 try: print(json.dumps(module.invoke(request,call=call,get_json=get,notify=notify)))
 except Exception as error:
  print(json.dumps({{'ok':False,'message':str(error),'effect':getattr(error,'effect','unknown')}}));sys.exit(1)
@@ -157,7 +160,7 @@ except Exception as error:
             let event = format!("$source-{index}");
             native::register(
                 &event,
-                json!({"teamharness_coordination":{"id":format!("{:032x}",index),"kind":"task_assigned","task_id":id,"main_task_id":"main","project_id":"","delivery_id":"dispatch"}}),
+                json!({"agent_matrix_user_id":"@worker:test","teamharness_coordination":{"id":format!("{:032x}",index),"kind":"task_assigned","task_id":id,"main_task_id":"main","project_id":"","delivery_id":"dispatch"}}),
             );
             native::register_recovered(&event, json!({"teamharness_coordination": {
                 "kind":"task_assigned", "task_id":id,"delivery_id":"fallback"
@@ -182,6 +185,10 @@ except Exception as error:
                 assert_eq!(name, "result.txt");
                 assert!(native::file_scope(&policy, "/another-task/output.txt", true).is_err());
                 assert_eq!(policy.workspace_dir, base.join("private"));
+                let mut history = vec![];
+                native::prepare(&mut history).await.unwrap();
+                assert!(history.iter().any(|message| message.content.contains("/verified/result.json")));
+                assert!(!history.iter().any(|message| message.content.contains("Entire upstream body 7d21")));
                 let rejected = native::TaskTool
                     .execute(
                         json!({"action":"submit","taskId":"foreign","summary":"Rejected fixture"}),
@@ -196,7 +203,8 @@ except Exception as error:
                     .unwrap();
                 assert!(!result.is_error);
                 assert!(result.text.contains("Task system receipt"));
-                assert!(native::completed().is_some());
+                assert!(result.text.contains("$actual-send"));
+                assert_eq!(native::completed(), Some(String::new()));
             })
             .await
             .unwrap();

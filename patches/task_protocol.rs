@@ -98,6 +98,7 @@ pub(crate) async fn scope<F: Future>(
     let role = std::env::var("AGENTTEAMS_AGENT_ROLE").unwrap_or_else(|_| "worker".to_owned());
     let mut context = json!({"role":role,"sourceEvent":msg.id,"sources":[]});
     let meta = NOTIFICATIONS.lock().unwrap().remove(&msg.id);
+    context["actor"] = meta.as_ref().map(|value| value["agent_matrix_user_id"].clone()).unwrap_or(Value::Null);
     let coordination = meta
         .as_ref()
         .map(|value| value["teamharness_coordination"].clone())
@@ -198,9 +199,10 @@ pub(crate) async fn prepare(history: &mut Vec<ChatMessage>) -> anyhow::Result<()
     };
     let context = turn.context.lock().unwrap().clone();
     if let Some(fact) = context["fact"].as_str() {
+        let projected = bridge(json!({"operation":"model_context","context":context["context"]})).await?;
         history.push(ChatMessage::system(format!(
             "{fact}\n{}",
-            context["context"]
+            projected
         )));
     }
     if let Some(sources) = context["sources"]
@@ -430,14 +432,14 @@ impl Tool for TaskTool {
                     .unwrap_or_default();
             }
             if outcome["phaseComplete"] == true {
-                current["phaseResult"] = outcome["fact"].clone();
+                current["phaseResult"] = json!(outcome["displayText"].as_str().unwrap_or(""));
             }
         }
         if outcome["effect"] == "none" && outcome["ok"] == false {
             return Ok(ToolResult::error(outcome.to_string()));
         }
-        let result = outcome.get("result").unwrap_or(&outcome);
-        let text = format!("{}\n{}", result, outcome["fact"].as_str().unwrap_or(""));
+        let result = bridge(json!({"operation":"model_result","outcome":outcome})).await?;
+        let text = result.to_string();
         Ok(if result["ok"] == false {
             ToolResult::error(text)
         } else {
