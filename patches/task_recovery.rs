@@ -313,25 +313,48 @@ pub(crate) async fn route_task_message(input: &Value) -> Result<bool, &'static s
         .filter(|run| !run.message() && input["room_id"] == run.room
             && !run.finished.load(Ordering::Acquire) && !run.cancel.is_cancelled())
         .cloned().collect();
-    let [run] = candidates.as_slice() else { return Ok(false); };
-    let owned = run.current().await?;
-    if owned["task"]["status"] != "in_progress" {
-        return Ok(false);
-    }
-    if owned["task"]["execution"]["state"] != "active" {
-        return Err("owned Task requires verification before receiving supplements");
-    }
     let room = input["room_id"].as_str().ok_or("missing supplement room")?;
+    let task_id = match candidates.as_slice() {
+        [run] => {
+            let owned = run.current().await?;
+            if owned["task"]["status"] != "in_progress" { return Ok(false); }
+            run.work["task_id"].as_str().ok_or("missing Task identity")?.to_owned()
+        }
+        [] => {
+            let snapshot = rpc(json!({"action":"discover"})).await?;
+            let Some(task) = supplement_task(&snapshot, room) else { return Ok(false); };
+            task.to_owned()
+        }
+        _ => return Ok(false),
+    };
     let event = input["event_id"].as_str().ok_or("missing supplement event")?;
     let claim = rpc(json!({"action":"matrix.message.claim","event_key":digest(&json!([room,event]))})).await?;
     match claim["recovery"].as_str() {
         Some("resume") => {
-            source(room, run.work["task_id"].as_str().ok_or("missing Task identity")?, event);
+            source(room, &task_id, event);
             Ok(true)
         }
         Some("verify") => Err("supplement has an unverified ordinary operation"),
         _ => Ok(false),
     }
+}
+
+fn supplement_task<'a>(snapshot: &'a Value, room: &str) -> Option<&'a str> {
+    let mut tasks = snapshot["tasks"].as_array()?.iter()
+        .map(|entry| &entry["task"])
+        .filter(|task| task["room_id"] == room && task["task_plan_id"].is_string()
+            && matches!(task["status"].as_str(), Some("assigned" | "in_progress")));
+    let task = tasks.next()?;
+    if tasks.next().is_some() { return None; }
+    task["task_id"].as_str()
+}
+
+fn business_history_input(input: &Value) -> bool {
+    let content = &input["input"]["content"];
+    matches!(input["intent"].as_str(), Some("context" | "message"))
+        && content["org.agentteams.progress_only"] != true
+        && ["org.agentteams.coordination", "com.agentteams.control", "com.agentteams.answer"]
+            .iter().all(|key| content.get(*key).is_none())
 }
 
 fn append_assignment(
@@ -742,7 +765,7 @@ async fn room_context(client: &Client, record: &Value) -> Result<Vec<Value>, &'s
         };
         let key = digest(&json!([room_id.as_str(), prior]));
         let accepted = rpc(json!({"action":"matrix.input","event_key":key})).await?;
-        if matches!(accepted["intent"].as_str(), Some("context" | "message")) {
+        if business_history_input(&accepted) {
             if !same_input(&raw, &accepted) {
                 return Err("Matrix history differs from the shared input");
             }
@@ -757,7 +780,7 @@ async fn room_context(client: &Client, record: &Value) -> Result<Vec<Value>, &'s
     if let Some(parent) = reply_to.filter(|p| !history.iter().any(|e| e["event_id"] == *p)) {
         let key = digest(&json!([room_id.as_str(), parent]));
         let accepted = rpc(json!({"action":"matrix.input","event_key":key})).await?;
-        if matches!(accepted["intent"].as_str(), Some("context" | "message")) {
+        if business_history_input(&accepted) {
             history.insert(0,json!({"event_id":parent,"sender":accepted["input"]["sender"],"body":accepted["input"]["content"]["body"]}));
         }
     }
@@ -1053,6 +1076,29 @@ pub(crate) fn start(
 mod tests {
     use super::*;
 
+    #[test]
+    fn blocked_owned_task_keeps_supplements_and_control_history_out_of_inference() {
+        let task = json!({"task_id":"T","room_id":"!task:test","task_plan_id":"plan",
+            "status":"in_progress","execution":{"state":"needs_verification"}});
+        let snapshot = json!({"tasks":[{"task":task}]});
+        assert_eq!(supplement_task(&snapshot, "!task:test"), Some("T"));
+        assert!(supplement_task(&snapshot, "!elsewhere:test").is_none());
+        let mut ambiguous = snapshot.clone();
+        ambiguous["tasks"].as_array_mut().unwrap().push(json!({"task":task}));
+        assert!(supplement_task(&ambiguous, "!task:test").is_none());
+        for state in ["submitted", "completed", "cancelled"] {
+            let mut ended = snapshot.clone(); ended["tasks"][0]["task"]["status"] = json!(state);
+            assert!(supplement_task(&ended, "!task:test").is_none());
+        }
+        let mut input = json!({"intent":"message","input":{"content":{"body":"business clarification"}}});
+        assert!(business_history_input(&input));
+        for key in ["com.agentteams.answer", "com.agentteams.control", "org.agentteams.coordination", "org.agentteams.progress_only"] {
+            input["input"]["content"][key] = json!(true);
+            assert!(!business_history_input(&input), "{key}");
+            input["input"]["content"].as_object_mut().unwrap().remove(key);
+        }
+    }
+
     #[tokio::test]
     async fn terminal_native_history_is_persisted_after_session_registry_closes() {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::{method, path}};
@@ -1109,11 +1155,11 @@ mod tests {
         let server = MockServer::start().await;
         unsafe { std::env::set_var("AGENTTEAMS_CONTROLLER_URL", server.uri()); }
         let identity = json!({"task_id":"T","team_id":"team","process_id":"own-process","instance_id":"container/start","generation":1});
-        let task = json!({"task_id":"T","status":"in_progress","execution":{
-            "process_id":"own-process","instance_id":"container/start","generation":1,"state":"active"}});
+        let task = json!({"task_id":"T","room_id":"!task:test","task_plan_id":"plan","status":"in_progress","execution":{
+            "process_id":"own-process","instance_id":"container/start","generation":1,"state":"needs_verification"}});
         Mock::given(method("GET")).and(path("/api/v1/tasks/recoverable"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"instance_id":"container/start",
-                "tasks":[{"team_id":"team","task":task}]}))).expect(2).mount(&server).await;
+                "tasks":[{"team_id":"team","task":task}]}))).expect(4).mount(&server).await;
         let event_key = digest(&json!(["!task:test", "$supplement"]));
         let route = format!("/api/v1/runtime/matrix/events/{event_key}/execution");
         for verb in ["GET", "POST"] {
@@ -1121,7 +1167,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({"etag":"fixture-etag","instance_id":"container/start","runtime":"openhuman",
                     "input":{"room_id":"!task:test","event_id":"$supplement"},
                     "execution":{"generation":1,"instance_id":"container/start","process_id":"own-process"},
-                    "recovery":"resume"}))).expect(2).mount(&server).await;
+                    "recovery":"resume"}))).expect(3).mount(&server).await;
         }
         let client = Client::builder().homeserver_url(server.uri()).build().await.unwrap();
         let run = Run::new(&client, "!task:test", identity,
@@ -1140,7 +1186,7 @@ mod tests {
         approval["input"]["content"]["com.agentteams.answer"] = json!({});
         assert!(!route_task_message(&approval).await.unwrap());
         run.finished.store(true, Ordering::Release);
-        assert!(!route_task_message(&input).await.unwrap());
+        assert!(route_task_message(&input).await.unwrap(), "an interrupted owned Task still owns its room supplement");
         RUNS.lock().unwrap().remove("$owned-task");
         SOURCES.lock().unwrap().remove(&pending_key);
         server.verify().await;

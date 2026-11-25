@@ -46,10 +46,9 @@ index 166b5c4..4ea3dac 100644
  pub mod openhuman;
 diff --git a/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs b/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs
 new file mode 100644
-index 0000000..ecf9fcf
 --- /dev/null
 +++ b/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,281 @@
 +//! Actual v0.57 engine, public Task bridge and native RunQueue. Synthetic API/provider only.
 +use super::*;
 +use crate::openhuman::agent::harness::run_queue::{QueueMode, QueuedMessage, RunQueue};
@@ -276,6 +275,10 @@ index 0000000..ecf9fcf
 +        assert!(!read.execute(json!({"path":"answer.txt"})).await.unwrap().is_error);
 +        assert!(write.execute(json!({"path":"../outside.txt","content":"bad"})).await.map(|r|r.is_error).unwrap_or(true));
 +        let shell=ShellTool::new(policy.clone(),Arc::new(crate::openhuman::agent::host_runtime::NativeRuntime::new()),crate::openhuman::security::AuditLogger::disabled());
++        assert_eq!(native::tool_timeout_secs("shell",120,false),310);
++        assert_eq!(native::tool_timeout_secs("shell",120,true),120);
++        assert_eq!(native::tool_timeout_secs("shell",60,false),60);
++        assert_eq!(native::tool_timeout_secs("task",120,false),120);
 +        assert_eq!(shell.command_timeout_secs(),300);let pwd=shell.execute(json!({"command":"pwd"})).await.unwrap();assert!(!pwd.is_error);assert_eq!(pwd.output().trim(),output.to_str().unwrap());
 +        assert!(shell.execute(json!({"command":"pwd"})).await.unwrap().is_error);
 +        assert_eq!(policy.tracker.count(),3,"Task-scoped validators must never reset the native budget");
@@ -669,13 +672,13 @@ index 328ae36..57181ab 100644
      }
  }
 diff --git a/src/openhuman/agent/harness/engine/tools.rs b/src/openhuman/agent/harness/engine/tools.rs
-index 07297ec..15e7d3d 100644
 --- a/src/openhuman/agent/harness/engine/tools.rs
 +++ b/src/openhuman/agent/harness/engine/tools.rs
-@@ -189,10 +189,38 @@ pub(crate) async fn run_one_tool(
+@@ -189,10 +189,41 @@
          }
      }
  
+-    let tool_deadline = crate::openhuman::tool_timeout::tool_execution_timeout_duration();
 +    #[cfg(feature = "channel-matrix")]
 +    let operation = match crate::openhuman::channels::task_recovery::begin_message_tools(
 +        serde_json::json!([{"id":progress_call_id,"name":call.name,"arguments":call.arguments}]),
@@ -692,8 +695,11 @@ index 07297ec..15e7d3d 100644
 +            };
 +        }
 +    };
-     let tool_deadline = crate::openhuman::tool_timeout::tool_execution_timeout_duration();
      let timeout_secs = crate::openhuman::tool_timeout::tool_execution_timeout_secs();
++    #[cfg(feature = "channel-matrix")]
++    let timeout_secs = crate::openhuman::channels::task_protocol::tool_timeout_secs(
++        &call.name, timeout_secs, crate::openhuman::tool_timeout::env_override_active());
++    let tool_deadline = std::time::Duration::from_secs(timeout_secs);
      let tool_started = std::time::Instant::now();
 +    #[cfg(feature = "channel-matrix")]
 +    let native_tool = crate::openhuman::channels::task_telemetry::boundary(
@@ -711,7 +717,7 @@ index 07297ec..15e7d3d 100644
      let elapsed_ms = tool_started.elapsed().as_millis() as u64;
      let (result_text, success) = match outcome {
          Ok(Ok(r)) => {
-@@ -352,6 +380,23 @@ pub(crate) async fn run_one_tool(
+@@ -352,6 +383,23 @@
              iteration_u32,
          )
          .await;

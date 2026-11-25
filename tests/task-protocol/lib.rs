@@ -176,6 +176,10 @@ except Exception as error:
                     field.key.as_str() == "agentteams.coordination.id" && field.value.to_string() == format!("{:032x}", index)));
                 let expected = base.join("tasks").join(&id).join("workspace");
                 assert_eq!(native::output_directory(), Some(expected.clone()));
+                assert_eq!(native::tool_timeout_secs("shell", 120, false), 310);
+                assert_eq!(native::tool_timeout_secs("shell", 120, true), 120);
+                assert_eq!(native::tool_timeout_secs("shell", 60, false), 60);
+                assert_eq!(native::tool_timeout_secs("task", 120, false), 120);
                 assert_eq!(native::scratch_directory(), Some(expected.join(".scratch")));
                 let policy = crate::openhuman::security::SecurityPolicy {
                     workspace_dir: base.join("private"),
@@ -254,6 +258,7 @@ except Exception as error:
         .unwrap();
         assert!(saved.is_object());
         assert!(native::output_directory().is_none());
+        assert_eq!(native::tool_timeout_secs("shell", 120, false), 120);
         assert!(native::completed().is_none());
         assert_eq!(
             native::TaskTool.permission_level(),

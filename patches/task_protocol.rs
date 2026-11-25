@@ -352,6 +352,14 @@ pub(crate) fn output_directory() -> Option<PathBuf> {
         .flatten()
 }
 
+pub(crate) fn tool_timeout_secs(name: &str, configured: u64, explicit_override: bool) -> u64 {
+    if name == "shell" && configured == 120 && !explicit_override && output_directory().is_some() {
+        310 // Leave time for the inner 300-second command and process cleanup.
+    } else {
+        configured
+    }
+}
+
 pub(crate) fn scratch_directory() -> Option<PathBuf> {
     CURRENT
         .try_with(|turn| {
