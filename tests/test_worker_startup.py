@@ -26,6 +26,33 @@ def test_member_prompt_distinguishes_ordinary_workspace_from_prepared_task_outpu
     assert 'Create relative files there' not in result.stdout
 
 
+def test_member_prompt_loads_only_assigned_skill_bodies_and_refreshes(tmp_path):
+    (tmp_path / 'AGENTS.md').write_text('你是测试成员。')
+    (tmp_path / 'SOUL.md').write_text('你使用中文沟通。')
+    (tmp_path / 'runtime').mkdir()
+    (tmp_path / 'runtime/runtime.yaml').write_text(yaml.safe_dump({'desired': {'skills': ['tester', 'escape']}}))
+    for name, body in [('tester', '核对准确 head，使用真实浏览器验收。'), ('unassigned', '不应加载的其他小队规则。')]:
+        directory = tmp_path / 'skills' / name
+        directory.mkdir(parents=True)
+        (directory / 'SKILL.md').write_text(body)
+    outside = tmp_path / 'private'
+    outside.mkdir()
+    (outside / 'SKILL.md').write_text('不应读取的目录外内容。')
+    (tmp_path / 'skills/escape').symlink_to(outside, target_is_directory=True)
+    start = source.index('    write_member_prompt() {')
+    end = source.index('\n    # Channel turns load', start)
+    for body in ['核对准确 head，使用真实浏览器验收。', '新版规则：先克隆已接受的 bundle。']:
+        (tmp_path / 'skills/tester/SKILL.md').write_text(body)
+        result = subprocess.run(['bash', '-e', '-c', source[start:end] + '\nwrite_member_prompt'],
+            text=True, capture_output=True, env={**os.environ, 'WORKSPACE': str(tmp_path),
+            'NATIVE_WORKSPACE': str(tmp_path / 'workspace'), 'WORKER_CR_NAME': 'tester',
+            'NATIVE_ROLE': 'worker', 'BRIDGE_ROOM_ID': '!room:test', 'BRIDGE_USER_ID': '@tester:test'})
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.count(body) == 1
+        assert '不应加载' not in result.stdout
+        assert '不应读取' not in result.stdout
+
+
 @pytest.mark.parametrize('role', ['worker', 'manager', 'team_leader'])
 def test_member_home_and_native_file_action_directory_are_distinct(tmp_path, role):
     start = source.index('WORKER_NAME=')
