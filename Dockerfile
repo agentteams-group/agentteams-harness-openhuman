@@ -98,6 +98,9 @@ RUN git -C /build/openhuman-src apply /tmp/agentteams.patch
 COPY patches/hitl.rs /build/openhuman-src/src/openhuman/approval/hitl.rs
 COPY patches/unified-hitl.patch /tmp/unified-hitl.patch
 RUN git -C /build/openhuman-src apply /tmp/unified-hitl.patch
+COPY patches/task_progress.rs /build/openhuman-src/src/openhuman/channels/task_progress.rs
+COPY patches/matrix-progress.patch /tmp/matrix-progress.patch
+RUN git -C /build/openhuman-src apply /tmp/matrix-progress.patch
 
 WORKDIR /build/openhuman-src
 
