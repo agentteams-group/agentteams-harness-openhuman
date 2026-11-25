@@ -941,6 +941,16 @@ fn write_session(path: &std::path::Path, cache: &Value) -> Result<(), &'static s
     Ok(())
 }
 
+fn cached_submission(history: &[Value], task: &str, submission: &str) -> bool {
+    history.iter().filter(|row| row["role"] == "tool").any(|row| {
+        let result = row["content"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok());
+        let receipt = result.as_ref().and_then(|r| r["content"].as_str())
+            .and_then(|s| serde_json::from_str::<Value>(s).ok());
+        receipt.is_some_and(|r| r["phaseComplete"] == true && r["task"]["id"] == task
+            && r["task"]["submissionId"] == submission)
+    })
+}
+
 async fn retain_handoffs() -> Result<(), &'static str> {
     let folder = home().join(".agentteams/native-handoffs");
     if !folder.is_dir() || std::fs::read_dir(&folder).map_err(|_| "handoff directory unavailable")?.next().is_none() {
@@ -962,11 +972,17 @@ async fn retain_handoffs() -> Result<(), &'static str> {
         let Ok(bytes) = std::fs::read(&path) else { continue };
         let mut saved: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid saved native transcript")?;
         if saved["session_id"] != target["session"] || saved["authority"] != authority()
-            || digest(&saved["scope"]) != scope || saved["native_digest"] != digest(&saved["history"])
-            || saved["delivery_event"].as_str().is_none_or(|id| !id.starts_with('$')) {
+            || digest(&saved["scope"]) != scope || saved["native_digest"] != digest(&saved["history"]) {
             continue;
         }
         let history = saved["history"].as_array_mut().ok_or("invalid native history")?;
+        // Submission can release the Task before a post-delivery cache refresh.
+        // Match the native tool result to the very submission the outbox confirmed.
+        let task = item["taskId"].as_str().ok_or("missing submitted task")?;
+        let submission = item["submissionId"].as_str().ok_or("missing submission")?;
+        if !cached_submission(history, task, submission) {
+            continue;
+        }
         for fact in item["facts"].as_array().ok_or("missing confirmed facts")? {
             let row = serde_json::to_value(ChatMessage::system(fact.as_str().ok_or("invalid confirmed fact")?))
                 .map_err(|_| "invalid native system message")?;
@@ -1171,6 +1187,15 @@ mod tests {
             assert!(!business_history_input(&input), "{key}");
             input["input"]["content"].as_object_mut().unwrap().remove(key);
         }
+    }
+
+    #[test]
+    fn confirmed_handoff_matches_the_native_terminal_tool_result() {
+        let result = json!({"phaseComplete":true,"task":{"id":"task","submissionId":"sub"}});
+        let tool = json!({"role":"tool","content":json!({"content":result.to_string()}).to_string()});
+        assert!(cached_submission(std::slice::from_ref(&tool), "task", "sub"));
+        assert!(!cached_submission(std::slice::from_ref(&tool), "task", "other"));
+        assert!(!cached_submission(&[json!({"role":"assistant","content":tool["content"]})], "task", "sub"));
     }
 
     #[tokio::test]
