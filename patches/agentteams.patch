@@ -3290,6 +3290,20 @@ index c6eb256..46f43ab 100644
  /// Verify the user has an active OpenHuman backend session.
  ///
  /// Without this check, an unregistered user can configure every workload
+@@ -1138,7 +1138,12 @@
+     )
+     .with_temperature_unsupported_models(config.temperature_unsupported_models.clone())
+     .with_temperature_override(temperature_override)
+-    .with_native_tool_calling(false)
++    // Managed Workers use the platform OpenAI-compatible function contract.
++    // Preserve prompt-guided tools for standalone local servers.
++    .with_native_tool_calling(
++        std::env::var_os("AGENTTEAMS_CONTROLLER_URL").is_some()
++            && std::env::var_os("AGENTTEAMS_PROCESS_ID").is_some(),
++    )
+     .with_local_provider_kind(LocalProviderKind::LocalOpenai);
+     Ok((Box::new(provider), model.to_string()))
+ }
 diff --git a/src/openhuman/inference/provider/factory_tests.rs b/src/openhuman/inference/provider/factory_tests.rs
 index b597f86..e5453cb 100644
 --- a/src/openhuman/inference/provider/factory_tests.rs

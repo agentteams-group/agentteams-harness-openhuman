@@ -15,11 +15,13 @@ import yaml
 
 KEY = "synthetic-caller-owned-key"
 MARKER = "NATIVE_LOCAL_GATEWAY_IO_a17"
+SKILL_MARKER = "ASSIGNED_NATIVE_SKILL_b28"
 
 
 class Gateway(BaseHTTPRequestHandler):
     requests = []
     accepted = []
+    native_tools = False
 
     def log_message(self, *_args):
         pass
@@ -39,12 +41,23 @@ class Gateway(BaseHTTPRequestHandler):
                    ("file_read", {"path": "io.txt"}), ("shell", {"command": "pwd"})]
         if stage < len(actions):
             name, args = actions[stage]
-            # This SDK intentionally uses prompt-guided tools for local-openai.
-            content = "<tool_call>" + json.dumps({"name": name, "arguments": args}) + "</tool_call>"
+            # Standalone local servers retain the SDK's prompt-guided mode.
+            if self.native_tools:
+                if stage == 0:
+                    assert SKILL_MARKER in json.dumps(payload["messages"]), "assigned Skill missing from native model input"
+                    print("PASS: assigned Skill is present in the actual model input", flush=True)
+                assert any(t["function"]["name"] == name for t in payload.get("tools", [])), "native tool schema missing"
+                content = None
+                tool_calls = [{"id": f"call-{stage}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]
+            else:
+                content = "<tool_call>" + json.dumps({"name": name, "arguments": args}) + "</tool_call>"
         else:
             content = "NATIVE_LOCAL_GATEWAY_OK"
+        message = {"role": "assistant", "content": content}
+        if stage < len(actions) and self.native_tools:
+            message["tool_calls"] = tool_calls
         data = json.dumps({"id": f"local-{stage}", "object": "chat.completion",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}],
             "usage": {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11}}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -60,7 +73,7 @@ def run(env, *args, check=True):
     return result
 
 
-def configure(root, endpoint):
+def configure(root, endpoint, *, managed=False):
     private = root / "workspace"
     actions = private / "actions"
     private.mkdir(); actions.mkdir()
@@ -70,15 +83,19 @@ def configure(root, endpoint):
         "member": {"runtime": "openhuman", "runtimeName": "worker", "matrixUserId": "@worker:test", "personalRoomId": "!home:test"},
         "storage": {"memberPrefix": "agents/worker"},
         "matrix": {"transport": {"homeserver": "http://matrix.invalid", "dm": {"policy": "open"}}},
-        "desired": {"model": {"model": "fixture-model", "gatewayUrl": endpoint}},
+        "desired": {"skills": ["fixture-skill"], "model": {"model": "fixture-model", "gatewayUrl": endpoint}},
         "credentials": {"matrixTokenEnv": "SMOKE_MATRIX_BINDING", "gatewayKeyEnv": "SMOKE_MODEL_BINDING"}}))
     env = {**os.environ, "WORKSPACE": str(root), "HOME": str(root), "OPENHUMAN_WORKSPACE": str(root),
         "OPENHUMAN_ACTION_DIR": str(actions), "OPENHUMAN_CONFIG": str(root / "config.toml"),
-        "AGENTTEAMS_WORKER_NAME": "worker", "WORKER_NAME": "worker", "WORKER_CR_NAME": "worker", "SMOKE_MATRIX_BINDING": "synthetic-matrix", "SMOKE_MODEL_BINDING": KEY,
+        "AGENTTEAMS_WORKER_NAME": "worker", "AGENTTEAMS_WORKER_HOME": str(root), "WORKER_NAME": "worker", "WORKER_CR_NAME": "worker", "SMOKE_MATRIX_BINDING": "synthetic-matrix", "SMOKE_MODEL_BINDING": KEY,
         "LOCAL_OPENAI_URL": endpoint + "/v1", "RUST_LOG": "error", "AGENTTEAMS_OTEL_ENABLED": "false"}
     for key in ("AGENTTEAMS_CONTROLLER_URL", "AGENTTEAMS_AUTH_TOKEN", "AGENTTEAMS_AUTH_TOKEN_FILE"):
         env.pop(key, None)
-    (root / "skills").mkdir()
+    if managed:
+        env.update(AGENTTEAMS_CONTROLLER_URL="http://controller.invalid", AGENTTEAMS_PROCESS_ID="fixture-process", AGENTTEAMS_AGENT_ROLE="worker")
+    skill = root / "skills/fixture-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("You must preserve the marker " + SKILL_MARKER + " in your assigned task context.")
     (root / "AGENTS.md").write_text("You execute the requested task using your native tools.")
     (root / "SOUL.md").write_text("Be accurate.")
     source = Path("/usr/local/bin/openhuman-worker-entrypoint.sh").read_text()
@@ -88,6 +105,9 @@ def configure(root, endpoint):
     result = subprocess.run(["bash", "-e", "-c", "umask 077\nlog() { :; }\n" + projection + "\n" + model],
         env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, (result.stdout[-1000:], result.stderr[-1000:])
+    if managed:
+        subprocess.run(["python3", "/opt/agentteams/scripts/configure-teamharness.py", str(root),
+                        "/opt/agentteams/plugins/teamharness"], env=env, check=True, capture_output=True, text=True, timeout=30)
     run(env, "config", "update_autonomy_settings", "--level", "supervised",
         "--allowed_commands", '["pwd"]', "--auto_approve", '["file_write","file_read","shell"]')
     return env, private, actions
@@ -142,6 +162,20 @@ def main():
             assert failure.returncode != 0 and len(Gateway.requests) > before
             assert len(Gateway.accepted) == 4, "wrong own-endpoint key must not execute tools"
             assert "401" in failure.stdout + failure.stderr
+        Gateway.accepted.clear()
+        Gateway.native_tools = True
+        with tempfile.TemporaryDirectory() as temp:
+            env, private, actions = configure(Path(temp), endpoint, managed=True)
+            result = chat(env)
+            assert result.returncode == 0, (result.stdout[-2500:], result.stderr[-2500:])
+            assert (actions / "io.txt").read_text() == MARKER
+            assert len(Gateway.accepted) == 4
+            first = Gateway.accepted[0]
+            assert SKILL_MARKER in json.dumps(first["messages"]), "assigned Skill never reached the native model request"
+            last = Gateway.accepted[-1]["messages"]
+            assert MARKER in json.dumps(last)
+            assert any(m.get("role") == "tool" for m in last), "native tool results were not preserved"
+        print("PASS: actual managed native function schemas/calls/results and assigned Skill reached the model; standalone local XML unchanged")
         print("PASS: actual release CLI startup -> authenticated local-openai Gateway -> native file_write/read/pwd; runtime/consent/key gates and cloud sessions preserved; wrong own-key rejected; no vendor session or real model")
     finally:
         gateway.shutdown()
