@@ -46,10 +46,9 @@ index 166b5c4..4ea3dac 100644
  pub mod openhuman;
 diff --git a/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs b/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs
 new file mode 100644
-index 0000000..ecf9fcf
 --- /dev/null
 +++ b/src/openhuman/agent/harness/engine/agentteams_protocol_tests.rs
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,281 @@
 +//! Actual v0.57 engine, public Task bridge and native RunQueue. Synthetic API/provider only.
 +use super::*;
 +use crate::openhuman::agent::harness::run_queue::{QueueMode, QueuedMessage, RunQueue};
@@ -276,7 +275,11 @@ index 0000000..ecf9fcf
 +        assert!(!read.execute(json!({"path":"answer.txt"})).await.unwrap().is_error);
 +        assert!(write.execute(json!({"path":"../outside.txt","content":"bad"})).await.map(|r|r.is_error).unwrap_or(true));
 +        let shell=ShellTool::new(policy.clone(),Arc::new(crate::openhuman::agent::host_runtime::NativeRuntime::new()),crate::openhuman::security::AuditLogger::disabled());
-+        let pwd=shell.execute(json!({"command":"pwd"})).await.unwrap();assert!(!pwd.is_error);assert_eq!(pwd.output().trim(),output.to_str().unwrap());
++        assert_eq!(native::tool_timeout_secs("shell",120,false),310);
++        assert_eq!(native::tool_timeout_secs("shell",120,true),120);
++        assert_eq!(native::tool_timeout_secs("shell",60,false),60);
++        assert_eq!(native::tool_timeout_secs("task",120,false),120);
++        assert_eq!(shell.command_timeout_secs(),300);let pwd=shell.execute(json!({"command":"pwd"})).await.unwrap();assert!(!pwd.is_error);assert_eq!(pwd.output().trim(),output.to_str().unwrap());
 +        assert!(shell.execute(json!({"command":"pwd"})).await.unwrap().is_error);
 +        assert_eq!(policy.tracker.count(),3,"Task-scoped validators must never reset the native budget");
 +        assert_eq!(policy.workspace_dir,root.path().join("private"));assert_eq!(policy.action_dir,root.path().join("native-actions"));
@@ -585,7 +588,7 @@ index f130ce3..9f24084 100644
 +            #[cfg(feature = "channel-matrix")]
 +            if crate::openhuman::channels::task_recovery::unexecuted_tool_frame(&response_text) {
 +                history.push(ChatMessage::assistant(response_text));
-+                history.push(ChatMessage::user("That tool request was malformed and did not run. Use a registered function to continue."));
++                history.push(ChatMessage::user("That tool request was malformed and did not run. Use a registered function. Tool-call JSON must contain a name key and an arguments object; a bare tool name is not valid JSON. Do not repeat closing tags."));
 +                continue;
 +            }
              tracing::debug!(
@@ -669,13 +672,13 @@ index 328ae36..57181ab 100644
      }
  }
 diff --git a/src/openhuman/agent/harness/engine/tools.rs b/src/openhuman/agent/harness/engine/tools.rs
-index 07297ec..15e7d3d 100644
 --- a/src/openhuman/agent/harness/engine/tools.rs
 +++ b/src/openhuman/agent/harness/engine/tools.rs
-@@ -189,10 +189,38 @@ pub(crate) async fn run_one_tool(
+@@ -189,10 +189,41 @@
          }
      }
  
+-    let tool_deadline = crate::openhuman::tool_timeout::tool_execution_timeout_duration();
 +    #[cfg(feature = "channel-matrix")]
 +    let operation = match crate::openhuman::channels::task_recovery::begin_message_tools(
 +        serde_json::json!([{"id":progress_call_id,"name":call.name,"arguments":call.arguments}]),
@@ -692,8 +695,11 @@ index 07297ec..15e7d3d 100644
 +            };
 +        }
 +    };
-     let tool_deadline = crate::openhuman::tool_timeout::tool_execution_timeout_duration();
      let timeout_secs = crate::openhuman::tool_timeout::tool_execution_timeout_secs();
++    #[cfg(feature = "channel-matrix")]
++    let timeout_secs = crate::openhuman::channels::task_protocol::tool_timeout_secs(
++        &call.name, timeout_secs, crate::openhuman::tool_timeout::env_override_active());
++    let tool_deadline = std::time::Duration::from_secs(timeout_secs);
      let tool_started = std::time::Instant::now();
 +    #[cfg(feature = "channel-matrix")]
 +    let native_tool = crate::openhuman::channels::task_telemetry::boundary(
@@ -711,7 +717,7 @@ index 07297ec..15e7d3d 100644
      let elapsed_ms = tool_started.elapsed().as_millis() as u64;
      let (result_text, success) = match outcome {
          Ok(Ok(r)) => {
-@@ -352,6 +380,23 @@ pub(crate) async fn run_one_tool(
+@@ -352,6 +383,23 @@
              iteration_u32,
          )
          .await;
@@ -2781,10 +2787,9 @@ index 169f4e1..837286b 100644
          if let Some(resolved_parent) = resolved_target.parent() {
              tokio::fs::create_dir_all(resolved_parent).await?;
 diff --git a/src/openhuman/tools/impl/system/shell.rs b/src/openhuman/tools/impl/system/shell.rs
-index a883b46..026db5e 100644
 --- a/src/openhuman/tools/impl/system/shell.rs
 +++ b/src/openhuman/tools/impl/system/shell.rs
-@@ -11,6 +11,18 @@ use std::time::{Duration, Instant};
+@@ -11,6 +11,18 @@
  const SHELL_TIMEOUT_SECS: u64 = 60;
  /// Maximum output size in bytes (1MB).
  const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -2803,7 +2808,7 @@ index a883b46..026db5e 100644
  /// Environment variables safe to pass to shell commands.
  /// Only functional variables are included — never API keys or secrets.
  const SAFE_ENV_VARS: &[&str] = &[
-@@ -208,12 +220,22 @@ impl ShellTool {
+@@ -208,12 +220,31 @@
      /// same gated execution path as the `shell` tool — all security
      /// checks (rate limits, path guards, approval gate routing) apply
      /// identically to workflow-triggered commands.
@@ -2816,7 +2821,16 @@ index a883b46..026db5e 100644
 +        policy
 +    }
 +
++    pub(crate) fn command_timeout_secs(&self) -> u64 {
++        #[cfg(feature = "channel-matrix")]
++        if crate::openhuman::channels::task_protocol::output_directory().is_some() {
++            return 300;
++        }
++        SHELL_TIMEOUT_SECS
++    }
++
      pub(crate) async fn run_with_security(&self, command: &str) -> (bool, ToolResult) {
++        let timeout_secs = self.command_timeout_secs();
 +        let security = self.task_policy();
          // Read-only `Block` + the Option-2 structural guard. Approval for
          // Write / Network / Destructive already happened at the harness
@@ -2826,8 +2840,8 @@ index a883b46..026db5e 100644
 +        if let Err(reason) = security.check_gated_command(command) {
              return (false, ToolResult::error(reason));
          }
- 
-@@ -244,9 +266,10 @@ impl ShellTool {
+
+@@ -244,9 +275,10 @@
          // Execute with timeout to prevent hanging commands.
          // Clear the environment to prevent leaking API keys and other secrets
          // (CWE-200), then re-add only safe, functional variables.
@@ -2839,10 +2853,13 @@ index a883b46..026db5e 100644
          {
              Ok(cmd) => cmd,
              Err(e) => {
-@@ -264,6 +287,36 @@ impl ShellTool {
-             }
-         }
- 
+@@ -261,6 +293,36 @@
+         for var in SAFE_ENV_VARS {
+             if let Ok(val) = std::env::var(var) {
+                 cmd.env(var, val);
++            }
++        }
++
 +        #[cfg(feature = "channel-matrix")]
 +        if let Some(scratch) = crate::openhuman::channels::task_protocol::scratch_directory() {
 +            cmd.env("TMPDIR", scratch);
@@ -2870,16 +2887,13 @@ index a883b46..026db5e 100644
 +                if let Ok(value) = std::env::var(var) {
 +                    cmd.env(var, value);
 +                }
-+            }
-+        }
-+
-         // If a managed Node.js install has already been resolved, transparently
-         // prepend its bin dir to PATH so this shell sees the managed toolchain.
-         // `try_cached()` never blocks and never triggers a download — unrelated
-@@ -286,8 +339,24 @@ impl ShellTool {
              }
          }
- 
+
+@@ -286,8 +348,24 @@
+             }
+         }
+
 -        let result =
 -            tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
 +        cmd.kill_on_drop(true);
@@ -2893,22 +2907,33 @@ index a883b46..026db5e 100644
 +                let _group =
 +                    OwnedShellGroup(nix::unistd::Pid::from_raw(child.id().unwrap() as i32));
 +                tokio::time::timeout(
-+                    Duration::from_secs(SHELL_TIMEOUT_SECS),
++                    Duration::from_secs(timeout_secs),
 +                    child.wait_with_output(),
 +                )
 +                .await
 +            }
 +            Err(error) => Ok(Err(error)),
 +        };
- 
+
          let tool_result = match result {
              Ok(Ok(output)) => {
-@@ -334,11 +403,12 @@ impl ShellTool {
+@@ -324,7 +402,7 @@
+             }
+             Ok(Err(e)) => ToolResult::error(format!("Failed to execute command: {e}")),
+             Err(_) => ToolResult::error(format!(
+-                "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
++                "Command timed out after {timeout_secs}s and was killed"
+             )),
+         };
+         (true, tool_result)
+@@ -333,12 +411,14 @@
+     /// Execute a command through the sandbox backend. Called when the
      /// agent's `SandboxMode` is `Sandboxed`.
      async fn run_sandboxed(&self, command: &str) -> (bool, ToolResult) {
++        let timeout_secs = self.command_timeout_secs();
          use crate::openhuman::sandbox;
 +        let security = self.task_policy();
- 
+
          let config = crate::openhuman::config::RuntimeConfig::default();
          let policy = sandbox::resolve_sandbox_policy(
              crate::openhuman::agent::harness::definition::SandboxMode::Sandboxed,
@@ -2917,15 +2942,35 @@ index a883b46..026db5e 100644
              &config,
              false,
          );
-@@ -366,7 +436,7 @@ impl ShellTool {
+@@ -366,16 +446,16 @@
          match sandbox::execute_in_sandbox(
              &policy,
              command,
 -            &self.security.action_dir,
 +            &security.action_dir,
              extra_env,
-             Duration::from_secs(SHELL_TIMEOUT_SECS),
+-            Duration::from_secs(SHELL_TIMEOUT_SECS),
++            Duration::from_secs(timeout_secs),
          )
+         .await
+         {
+             Ok(result) => {
+                 let tool_result = if result.timed_out {
+                     ToolResult::error(format!(
+-                        "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
++                        "Command timed out after {timeout_secs}s and was killed"
+                     ))
+                 } else if result.success() {
+                     if result.stderr.is_empty() {
+@@ -845,6 +925,8 @@
+     #[test]
+     fn shell_timeout_constant_is_reasonable() {
+         assert_eq!(SHELL_TIMEOUT_SECS, 60, "shell timeout must be 60 seconds");
++        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime(), test_audit());
++        assert_eq!(tool.command_timeout_secs(), 60, "ordinary commands keep their original budget");
+     }
+
+     #[test]
 diff --git a/src/openhuman/tools/ops.rs b/src/openhuman/tools/ops.rs
 index 2521ae9..7db2e1e 100644
 --- a/src/openhuman/tools/ops.rs
@@ -3290,6 +3335,20 @@ index c6eb256..46f43ab 100644
  /// Verify the user has an active OpenHuman backend session.
  ///
  /// Without this check, an unregistered user can configure every workload
+@@ -1138,7 +1138,12 @@
+     )
+     .with_temperature_unsupported_models(config.temperature_unsupported_models.clone())
+     .with_temperature_override(temperature_override)
+-    .with_native_tool_calling(false)
++    // Managed Workers use the platform OpenAI-compatible function contract.
++    // Preserve prompt-guided tools for standalone local servers.
++    .with_native_tool_calling(
++        std::env::var_os("AGENTTEAMS_CONTROLLER_URL").is_some()
++            && std::env::var_os("AGENTTEAMS_PROCESS_ID").is_some(),
++    )
+     .with_local_provider_kind(LocalProviderKind::LocalOpenai);
+     Ok((Box::new(provider), model.to_string()))
+ }
 diff --git a/src/openhuman/inference/provider/factory_tests.rs b/src/openhuman/inference/provider/factory_tests.rs
 index b597f86..e5453cb 100644
 --- a/src/openhuman/inference/provider/factory_tests.rs

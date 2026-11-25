@@ -79,6 +79,7 @@ jobs:
           cargo test --locked --no-default-features --features channel-matrix --test agentteams_direct_control --test agentteams_task_recovery
           cargo test --locked --lib --no-default-features --features channel-matrix agentteams_native_task_protocol_ -- --test-threads=1
           cargo test --locked --lib --no-default-features --features channel-matrix agentteams_native_steer_
+          cargo test --locked --lib --no-default-features --features channel-matrix shell_timeout_constant_is_reasonable
           cargo test --locked --lib --no-default-features --features channel-matrix channels::task_progress::tests
           cargo test --locked --lib --no-default-features --features channel-matrix worker_sync::tests
           cargo test --locked --lib --no-default-features --features channel-matrix channels::task_recovery::tests

@@ -41,7 +41,10 @@ pub(crate) async fn check_authority(for_tool: bool) -> anyhow::Result<Value> {
 }
 
 pub(crate) fn unexecuted_tool_frame(text: &str) -> bool {
-    TASK_RUN.try_with(|_| ()).is_ok() && text.trim_start().starts_with("<tool_call>")
+    TASK_RUN.try_with(|_| ()).is_ok()
+        && ["<tool_call>", "<toolcall>", "<tool-call>"]
+            .iter()
+            .any(|tag| text.contains(tag))
 }
 
 pub(crate) async fn attach_pending(history: &mut Vec<ChatMessage>) -> anyhow::Result<()> {
@@ -292,6 +295,68 @@ fn delivered_event(
     None
 }
 
+fn ordinary_task_input(input: &Value) -> bool {
+    let content = &input["input"]["content"];
+    input["intent"] == "message"
+        && input["work"]["kind"] == "message"
+        && ["org.agentteams.coordination", "com.agentteams.control", "com.agentteams.answer"]
+            .iter().all(|key| content.get(*key).is_none())
+}
+
+/// Retain a room supplement for the owned Task's next native engine boundary.
+/// The shared message lease is retired only after actual Task-history persistence.
+pub(crate) async fn route_task_message(input: &Value) -> Result<bool, &'static str> {
+    if !ordinary_task_input(input) {
+        return Ok(false);
+    }
+    let candidates: Vec<_> = RUNS.lock().unwrap().values()
+        .filter(|run| !run.message() && input["room_id"] == run.room
+            && !run.finished.load(Ordering::Acquire) && !run.cancel.is_cancelled())
+        .cloned().collect();
+    let room = input["room_id"].as_str().ok_or("missing supplement room")?;
+    let task_id = match candidates.as_slice() {
+        [run] => {
+            let owned = run.current().await?;
+            if owned["task"]["status"] != "in_progress" { return Ok(false); }
+            run.work["task_id"].as_str().ok_or("missing Task identity")?.to_owned()
+        }
+        [] => {
+            let snapshot = rpc(json!({"action":"discover"})).await?;
+            let Some(task) = supplement_task(&snapshot, room) else { return Ok(false); };
+            task.to_owned()
+        }
+        _ => return Ok(false),
+    };
+    let event = input["event_id"].as_str().ok_or("missing supplement event")?;
+    let claim = rpc(json!({"action":"matrix.message.claim","event_key":digest(&json!([room,event]))})).await?;
+    match claim["recovery"].as_str() {
+        Some("resume") => {
+            source(room, &task_id, event);
+            Ok(true)
+        }
+        Some("verify") => Err("supplement has an unverified ordinary operation"),
+        _ => Ok(false),
+    }
+}
+
+fn supplement_task<'a>(snapshot: &'a Value, room: &str) -> Option<&'a str> {
+    let mut tasks = snapshot["tasks"].as_array()?.iter()
+        .map(|entry| &entry["task"])
+        .filter(|task| task["room_id"] == room && task["task_plan_id"].is_string()
+            && matches!(task["status"].as_str(), Some("assigned" | "in_progress")));
+    let task = tasks.next()?;
+    if tasks.next().is_some() { return None; }
+    task["task_id"].as_str()
+}
+
+fn business_history_input(input: &Value) -> bool {
+    let content = &input["input"]["content"];
+    matches!(input["intent"].as_str(), Some("context" | "message"))
+        && content["org.agentteams.progress_only"] != true
+        && ["org.agentteams.coordination", "com.agentteams.control", "com.agentteams.answer"]
+            .iter().all(|key| content.get(*key).is_none())
+}
+
 fn append_assignment(
     history: &mut Vec<ChatMessage>,
     input: &Value,
@@ -299,14 +364,14 @@ fn append_assignment(
     room: &str,
     id: &str,
 ) -> Result<Option<ChatMessage>, &'static str> {
-    if input["work"] != *work
+    let supplement = ordinary_task_input(input);
+    if (!supplement && (input["work"] != *work || input["intent"] != "task_notification"))
         || input["room_id"] != room
         || input["event_id"] != id
-        || input["intent"] != "task_notification"
     {
         return Err("assignment scope changed");
     }
-    if !input["native_commit"].is_null() {
+    if !supplement && !input["native_commit"].is_null() {
         return Ok(None);
     }
     let msg = ChatMessage::user(json!({"room_id":room,"event_id":id,"sender":input["input"]["sender"],"content":input["input"]["content"]}).to_string());
@@ -353,6 +418,23 @@ impl Run {
             if rpc(json!({"action":"session.usable","snapshot":view,"native_ref":session,"native_digest":digest(&native)})).await? != true {
                 restored.clear();
                 session = uuid::Uuid::new_v4().to_string();
+            }
+        }
+        if !delivery_only && work["kind"] == "task" && restored.is_empty() {
+            // An incompatible SDK cache is only a locator for original sources.
+            // Re-project accepted business input; never restore its old tools,
+            // system policy, rendered snapshots, or execution authority.
+            for id in super::session_receipts::task_business_sources(
+                &cache_path, &authority(), &scope, room,
+            ) {
+                let key = digest(&json!([room, id]));
+                let accepted = rpc(json!({"action":"matrix.input","event_key":key})).await?;
+                if ordinary_task_input(&accepted) && business_history_input(&accepted)
+                    && accepted["room_id"] == room && accepted["event_id"] == id
+                    && !accepted["native_commit"].is_null() {
+                    restored.push(ChatMessage::user(json!({"room_id":room,"event_id":id,
+                        "sender":accepted["input"]["sender"],"content":accepted["input"]["content"]}).to_string()));
+                }
             }
         }
         Ok(Arc::new(Run {
@@ -403,6 +485,13 @@ impl Run {
                 )
                 .map_err(|_| "native assignment persistence failed")?;
                 commit_input(&home(), &self.room, &id, &self.session).await?;
+                if ordinary_task_input(&view["input"]) {
+                    let claim = rpc(json!({"action":"matrix.message.claim","event_key":key})).await?;
+                    if claim["recovery"] != "resume" {
+                        return Err("supplement execution requires verification");
+                    }
+                    rpc(json!({"action":"matrix.message.cancel","identity":claim["identity"]})).await?;
+                }
             }
             if let Some(events) = SOURCES.lock().unwrap().get_mut(&scope) {
                 events.retain(|old| old != &id);
@@ -693,7 +782,7 @@ async fn room_context(client: &Client, record: &Value) -> Result<Vec<Value>, &'s
         };
         let key = digest(&json!([room_id.as_str(), prior]));
         let accepted = rpc(json!({"action":"matrix.input","event_key":key})).await?;
-        if matches!(accepted["intent"].as_str(), Some("context" | "message")) {
+        if business_history_input(&accepted) {
             if !same_input(&raw, &accepted) {
                 return Err("Matrix history differs from the shared input");
             }
@@ -708,7 +797,7 @@ async fn room_context(client: &Client, record: &Value) -> Result<Vec<Value>, &'s
     if let Some(parent) = reply_to.filter(|p| !history.iter().any(|e| e["event_id"] == *p)) {
         let key = digest(&json!([room_id.as_str(), parent]));
         let accepted = rpc(json!({"action":"matrix.input","event_key":key})).await?;
-        if matches!(accepted["intent"].as_str(), Some("context" | "message")) {
+        if business_history_input(&accepted) {
             history.insert(0,json!({"event_id":parent,"sender":accepted["input"]["sender"],"body":accepted["input"]["content"]["body"]}));
         }
     }
@@ -1004,6 +1093,29 @@ pub(crate) fn start(
 mod tests {
     use super::*;
 
+    #[test]
+    fn blocked_owned_task_keeps_supplements_and_control_history_out_of_inference() {
+        let task = json!({"task_id":"T","room_id":"!task:test","task_plan_id":"plan",
+            "status":"in_progress","execution":{"state":"needs_verification"}});
+        let snapshot = json!({"tasks":[{"task":task}]});
+        assert_eq!(supplement_task(&snapshot, "!task:test"), Some("T"));
+        assert!(supplement_task(&snapshot, "!elsewhere:test").is_none());
+        let mut ambiguous = snapshot.clone();
+        ambiguous["tasks"].as_array_mut().unwrap().push(json!({"task":task}));
+        assert!(supplement_task(&ambiguous, "!task:test").is_none());
+        for state in ["submitted", "completed", "cancelled"] {
+            let mut ended = snapshot.clone(); ended["tasks"][0]["task"]["status"] = json!(state);
+            assert!(supplement_task(&ended, "!task:test").is_none());
+        }
+        let mut input = json!({"intent":"message","input":{"content":{"body":"business clarification"}}});
+        assert!(business_history_input(&input));
+        for key in ["com.agentteams.answer", "com.agentteams.control", "org.agentteams.coordination", "org.agentteams.progress_only"] {
+            input["input"]["content"][key] = json!(true);
+            assert!(!business_history_input(&input), "{key}");
+            input["input"]["content"].as_object_mut().unwrap().remove(key);
+        }
+    }
+
     #[tokio::test]
     async fn terminal_native_history_is_persisted_after_session_registry_closes() {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::{method, path}};
@@ -1038,6 +1150,11 @@ mod tests {
             assert_eq!(run.progress_run_id(), delivery.progress_run_id());
             TASK_RUN.scope(run.clone(), async {
                 assert_eq!(progress_run_id().as_deref(), Some(run.progress_run_id().as_str()));
+                for frame in ["<tool_call>", "<toolcall>", "<tool-call>"] {
+                    assert!(unexecuted_tool_frame(&format!("我开始检查。\n{frame}invalid")));
+                    assert!(unexecuted_tool_frame(&format!("{frame}invalid")));
+                }
+                assert!(!unexecuted_tool_frame("验证完成，报告已提交。"));
             }).await;
             let history: Vec<ChatMessage> = serde_json::from_value(json!([
                 {"role":"user","content":"Own requirement"},
@@ -1050,6 +1167,86 @@ mod tests {
             server.verify().await;
             std::fs::remove_file(&run.cache_path).unwrap();
         }
+        // A plain accepted room supplement joins the existing owned Task.
+        // It must not be dispatched as a second ordinary message execution.
+        let server = MockServer::start().await;
+        unsafe { std::env::set_var("AGENTTEAMS_CONTROLLER_URL", server.uri()); }
+        let identity = json!({"task_id":"T","team_id":"team","process_id":"own-process","instance_id":"container/start","generation":1});
+        let task = json!({"task_id":"T","room_id":"!task:test","task_plan_id":"plan","status":"in_progress","execution":{
+            "process_id":"own-process","instance_id":"container/start","generation":1,"state":"needs_verification"}});
+        Mock::given(method("GET")).and(path("/api/v1/tasks/recoverable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"instance_id":"container/start",
+                "tasks":[{"team_id":"team","task":task}]}))).expect(4).mount(&server).await;
+        let event_key = digest(&json!(["!task:test", "$supplement"]));
+        let route = format!("/api/v1/runtime/matrix/events/{event_key}/execution");
+        for verb in ["GET", "POST"] {
+            Mock::given(method(verb)).and(path(route.clone()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"etag":"fixture-etag","instance_id":"container/start","runtime":"openhuman",
+                    "input":{"room_id":"!task:test","event_id":"$supplement"},
+                    "execution":{"generation":1,"instance_id":"container/start","process_id":"own-process"},
+                    "recovery":"resume"}))).expect(3).mount(&server).await;
+        }
+        let client = Client::builder().homeserver_url(server.uri()).build().await.unwrap();
+        let run = Run::new(&client, "!task:test", identity,
+            json!({"kind":"task","team_id":"team","task_id":"T"}), json!(["team","T"]), "new-task", false).await.unwrap();
+        RUNS.lock().unwrap().insert("$owned-task".into(), run.clone());
+        let input = json!({"intent":"message","work":{"kind":"message"},"room_id":"!task:test",
+            "event_id":"$supplement","input":{"sender":"@human:test","content":{"body":"Use the browser"}}});
+        for _ in 0..2 { assert!(route_task_message(&input).await.unwrap()); }
+        let pending_key = digest(&json!(["!task:test","T"]));
+        assert_eq!(SOURCES.lock().unwrap().get(&pending_key).unwrap(), &["$supplement"]);
+        assert_eq!(RUNS.lock().unwrap().len(), 1, "a supplement must not create a message Run");
+        let mut elsewhere = input.clone();
+        elsewhere["room_id"] = json!("!other:test");
+        assert!(!route_task_message(&elsewhere).await.unwrap());
+        let mut approval = input.clone();
+        approval["input"]["content"]["com.agentteams.answer"] = json!({});
+        assert!(!route_task_message(&approval).await.unwrap());
+        run.finished.store(true, Ordering::Release);
+        assert!(route_task_message(&input).await.unwrap(), "an interrupted owned Task still owns its room supplement");
+        RUNS.lock().unwrap().remove("$owned-task");
+        SOURCES.lock().unwrap().remove(&pending_key);
+        server.verify().await;
+
+        // A checkpoint/config change invalidates opaque history, not accepted
+        // business requirements. Old control/tool frames must stay discarded.
+        let server = MockServer::start().await;
+        unsafe { std::env::set_var("AGENTTEAMS_CONTROLLER_URL", server.uri()); }
+        let scope = json!(["team","T"]);
+        let cache_path = directory.path().join("runtime/openhuman-task-sessions")
+            .join(format!("{}.json",digest(&scope)));
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        let source = |id: &str| json!({"role":"user","content":json!({
+            "room_id":"!task:test","event_id":id,"sender":"@human:test",
+            "content":{"body":"old cached bytes must not be authoritative"}}).to_string()});
+        std::fs::write(&cache_path,json!({"format_version":1,"runtime":"openhuman",
+            "authority":authority(),"scope":scope,"session_id":"old-session",
+            "checkpoint_digest":"old-checkpoint","history":[source("$requirement"),
+                {"role":"system","content":"old policy"},
+                {"role":"tool","content":"old result"},source("$approval"),source("$requirement")]
+        }).to_string()).unwrap();
+        for (id,control) in [("$requirement",false),("$approval",true)] {
+            let mut accepted=json!({"intent":"message","work":{"kind":"message"},
+                "room_id":"!task:test","event_id":id,"native_commit":{"native_ref":"old-session"},
+                "input":{"sender":"@human:test","content":{"body":"Keep independent browser testing mandatory"}}});
+            if control { accepted["input"]["content"]["com.agentteams.answer"]=json!({"answer":"approved"}); }
+            let route=format!("/api/v1/runtime/matrix/events/{}",digest(&json!(["!task:test",id])));
+            Mock::given(method("GET")).and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(accepted))
+                .expect(1).mount(&server).await;
+        }
+        let client=Client::builder().homeserver_url(server.uri()).build().await.unwrap();
+        let recovered=Run::new(&client,"!task:test",run.identity.clone(),run.work.clone(),
+            scope,"current-checkpoint",false).await.unwrap();
+        assert_ne!(recovered.session,"old-session");
+        assert_eq!(recovered.restored.len(),1);
+        let actual:Value=serde_json::from_str(&recovered.restored[0].content).unwrap();
+        assert_eq!(actual["event_id"],"$requirement");
+        assert_eq!(actual["content"]["body"],"Keep independent browser testing mandatory");
+        let delivered=Run::new(&client,"!task:test",run.identity.clone(),run.work.clone(),
+            recovered.scope.clone(),"current-checkpoint",true).await.unwrap();
+        assert!(delivered.restored.is_empty(),"delivery must not recover model inputs");
+        server.verify().await;
         for (name, value) in names.iter().zip(previous) {
             unsafe { if let Some(value) = value { std::env::set_var(name, value); }
                      else { std::env::remove_var(name); } }
@@ -1082,6 +1279,31 @@ mod tests {
                 .is_none()
         );
         assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn task_room_supplement_preserves_the_actual_input_without_an_extra_message_turn() {
+        let work = json!({"kind":"task","team_id":"team","task_id":"task"});
+        let mut input = json!({"work":{"kind":"message"},"room_id":"!room:d","event_id":"$human",
+            "intent":"message","input":{"sender":"@human:d","content":{"body":"Keep browser testing mandatory"}},
+            "native_commit":{"native_ref":"previous-ordinary-session"}});
+        let mut history = vec![ChatMessage::assistant("existing Task work")];
+        for _ in 0..2 {
+            append_assignment(&mut history, &input, &work, "!room:d", "$human").unwrap();
+        }
+        assert_eq!(history.len(), 2);
+        let persisted: Value = serde_json::from_str(&history[1].content).unwrap();
+        assert_eq!(persisted["event_id"], "$human");
+        assert_eq!(persisted["content"], input["input"]["content"]);
+        assert!(append_assignment(&mut history, &input, &work, "!other:d", "$human").is_err());
+        for key in ["org.agentteams.coordination", "com.agentteams.control", "com.agentteams.answer"] {
+            input["input"]["content"][key] = json!({});
+            assert!(!ordinary_task_input(&input));
+            assert!(append_assignment(&mut history, &input, &work, "!room:d", "$human").is_err());
+            input["input"]["content"].as_object_mut().unwrap().remove(key);
+        }
+        input["work"] = json!({"kind":"task","team_id":"other","task_id":"other"});
+        assert!(append_assignment(&mut history, &input, &work, "!room:d", "$human").is_err());
     }
 
     #[test]

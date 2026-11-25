@@ -3,6 +3,50 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+/// Locate original business inputs when an opaque Task session cannot be reused.
+/// Callers must re-read each source from the authenticated shared input ledger.
+pub(crate) fn task_business_sources(
+    path: &Path,
+    authority: &str,
+    scope: &serde_json::Value,
+    room: &str,
+) -> Vec<String> {
+    let saved: Option<serde_json::Value> = std::fs::read(path)
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok());
+    let Some(saved) = saved else {
+        return Vec::new();
+    };
+    if saved["format_version"] != 1
+        || saved["runtime"] != "openhuman"
+        || saved["authority"] != authority
+        || saved["scope"] != *scope
+    {
+        return Vec::new();
+    }
+    let mut sources = Vec::new();
+    for frame in saved["history"].as_array().into_iter().flatten() {
+        if frame["role"] != "user" {
+            continue;
+        }
+        let Some(content) = frame["content"].as_str() else {
+            continue;
+        };
+        let Ok(source) = serde_json::from_str::<serde_json::Value>(content) else {
+            continue;
+        };
+        if source["room_id"] != room {
+            continue;
+        }
+        if let Some(id) = source["event_id"].as_str().filter(|id| id.starts_with('$')) {
+            if !sources.iter().any(|seen| seen == id) {
+                sources.push(id.to_owned());
+            }
+        }
+    }
+    sources
+}
+
 pub(crate) fn checkpoint(
     workspace: &Path,
     room_id: &str,
@@ -32,6 +76,50 @@ pub(crate) fn checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incompatible_task_cache_retains_only_ordered_source_identities() {
+        use serde_json::json;
+        let root = std::env::temp_dir().join(format!("task-source-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("task.json");
+        let scope = json!(["team", "T"]);
+        let source = |id: &str, room: &str| {
+            json!({"role":"user", "content":
+            json!({"room_id":room,"event_id":id,"sender":"@human:test","content":{"body":"Use the browser"}}).to_string()})
+        };
+        let history = json!([
+            {"role":"system","content":"old policy"},
+            source("$first", "!task:test"),
+            {"role":"tool","content":"old tool result"},
+            source("$second", "!task:test"),
+            source("$first", "!task:test"),
+            source("$elsewhere", "!other:test"),
+            {"role":"user","content":"rendered old recovery snapshot"}
+        ]);
+        let saved = json!({"format_version":1,"runtime":"openhuman","authority":"worker",
+            "scope":scope,"checkpoint_digest":"obsolete","expires_at":0,"history":history});
+        std::fs::write(&path, saved.to_string()).unwrap();
+        assert_eq!(
+            task_business_sources(&path, "worker", &scope, "!task:test"),
+            vec!["$first", "$second"]
+        );
+        for (key, value) in [
+            ("runtime", json!("hermes")),
+            ("authority", json!("other")),
+            ("scope", json!(["team", "other-task"])),
+            ("format_version", json!(2)),
+        ] {
+            let mut invalid = saved.clone();
+            invalid[key] = value;
+            std::fs::write(&path, invalid.to_string()).unwrap();
+            assert!(
+                task_business_sources(&path, "worker", &scope, "!task:test").is_empty(),
+                "{key}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn saves_native_input_and_exact_source_without_waiting_for_a_reply() {

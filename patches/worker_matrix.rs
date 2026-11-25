@@ -36,6 +36,9 @@ pub(super) async fn admit(
     if record["input"]["sender"] != sender || record["room_id"] != room.room_id().as_str() {
         return Err("source changed");
     }
+    if crate::openhuman::channels::task_recovery::route_task_message(&record).await? {
+        return Ok(());
+    }
     admit_message(client, &record, key, tx, body, || {
         if direct {
             crate::openhuman::channels::matrix_direct::register(
