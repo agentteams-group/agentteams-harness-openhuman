@@ -14,6 +14,7 @@ struct Display {
     context: Arc<Context>,
     run_id: String,
     published: AtomicBool,
+    phase_complete: AtomicBool,
 }
 pub(crate) struct Call {
     display: Arc<Display>,
@@ -164,15 +165,24 @@ pub(crate) async fn scope<F: Future>(run_id: String, future: F) -> F::Output {
         context,
         run_id,
         published: AtomicBool::new(false),
+        phase_complete: AtomicBool::new(false),
     });
     let mut closing = CloseOnDrop {
         display: display.clone(),
         finished: false,
     };
     let result = DISPLAY.scope(display.clone(), future).await;
-    display.end("quiet").await;
+    if !display.phase_complete.load(Ordering::Acquire) {
+        display.end("quiet").await;
+    }
     closing.finished = true;
     result
+}
+pub(crate) fn run_id() -> Option<String> {
+    DISPLAY.try_with(|display| display.run_id.clone()).ok()
+}
+pub(crate) fn phase_completed() {
+    let _ = DISPLAY.try_with(|display| display.phase_complete.store(true, Ordering::Release));
 }
 pub(crate) fn reply_content(text: &str, transaction: &str, run_id: &str) -> Value {
     json!({"msgtype":"m.text", "body":text,
@@ -247,6 +257,17 @@ mod tests {
         assert_eq!(content["m.mentions"]["user_ids"], json!([]));
         assert!(content.get("org.agentteams.run").is_none());
     }
+    #[tokio::test]
+    async fn successful_task_phase_keeps_its_run_without_an_extra_quiet_notice() {
+        let channel = Arc::new(Matrix::default());
+        let context = Arc::new(Context { channel: channel.clone(), room: "!own".into(), sender: "@human".into() });
+        crate::openhuman::approval::matrix::CONTEXT.scope(context, scope("test-run".into(), async {
+            assert_eq!(run_id().as_deref(), Some("test-run"));
+            thinking(Some("核对文件")).await;
+            phase_completed();
+        })).await;
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+    }
     #[derive(Default)]
     struct Matrix {
         sent: Mutex<Vec<Value>>,
@@ -290,6 +311,7 @@ mod tests {
             context,
             run_id: "own-run".into(),
             published: AtomicBool::new(false),
+            phase_complete: AtomicBool::new(false),
         });
         DISPLAY
             .scope(display.clone(), async {

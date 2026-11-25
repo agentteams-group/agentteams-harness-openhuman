@@ -11,13 +11,13 @@ pub fn is_control_room(room: &str) -> bool { ROOMS.lock().unwrap().contains(room
 
 pub struct Notification { pub text: String, pub task_id: Option<String>, pub meta: Value, pub assistant: bool }
 
-pub async fn prepare(content: &Value, room: &str, sender: &str, own: &str) -> Option<Notification> {
+pub async fn prepare(content: &Value, room: &str, sender: &str, own: &str, event_id: &str) -> Option<Notification> {
     let mut child = tokio::process::Command::new("python3")
         .arg("/opt/agentteams/scripts/lib/task_coordination.py")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .kill_on_drop(true).spawn().ok()?;
     let mut stdin = child.stdin.take()?;
-    let input = json!({"content": content, "room": room, "sender": sender, "own": own});
+    let input = json!({"content": content, "room": room, "sender": sender, "own": own, "event_id": event_id});
     stdin.write_all(input.to_string().as_bytes()).await.ok()?;
     drop(stdin);
     let result = tokio::time::timeout(std::time::Duration::from_secs(15), child.wait_with_output()).await.ok()?.ok()?;

@@ -68,7 +68,9 @@ fn classify(
     if raw["type"] == "m.room.encrypted" {
         return Err("Matrix event has not been decrypted");
     }
-    if raw["type"] != "m.room.message" {
+    let control = raw["type"] == "org.agentteams.coordination"
+        && raw["content"]["org.agentteams.coordination"].is_object();
+    if raw["type"] != "m.room.message" && !control {
         return Ok(None);
     }
     let event = raw["event_id"].as_str().ok_or("missing Matrix event ID")?;
@@ -246,7 +248,12 @@ where
             };
             let mut raw = record["input"].clone();
             raw["event_id"] = record["event_id"].clone();
-            let Ok(typed) = serde_json::from_value::<OriginalSyncRoomMessageEvent>(raw.clone())
+            // The shared inbox verified the original control. Adapt only the SDK view.
+            let mut sdk_event = raw.clone();
+            if sdk_event["type"] == "org.agentteams.coordination" {
+                sdk_event["type"] = json!("m.room.message");
+            }
+            let Ok(typed) = serde_json::from_value::<OriginalSyncRoomMessageEvent>(sdk_event)
             else {
                 continue;
             };

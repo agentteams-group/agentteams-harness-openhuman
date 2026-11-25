@@ -428,7 +428,10 @@ impl Tool for TaskTool {
     }
     async fn execute(&self, arguments: Value) -> anyhow::Result<ToolResult> {
         let turn = CURRENT.try_with(Arc::clone)?;
-        let context = turn.context.lock().unwrap().clone();
+        let mut context = turn.context.lock().unwrap().clone();
+        if let Some(id) = super::task_progress::run_id() {
+            context["runId"] = json!(id);
+        }
         let outcome =
             bridge(json!({"operation":"task","arguments":arguments,"context":context})).await?;
         {
@@ -444,6 +447,7 @@ impl Tool for TaskTool {
                     .unwrap_or_default();
             }
             if outcome["phaseComplete"] == true {
+                super::task_progress::phase_completed();
                 current["phaseResult"] = json!(outcome["displayText"].as_str().unwrap_or(""));
             }
         }

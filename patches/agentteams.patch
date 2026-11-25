@@ -1865,7 +1865,7 @@ index 1e343d5..d126994 100644
 +                        &raw["content"],
 +                        room.room_id().as_str(),
 +                        event.sender.as_str(),
-+                        my_user_id.as_str(),
++                        my_user_id.as_str(), event.event_id.as_str(),
 +                    )
 +                    .await
 +                } else {

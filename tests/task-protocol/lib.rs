@@ -8,7 +8,7 @@ pub(crate) mod session_receipts;
 #[path = "../../patches/task_protocol.rs"]
 pub(crate) mod task_protocol_source;
 #[allow(unused_imports)]
-pub(crate) use openhuman::channels::{matrix_direct, task_recovery};
+pub(crate) use openhuman::channels::{matrix_direct, task_progress, task_recovery};
 #[path = "../../patches/task_telemetry.rs"]
 pub(crate) mod task_telemetry;
 mod openhuman {
@@ -92,6 +92,10 @@ mod openhuman {
             pub fn get(_: &str) -> Option<Direct> {
                 None
             }
+        }
+        pub mod task_progress {
+            pub fn run_id() -> Option<String> { None }
+            pub fn phase_completed() {}
         }
         pub mod task_recovery {
             pub async fn checkpoint(
