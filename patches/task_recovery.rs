@@ -109,6 +109,7 @@ pub(crate) struct Run {
     pub started: AtomicBool,
     pub finished: AtomicBool,
     pub succeeded: AtomicBool,
+    planning_control_consumed: AtomicBool,
 }
 
 pub(crate) fn enabled() -> bool {
@@ -128,6 +129,20 @@ pub(crate) fn get(id: &str) -> Option<Arc<Run>> {
 pub(crate) fn handoff_target() -> Option<Value> {
     TASK_RUN.try_with(|run| (!run.message()).then(|| json!({"runtime":"openhuman",
         "session":run.session,"scope":digest(&run.scope)}))).ok().flatten()
+}
+
+pub(crate) fn mark_planned_control() {
+    let _ = TASK_RUN.try_with(|run| run.planning_control_consumed.store(true, Ordering::Release));
+}
+
+pub(crate) async fn retire_settled_planning_control() -> anyhow::Result<()> {
+    if let Ok(run) = TASK_RUN.try_with(Arc::clone) {
+        if run.message() {
+            rpc(json!({"action":"matrix.message.cancel","identity":run.identity})).await.map_err(anyhow::Error::msg)?;
+            run.succeeded.store(true, Ordering::Release);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn progress_run_id() -> Option<String> {
@@ -326,10 +341,7 @@ pub(crate) async fn route_task_message(input: &Value) -> Result<bool, &'static s
             run.work["task_id"].as_str().ok_or("missing Task identity")?.to_owned()
         }
         [] => {
-            if let Err(error) = retain_handoffs().await {
-        tracing::warn!("Confirmed Task handoffs remain pending: {error}");
-    }
-    let snapshot = rpc(json!({"action":"discover"})).await?;
+            let snapshot = rpc(json!({"action":"discover"})).await?;
             let Some(task) = supplement_task(&snapshot, room) else { return Ok(false); };
             task.to_owned()
         }
@@ -460,6 +472,7 @@ impl Run {
             started: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             succeeded: AtomicBool::new(false),
+            planning_control_consumed: AtomicBool::new(false),
         }))
     }
 
@@ -642,6 +655,12 @@ impl Run {
     }
 
     pub(crate) async fn complete(&self, text: &str) -> Result<(), &'static str> {
+        // The Controller has already published the plan in this room. Finish
+        // its transport trigger once the native tool transcript is checkpointed.
+        if self.message() && text.trim().is_empty() && self.planning_control_consumed.load(Ordering::Acquire) {
+            rpc(json!({"action":"matrix.message.cancel","identity":self.identity})).await?;
+            return Ok(());
+        }
         let reply = self
             .call(
                 "prepare_reply",
@@ -693,7 +712,6 @@ impl Run {
             serde_json::to_value(&history).map_err(|_| "native history serialization failed")?;
         let cache = json!({"format_version":1, "runtime":"openhuman", "authority":authority(), "scope":self.scope,
             "session_id":self.session, "checkpoint_digest":current["checkpoint_digest"],
-            "delivery_event": current["task"]["execution"]["checkpoint"]["reply_event"],
             "native_digest":digest(&serialized), "history":serialized, "expires_at":now()+86400});
         write_session(&self.cache_path, &cache)?;
         *self.native_history.lock().unwrap() = history;

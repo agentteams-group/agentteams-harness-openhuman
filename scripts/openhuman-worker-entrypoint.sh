@@ -350,19 +350,29 @@ if [ -n "${AGENTTEAMS_CONTROLLER_URL:-}" ]; then
     TASK_SYNC_EXCLUDES=(--exclude "tasks/**" --exclude "projects/**")
 fi
 
+# A submitted node can be handed off after its native session has stopped.
+# Keep the pending references across worker replacement until that history is synced.
+HANDOFF_DIR=".agentteams/native-handoffs"
+
 # Local → Remote: push changed files every 30 seconds
 (
     while true; do
         sleep 30
         # Native mutable history is separate from Controller-owned runtime projections.
+        _history_synced=true
         for _sessions in runtime/openhuman-task-sessions runtime/openhuman-message-sessions; do
             if [ -d "${WORKSPACE}/${_sessions}" ]; then
                 ensure_mc_credentials 2>/dev/null || true
                 mc mirror "${WORKSPACE}/${_sessions}/" \
                     "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/${_sessions}/" \
-                    --overwrite 2>/dev/null || log "WARNING: native session history sync failed"
+                    --overwrite 2>/dev/null || { _history_synced=false; log "WARNING: native session history sync failed"; }
             fi
         done
+        if [ -d "${WORKSPACE}/${HANDOFF_DIR}" ] && [ "${_history_synced}" = true ]; then
+            mc mirror --overwrite --remove "${WORKSPACE}/${HANDOFF_DIR}/" \
+                "${AGENTTEAMS_STORAGE_PREFIX}/agents/${WORKER_NAME}/${HANDOFF_DIR}/" \
+                2>/dev/null || log "WARNING: pending handoff sync failed"
+        fi
         CHANGED=$(find "${WORKSPACE}/" -type f -newer "${PULL_MARKER}" \
             -not -path "*/config.toml" \
             -not -path "*/.last-pull" \

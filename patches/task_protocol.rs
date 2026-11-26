@@ -128,6 +128,10 @@ pub(crate) async fn scope<F: Future>(
             let admitted = bridge(json!({"operation":"admit_event","eventId":id,
                 "nativeEventId":msg.id,"action":"begin"}))
             .await?;
+            if event["kind"] == "handoff" && admitted["active"] == false
+                && (admitted["settled"] == true || admitted["reused"] == true) {
+                super::task_recovery::retire_settled_planning_control().await?;
+            }
             anyhow::ensure!(admitted["active"] == true, "Task phase is no longer active");
             if event["kind"] == "handoff" {
                 event["pending_task_ids"] = admitted["pending_task_ids"].clone();
@@ -450,6 +454,9 @@ impl Tool for TaskTool {
                     .unwrap_or_default();
             }
             if outcome["phaseComplete"] == true {
+                if turn.coordination["kind"] == "handoff" && arguments["action"] == "plan" {
+                    super::task_recovery::mark_planned_control();
+                }
                 super::task_progress::phase_completed();
                 current["phaseResult"] = json!(outcome["displayText"].as_str().unwrap_or(""));
             }
