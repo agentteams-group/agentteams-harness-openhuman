@@ -109,6 +109,7 @@ pub(crate) struct Run {
     pub started: AtomicBool,
     pub finished: AtomicBool,
     pub succeeded: AtomicBool,
+    planning_control_consumed: AtomicBool,
 }
 
 pub(crate) fn enabled() -> bool {
@@ -125,6 +126,25 @@ pub(crate) fn enabled() -> bool {
 pub(crate) fn get(id: &str) -> Option<Arc<Run>> {
     RUNS.lock().unwrap().get(id).cloned()
 }
+pub(crate) fn handoff_target() -> Option<Value> {
+    TASK_RUN.try_with(|run| (!run.message()).then(|| json!({"runtime":"openhuman",
+        "session":run.session,"scope":digest(&run.scope)}))).ok().flatten()
+}
+
+pub(crate) fn mark_planned_control() {
+    let _ = TASK_RUN.try_with(|run| run.planning_control_consumed.store(true, Ordering::Release));
+}
+
+pub(crate) async fn retire_settled_planning_control() -> anyhow::Result<()> {
+    if let Ok(run) = TASK_RUN.try_with(Arc::clone) {
+        if run.message() {
+            rpc(json!({"action":"matrix.message.cancel","identity":run.identity})).await.map_err(anyhow::Error::msg)?;
+            run.succeeded.store(true, Ordering::Release);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn progress_run_id() -> Option<String> {
     TASK_RUN.try_with(|run| run.progress_run_id()).ok()
 }
@@ -452,6 +472,7 @@ impl Run {
             started: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             succeeded: AtomicBool::new(false),
+            planning_control_consumed: AtomicBool::new(false),
         }))
     }
 
@@ -634,6 +655,12 @@ impl Run {
     }
 
     pub(crate) async fn complete(&self, text: &str) -> Result<(), &'static str> {
+        // The Controller has already published the plan in this room. Finish
+        // its transport trigger once the native tool transcript is checkpointed.
+        if self.message() && text.trim().is_empty() && self.planning_control_consumed.load(Ordering::Acquire) {
+            rpc(json!({"action":"matrix.message.cancel","identity":self.identity})).await?;
+            return Ok(());
+        }
         let reply = self
             .call(
                 "prepare_reply",
@@ -686,27 +713,7 @@ impl Run {
         let cache = json!({"format_version":1, "runtime":"openhuman", "authority":authority(), "scope":self.scope,
             "session_id":self.session, "checkpoint_digest":current["checkpoint_digest"],
             "native_digest":digest(&serialized), "history":serialized, "expires_at":now()+86400});
-        let directory = self.cache_path.parent().ok_or("missing cache directory")?;
-        std::fs::create_dir_all(directory).map_err(|_| "native cache persistence failed")?;
-        let temporary = directory.join(uuid::Uuid::new_v4().to_string());
-        let result = (|| -> std::io::Result<()> {
-            use std::io::Write;
-            let mut options = std::fs::OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
-            file.write_all(cache.to_string().as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, &self.cache_path)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-            return Err("native cache persistence failed");
-        }
+        write_session(&self.cache_path, &cache)?;
         *self.native_history.lock().unwrap() = history;
         if !terminal {
             rpc(json!({"action":"session.remember","work":work,"snapshot":current,"identity":self.identity,
@@ -918,13 +925,94 @@ pub(crate) async fn finish_message_tools(op: Option<String>, results: Value) -> 
 }
 
 /// The same binding used by scan and the actual native ingress regression.
-pub(crate) fn bind_protocol_source(id: &str, task: &Value) {
+pub(crate) fn bind_protocol_source(id: &str, task: &Value, own: &str) {
     if task.get("task_plan_id").and_then(Value::as_str).is_some() {
-        super::task_protocol::register_recovered(id, json!({"teamharness_coordination": {
+        super::task_protocol::register_recovered(id, json!({"agent_matrix_user_id":own,"teamharness_coordination": {
             "kind":"task_assigned", "task_id":task["task_id"], "main_task_id":task["main_task_id"],
             "project_id":task.get("project_id").cloned().unwrap_or(json!("")), "delivery_id":task["notifyTxn"]
         }}));
     }
+}
+
+fn write_session(path: &std::path::Path, cache: &Value) -> Result<(), &'static str> {
+    let directory = path.parent().ok_or("missing cache directory")?;
+    std::fs::create_dir_all(directory).map_err(|_| "native cache persistence failed")?;
+    let temporary = directory.join(uuid::Uuid::new_v4().to_string());
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(cache.to_string().as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err("native cache persistence failed");
+    }
+    Ok(())
+}
+
+fn cached_submission(history: &[Value], task: &str, submission: &str) -> bool {
+    history.iter().filter(|row| row["role"] == "tool").any(|row| {
+        let result = row["content"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok());
+        let receipt = result.as_ref().and_then(|r| r["content"].as_str())
+            .and_then(|s| serde_json::from_str::<Value>(s).ok());
+        receipt.is_some_and(|r| r["phaseComplete"] == true && r["task"]["id"] == task
+            && r["task"]["submissionId"] == submission)
+    })
+}
+
+async fn retain_handoffs() -> Result<(), &'static str> {
+    let folder = home().join(".agentteams/native-handoffs");
+    if !folder.is_dir() || std::fs::read_dir(&folder).map_err(|_| "handoff directory unavailable")?.next().is_none() {
+        return Ok(());
+    }
+    let pending = super::task_protocol::bridge(json!({"operation":"confirmed_handoffs","runtime":"openhuman"}))
+        .await.map_err(|_| "handoff lookup unavailable")?;
+    for item in pending["items"].as_array().ok_or("invalid handoff response")? {
+        let target = &item["target"];
+        let scope = target["scope"].as_str().ok_or("missing session scope")?;
+        let key = item["key"].as_str().ok_or("missing handoff key")?;
+        if [scope, key].iter().any(|s| s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Err("invalid native handoff reference");
+        }
+        if RUNS.lock().unwrap().values().any(|run| digest(&run.scope) == scope) {
+            continue;
+        }
+        let path = home().join("runtime/openhuman-task-sessions").join(format!("{scope}.json"));
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let mut saved: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid saved native transcript")?;
+        if saved["session_id"] != target["session"] || saved["authority"] != authority()
+            || digest(&saved["scope"]) != scope || saved["native_digest"] != digest(&saved["history"]) {
+            continue;
+        }
+        let history = saved["history"].as_array_mut().ok_or("invalid native history")?;
+        // Submission can release the Task before a post-delivery cache refresh.
+        // Match the native tool result to the very submission the outbox confirmed.
+        let task = item["taskId"].as_str().ok_or("missing submitted task")?;
+        let submission = item["submissionId"].as_str().ok_or("missing submission")?;
+        if !cached_submission(history, task, submission) {
+            continue;
+        }
+        for fact in item["facts"].as_array().ok_or("missing confirmed facts")? {
+            let row = serde_json::to_value(ChatMessage::system(fact.as_str().ok_or("invalid confirmed fact")?))
+                .map_err(|_| "invalid native system message")?;
+            if !history.contains(&row) {
+                history.push(row);
+            }
+        }
+        saved["native_digest"] = json!(digest(&saved["history"]));
+        write_session(&path, &saved)?;
+        std::fs::remove_file(folder.join(format!("{key}.json"))).map_err(|_| "handoff acknowledgement failed")?;
+    }
+    Ok(())
 }
 
 async fn scan(
@@ -932,6 +1020,9 @@ async fn scan(
     own: &str,
     tx: &mpsc::Sender<ChannelMessage>,
 ) -> Result<(), &'static str> {
+    if let Err(error) = retain_handoffs().await {
+        tracing::warn!("Confirmed Task handoffs remain pending: {error}");
+    }
     let snapshot = rpc(json!({"action":"discover"})).await?;
     let mut entries = snapshot["tasks"]
         .as_array()
@@ -1027,7 +1118,7 @@ async fn scan(
             .and_then(|ids| ids.first())
             .cloned()
             .unwrap_or_else(|| format!("recovery:{}", uuid::Uuid::new_v4()));
-        bind_protocol_source(&id, &task);
+        bind_protocol_source(&id, &task, own);
         super::task_protocol::register_recovered(&id, json!({"agent_matrix_user_id":own}));
         RUNS.lock().unwrap().insert(id.clone(), run.clone());
         let input = ChannelMessage {
@@ -1114,6 +1205,15 @@ mod tests {
             assert!(!business_history_input(&input), "{key}");
             input["input"]["content"].as_object_mut().unwrap().remove(key);
         }
+    }
+
+    #[test]
+    fn confirmed_handoff_matches_the_native_terminal_tool_result() {
+        let result = json!({"phaseComplete":true,"task":{"id":"task","submissionId":"sub"}});
+        let tool = json!({"role":"tool","content":json!({"content":result.to_string()}).to_string()});
+        assert!(cached_submission(std::slice::from_ref(&tool), "task", "sub"));
+        assert!(!cached_submission(std::slice::from_ref(&tool), "task", "other"));
+        assert!(!cached_submission(&[json!({"role":"assistant","content":tool["content"]})], "task", "sub"));
     }
 
     #[tokio::test]

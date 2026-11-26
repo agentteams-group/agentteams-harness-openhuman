@@ -8,7 +8,7 @@ pub(crate) mod session_receipts;
 #[path = "../../patches/task_protocol.rs"]
 pub(crate) mod task_protocol_source;
 #[allow(unused_imports)]
-pub(crate) use openhuman::channels::{matrix_direct, task_recovery};
+pub(crate) use openhuman::channels::{matrix_direct, task_progress, task_recovery};
 #[path = "../../patches/task_telemetry.rs"]
 pub(crate) mod task_telemetry;
 mod openhuman {
@@ -93,7 +93,18 @@ mod openhuman {
                 None
             }
         }
+        pub mod task_progress {
+            pub fn run_id() -> Option<String> { None }
+            pub fn phase_completed() {}
+        }
         pub mod task_recovery {
+            pub fn mark_planned_control() {}
+            pub static RETIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            pub async fn retire_settled_planning_control() -> anyhow::Result<()> {
+                RETIRED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            pub fn handoff_target() -> Option<serde_json::Value> { None }
             pub async fn checkpoint(
                 _: &[super::super::inference::provider::ChatMessage],
             ) -> anyhow::Result<()> {
@@ -138,6 +149,8 @@ def call(arguments):
   return {{'task':{{'id':identity,'status':'in_progress','mainTaskId':'main','projectId':'','assignedTo':'one','assignmentId':'dispatch'}},'taskDirectory':str(task_root),'outputDirectory':str(task_root/'workspace'),'scratchDirectory':str(task_root/'workspace/.scratch'),'inputs':[{{'files':[{{'path':'/verified/result.json','preview':'Entire upstream body 7d21'}}]}}]}}
  return {{'task':{{'id':identity,'status':'submitted','submissionId':'candidate'}},'notification':{{'eventId':'notice','status':'queued','recipient':'leader'}}}}
 async def notify(event,native,action):
+ if native == '$settled-plan': return {{'active':False,'settled':True}}
+ if native == '$unverified-plan': return {{'active':False}}
  assert native == '$handoff', 'Execution assignments must go directly to Task begin'
  return {{'active':True,'pending_task_ids':['main']}}
 def get(route):
@@ -229,6 +242,18 @@ except Exception as error:
         })
         .await
         .unwrap();
+
+        for id in ["$settled-plan", "$unverified-plan"] {
+            native::register(id, json!({"teamharness_coordination":{
+                "id":"00000000000000000000000000000003","kind":"handoff"}}));
+            let replay = ChannelMessage {
+                id: id.into(), reply_target: "!room:test".into(), sender: "@manager:test".into(),
+            };
+            assert!(native::scope(&replay, "leader-session", async {
+                panic!("inactive planning control started a model turn")
+            }).await.is_err());
+        }
+        assert_eq!(super::task_recovery::RETIRED.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         std::env::set_var("AGENTTEAMS_AGENT_ROLE", "manager");
         let msg = ChannelMessage {

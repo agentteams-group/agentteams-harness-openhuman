@@ -253,7 +253,7 @@ new file mode 100644
 +        "$native-source",
 +        &json!({
 +            "task_plan_id":"plan", "task_id":"native-exec", "main_task_id":"main", "notifyTxn":"dispatch"
-+        }),
++        }), "@leader:test",
 +    );
 +    let message = ChannelMessage {
 +        id: "$native-source".into(),
@@ -1865,7 +1865,7 @@ index 1e343d5..d126994 100644
 +                        &raw["content"],
 +                        room.room_id().as_str(),
 +                        event.sender.as_str(),
-+                        my_user_id.as_str(),
++                        my_user_id.as_str(), event.event_id.as_str(),
 +                    )
 +                    .await
 +                } else {
